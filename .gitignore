@@ -1,0 +1,41 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+
+# Logs and temp outputs
+*.log
+/tmp-audits/
+audit.json
+*-audit-*.json
+
+# Secrets — never commit
+.env
+.env.local
+.env.production
+!.env.example
+*.secret
+*secrets*
+credentials.json
+.anthropic/
+.supabase/
+
+# Local Claude working files
+.claude/

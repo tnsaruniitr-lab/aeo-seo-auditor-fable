@@ -1,0 +1,13 @@
+# Pinned for reproducible builds. Unpinned (>=) deps meant every Railway rebuild
+# could pull a new major/minor of anthropic/pydantic/playwright and break prod
+# on a rebuild that changed no first-party code (finding ENG-3). Bump these
+# deliberately, not implicitly.
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+pydantic==2.7.1
+anthropic==0.84.0
+python-dotenv==1.0.1
+
+# Agent-mode dependencies (parity layer)
+httpx==0.27.0          # Supabase REST + webhooks
+playwright==1.60.0     # render_page_js — JS rendering + perf metrics + PDF fallback

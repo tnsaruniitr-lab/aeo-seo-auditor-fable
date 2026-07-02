@@ -1,0 +1,233 @@
+{
+  "version": "1.0",
+  "source": "extracted from website-seo-aeo-auditor v3 (check_schema_completeness.py::FIELD_SPECS)",
+  "description": "Per-@type Schema.org field requirements. Three tiers: required (Schema.org spec), google_required (Google Search structured data requirements), recommended (best-practice fields; surface as warn if missing).",
+  "field_specs": {
+    "Organization": {
+      "required": ["name", "url"],
+      "google_required": [],
+      "recommended": ["logo", "sameAs", "contactPoint", "description"]
+    },
+    "LocalBusiness": {
+      "required": ["name", "url"],
+      "google_required": ["address", "telephone"],
+      "recommended": ["openingHours", "priceRange", "geo", "image", "aggregateRating"]
+    },
+    "MedicalBusiness": {
+      "required": ["name", "url"],
+      "google_required": ["address"],
+      "recommended": ["telephone", "medicalSpecialty", "priceRange", "aggregateRating", "hasOfferCatalog"]
+    },
+    "MedicalClinic": {
+      "required": ["name", "url"],
+      "google_required": ["address"],
+      "recommended": ["telephone", "medicalSpecialty", "availableService"]
+    },
+    "MedicalOrganization": {
+      "required": ["name", "url"],
+      "google_required": [],
+      "recommended": ["medicalSpecialty", "sameAs", "contactPoint"]
+    },
+    "Person": {
+      "required": ["name"],
+      "google_required": [],
+      "recommended": ["jobTitle", "sameAs", "url", "worksFor", "hasCredential"]
+    },
+    "WebSite": {
+      "required": ["name", "url"],
+      "google_required": [],
+      "recommended": ["publisher", "potentialAction"]
+    },
+    "WebPage": {
+      "required": ["name", "url"],
+      "google_required": [],
+      "recommended": ["description", "dateModified", "isPartOf", "primaryImageOfPage", "inLanguage"]
+    },
+    "Article": {
+      "required": ["headline", "datePublished"],
+      "google_required": ["author", "image"],
+      "recommended": ["dateModified", "publisher", "description", "mainEntityOfPage"]
+    },
+    "BlogPosting": {
+      "required": ["headline", "datePublished"],
+      "google_required": ["author", "image"],
+      "recommended": ["dateModified", "publisher", "description", "mainEntityOfPage"]
+    },
+    "NewsArticle": {
+      "required": ["headline", "datePublished"],
+      "google_required": ["author", "image"],
+      "recommended": ["dateModified", "publisher", "description"]
+    },
+    "Product": {
+      "required": ["name"],
+      "google_required": ["offers"],
+      "recommended": ["image", "description", "brand", "aggregateRating", "review", "sku"]
+    },
+    "Offer": {
+      "required": [],
+      "google_required": ["price", "priceCurrency"],
+      "recommended": ["availability", "priceValidUntil", "url", "itemCondition"]
+    },
+    "AggregateOffer": {
+      "required": ["lowPrice", "priceCurrency", "offerCount"],
+      "google_required": [],
+      "recommended": ["highPrice", "offers"]
+    },
+    "FAQPage": {
+      "required": ["mainEntity"],
+      "google_required": [],
+      "recommended": [],
+      "custom_checks": ["faqpage_mainentity_is_array_of_questions", "faqpage_schema_matches_visible_count"]
+    },
+    "Question": {
+      "required": ["name", "acceptedAnswer"],
+      "google_required": [],
+      "recommended": []
+    },
+    "Answer": {
+      "required": ["text"],
+      "google_required": [],
+      "recommended": []
+    },
+    "HowTo": {
+      "required": ["name", "step"],
+      "google_required": [],
+      "recommended": ["description", "image", "totalTime", "supply", "tool", "estimatedCost"]
+    },
+    "HowToStep": {
+      "required": ["text"],
+      "google_required": [],
+      "recommended": ["name", "image", "url"]
+    },
+    "Review": {
+      "required": ["author", "reviewRating"],
+      "google_required": ["itemReviewed"],
+      "recommended": ["datePublished", "reviewBody"]
+    },
+    "AggregateRating": {
+      "required": ["ratingValue", "ratingCount"],
+      "google_required": [],
+      "recommended": ["bestRating", "worstRating", "reviewCount"]
+    },
+    "Rating": {
+      "required": ["ratingValue"],
+      "google_required": [],
+      "recommended": ["bestRating", "worstRating"]
+    },
+    "Recipe": {
+      "required": ["name", "recipeIngredient"],
+      "google_required": ["image", "author"],
+      "recommended": ["datePublished", "description", "cookTime", "prepTime", "totalTime", "recipeYield", "recipeInstructions", "nutrition", "aggregateRating"]
+    },
+    "Event": {
+      "required": ["name", "startDate", "location"],
+      "google_required": [],
+      "recommended": ["endDate", "eventStatus", "eventAttendanceMode", "image", "description", "offers", "organizer"]
+    },
+    "VideoObject": {
+      "required": ["name", "description", "thumbnailUrl", "uploadDate"],
+      "google_required": [],
+      "recommended": ["contentUrl", "embedUrl", "duration", "interactionStatistic"]
+    },
+    "ImageObject": {
+      "required": ["url"],
+      "google_required": [],
+      "recommended": ["width", "height", "caption", "creator", "license"]
+    },
+    "BreadcrumbList": {
+      "required": ["itemListElement"],
+      "google_required": [],
+      "recommended": [],
+      "custom_checks": ["breadcrumblist_sequential_positions_from_one"]
+    },
+    "ListItem": {
+      "required": ["position", "name"],
+      "google_required": [],
+      "recommended": ["item"]
+    },
+    "MedicalProcedure": {
+      "required": ["name"],
+      "google_required": [],
+      "recommended": ["description", "howPerformed", "preparation", "procedureType", "followup"]
+    },
+    "MedicalTherapy": {
+      "required": ["name"],
+      "google_required": [],
+      "recommended": ["description", "contraindication", "seriousAdverseOutcome", "indication"]
+    },
+    "Drug": {
+      "required": ["name"],
+      "google_required": [],
+      "recommended": ["activeIngredient", "dosageForm", "prescribingInfo", "warning", "nonProprietaryName"]
+    },
+    "SoftwareApplication": {
+      "required": ["name"],
+      "google_required": ["offers", "operatingSystem", "applicationCategory"],
+      "recommended": ["aggregateRating", "description", "screenshot", "featureList", "datePublished", "dateModified", "softwareVersion"]
+    },
+    "MobileApplication": {
+      "required": ["name", "operatingSystem"],
+      "google_required": ["offers", "applicationCategory"],
+      "recommended": ["aggregateRating", "description", "screenshot"]
+    },
+    "Service": {
+      "required": ["name"],
+      "google_required": [],
+      "recommended": ["description", "provider", "areaServed", "serviceType", "offers"]
+    },
+    "ContactPoint": {
+      "required": ["contactType"],
+      "google_required": [],
+      "recommended": ["telephone", "email", "availableLanguage", "areaServed"]
+    },
+    "PostalAddress": {
+      "required": [],
+      "google_required": ["streetAddress", "addressLocality", "addressCountry"],
+      "recommended": ["postalCode", "addressRegion"]
+    },
+    "SearchAction": {
+      "required": ["target"],
+      "google_required": ["query-input"],
+      "recommended": []
+    }
+  },
+  "custom_validation_rules": {
+    "faqpage_mainentity_is_array_of_questions": {
+      "applies_to": "FAQPage",
+      "rule": "mainEntity must be an array. Every item must have @type='Question', a non-empty name string, and an acceptedAnswer object with a non-empty text string.",
+      "severity_on_fail": "high"
+    },
+    "faqpage_schema_matches_visible_count": {
+      "applies_to": "FAQPage",
+      "rule": "The number of Question entities in FAQPage.mainEntity must equal the number of visible FAQ pairs on the page. Mismatch triggers Google's rich-result ineligibility.",
+      "severity_on_fail": "high",
+      "note": "Requires page HTML inspection — not purely schema-side."
+    },
+    "breadcrumblist_sequential_positions_from_one": {
+      "applies_to": "BreadcrumbList",
+      "rule": "itemListElement must be an array of ListItem objects with sequential position values starting from 1 (1, 2, 3, ... n). Gaps or out-of-order positions invalidate the breadcrumb rich result.",
+      "severity_on_fail": "medium"
+    },
+    "every_entity_has_stable_id": {
+      "applies_to": "all",
+      "rule": "Every JSON-LD entity should carry a stable @id fragment (e.g. https://example.com/#organization). Required for building a coherent entity graph that AI engines can cross-reference across pages.",
+      "severity_on_fail": "medium",
+      "note": "Not Google-required but high-impact for AEO."
+    },
+    "datemodified_not_current_timestamp": {
+      "applies_to": "Article|BlogPosting|NewsArticle|WebPage",
+      "rule": "dateModified must not equal the current timestamp within 60 seconds. A match indicates Date.now()-style cosmetic freshness, which Google's freshness algorithm discounts.",
+      "severity_on_fail": "high"
+    },
+    "datemodified_iso_8601_with_time": {
+      "applies_to": "Article|BlogPosting|NewsArticle|WebPage",
+      "rule": "dateModified should be full ISO 8601 with time component (e.g. 2026-04-04T00:00:00+00:00), not date-only (2026-04-04). Google accepts both; Schema.org prefers full ISO.",
+      "severity_on_fail": "low"
+    },
+    "person_ymyl_has_credential_or_sameas": {
+      "applies_to": "Person",
+      "rule": "On YMYL pages (medical, financial, legal, travel-budget), Person entities representing authors/practitioners should carry either hasCredential array OR sameAs links to LinkedIn/professional profiles. Raw 'name + jobTitle' is insufficient for E-E-A-T signals.",
+      "severity_on_fail": "high"
+    }
+  }
+}

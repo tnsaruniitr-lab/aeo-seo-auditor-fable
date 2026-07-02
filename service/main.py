@@ -1,0 +1,2533 @@
+"""
+main.py — FastAPI service exposing the standalone auditor.
+
+Three endpoints:
+    POST /audit          — kick off an audit (async, returns audit_id)
+    GET  /audit/{id}     — fetch status + result (poll until completed)
+    GET  /healthz        — service health check
+
+Plus convenience routes:
+    GET /audit/{id}.json — raw JSON
+    GET /audit/{id}.md   — Markdown report
+    GET /audit/{id}.pdf  — PDF summary
+    GET /audit/{id}.html — preview-friendly HTML render
+
+USAGE
+    pip install fastapi uvicorn anthropic python-dotenv
+    export ANTHROPIC_API_KEY="sk-ant-..."
+    uvicorn main:app --host 0.0.0.0 --port 8000
+
+ENVIRONMENT VARIABLES
+    ANTHROPIC_API_KEY  — required for audit narrative generation
+    AUDIT_OUTPUT_DIR   — where to write audit artifacts (default: ./audits/)
+    PORT               — port to bind (default: 8000)
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import sys
+import threading
+import time
+import traceback
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Optional
+
+
+# ----------------------------------------------------------------------
+# LOGGING — configured early so all modules picking up loggers inherit it
+# ----------------------------------------------------------------------
+
+LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+    datefmt='%H:%M:%S',
+    stream=sys.stdout,
+    force=True,
+)
+log = logging.getLogger('audit')
+
+# Quiet down noisy third-party loggers unless we asked for DEBUG
+if LOG_LEVEL != 'DEBUG':
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('anthropic').setLevel(logging.WARNING)
+    logging.getLogger('httpcore').setLevel(logging.WARNING)
+
+# Load .env if present (graceful fallback if python-dotenv not installed)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+THIS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(THIS_DIR))
+
+import secrets
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Request
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel, HttpUrl, Field
+from typing import List as _List  # avoid clash with the Optional/Dict already imported
+
+from audit_pipeline import run_audit as run_audit_deterministic
+from safety import check_url_safe
+
+# Agent-mode (full parity with the chat skill) is opt-in via AUDIT_MODE env var.
+# Default is "agent" once the parity layer is deployed; falls back automatically
+# if dependencies (Playwright, Tavily key, etc.) aren't ready.
+AUDIT_MODE = os.getenv('AUDIT_MODE', 'agent').lower().strip()
+
+try:
+    from agent import run_audit_agent
+    AGENT_AVAILABLE = True
+except Exception as _agent_import_err:
+    AGENT_AVAILABLE = False
+    _AGENT_IMPORT_ERROR = str(_agent_import_err)
+
+# Supabase read path — for reloading persisted audits by domain or id.
+try:
+    from tools import (fetch_audit, list_audits_for_domain, list_all_audits,
+                       delete_audits)
+except Exception:
+    def fetch_audit(*_a, **_k):  # type: ignore
+        return None
+    def list_audits_for_domain(*_a, **_k):  # type: ignore
+        return []
+    def list_all_audits(*_a, **_k):  # type: ignore
+        return []
+    def delete_audits(*_a, **_k):  # type: ignore
+        return {"deleted": False, "error": "tools.delete_audits unavailable"}
+
+# Durability, product-loop, metering, and metrics modules. Guarded so a missing
+# optional module never blocks service boot.
+try:
+    from persistence import (regenerate_markdown, regenerate_pdf, save_job_status,
+                             persist_suppression, load_suppressions, remove_suppression)
+except Exception:
+    def regenerate_markdown(*_a, **_k):  # type: ignore
+        return None
+    def regenerate_pdf(*_a, **_k):  # type: ignore
+        return None
+    def save_job_status(*_a, **_k):  # type: ignore
+        return False
+    def persist_suppression(*_a, **_k):  # type: ignore
+        return False
+    def load_suppressions(*_a, **_k):  # type: ignore
+        return []
+    def remove_suppression(*_a, **_k):  # type: ignore
+        return False
+try:
+    from delta import delta_against_prior
+except Exception:
+    def delta_against_prior(*_a, **_k):  # type: ignore
+        return None
+try:
+    import monitoring
+except Exception:
+    monitoring = None  # type: ignore
+try:
+    import billing
+except Exception:
+    billing = None  # type: ignore
+
+
+def run_audit(url: str, output_dir: str, progress_callback=None):
+    """Dispatch to the chosen audit pipeline.
+
+    Modes:
+        - 'agent'         : full 15-phase parity loop (matches chat skill)
+        - 'deterministic' : legacy fast path (scripts + 1 Sonnet call)
+        - 'auto'          : agent if available, else deterministic
+
+    progress_callback (optional): called with a dict {phase, tool, turn,
+    tool_count, elapsed_seconds, last_tool_ms} after each tool call when
+    running in agent mode. Ignored by the deterministic path.
+    """
+    mode = AUDIT_MODE
+    if mode == 'agent' and not AGENT_AVAILABLE:
+        # Hard-fail if the user explicitly asked for agent and it's broken
+        raise RuntimeError(
+            f"AUDIT_MODE=agent requested but agent module failed to import: "
+            f"{_AGENT_IMPORT_ERROR}"
+        )
+    if mode == 'auto':
+        mode = 'agent' if AGENT_AVAILABLE else 'deterministic'
+    if mode == 'agent':
+        return run_audit_agent(url, output_dir=output_dir, verbose=False,
+                                progress_callback=progress_callback)
+    return run_audit_deterministic(url, output_dir=output_dir)
+
+
+# ----------------------------------------------------------------------
+# CONFIG
+# ----------------------------------------------------------------------
+
+OUTPUT_DIR = Path(os.getenv('AUDIT_OUTPUT_DIR', './audits/')).expanduser().resolve()
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# In-memory job tracker (sufficient for single-instance v1).
+# For multi-instance scale, swap for Redis or DB.
+JOBS: Dict[str, Dict] = {}
+JOBS_LOCK = threading.Lock()
+
+# Resource bounds. Audits spawn chromium + run the agent loop; without a cap,
+# concurrent submissions exhaust memory/CPU. We bound queued+running audits
+# and evict old finished jobs so JOBS can't grow without limit.
+MAX_CONCURRENT_AUDITS = int(os.getenv('MAX_CONCURRENT_AUDITS', '3'))
+MAX_TRACKED_JOBS = int(os.getenv('MAX_TRACKED_JOBS', '500'))
+# A running audit older than this is considered hung and reaped to 'error'
+# so it can't hold a slot / sit in 'running' forever.
+MAX_AUDIT_SECONDS = int(os.getenv('MAX_AUDIT_SECONDS', '1200'))
+
+# Fail-closed switch: in production a missing auth env var must NOT silently
+# expose the expensive/mutating endpoints. Detected via Railway's injected
+# vars, or forced with AUDITOR_FAIL_CLOSED=1. Local dev (no signal) stays open.
+IS_PRODUCTION = bool(
+    os.getenv('RAILWAY_GIT_COMMIT_SHA') or os.getenv('RAILWAY_ENVIRONMENT')
+    or os.getenv('AUDITOR_FAIL_CLOSED') == '1'
+)
+
+
+# Suppression denylist — domains that must not be audited or re-published
+# (e.g. a brand that has formally objected / issued a takedown). Seeded from
+# the SUPPRESSED_DOMAINS env var (comma-separated, durable across redeploys);
+# a by-domain delete with suppress=1 also adds to it for the current process.
+def _registrable(domain: str) -> str:
+    """Normalize to a bare host: strip scheme, leading www., trailing slash."""
+    d = (domain or '').strip().lower()
+    d = re.sub(r'^https?://', '', d).strip('/').split('/')[0]
+    return d[4:] if d.startswith('www.') else d
+
+
+SUPPRESSED_DOMAINS = {
+    _registrable(d) for d in os.getenv('SUPPRESSED_DOMAINS', '').split(',')
+    if d.strip()
+}
+SUPPRESS_LOCK = threading.Lock()
+
+# Merge durable suppressions from Supabase so takedowns survive redeploys, not
+# only the ones seeded via the env var (ENG-7). Best-effort at boot.
+try:
+    for _d in load_suppressions():
+        SUPPRESSED_DOMAINS.add(_registrable(_d))
+except Exception:
+    pass
+
+
+def _is_suppressed(url_or_domain: str) -> bool:
+    reg = _registrable(url_or_domain)
+    with SUPPRESS_LOCK:
+        return reg in SUPPRESSED_DOMAINS
+
+
+def _purge_local_artifacts(domain: Optional[str] = None,
+                           audit_id: Optional[str] = None) -> int:
+    """Delete on-disk audit artifacts (.json/.md/.pdf/.html) for a domain or
+    audit_id. Files are named '{slug}-{audit_id[:8]}.*' in OUTPUT_DIR."""
+    removed = 0
+    try:
+        if audit_id:
+            pattern = f'*-{audit_id[:8]}.*'
+        elif domain:
+            pattern = f'{_registrable(domain).replace(".", "-")}-*.*'
+        else:
+            return 0
+        for p in OUTPUT_DIR.glob(pattern):
+            try:
+                p.unlink()
+                removed += 1
+            except OSError:
+                pass
+    except Exception:
+        pass
+    return removed
+
+
+def _purge_jobs(domain: Optional[str] = None,
+                audit_id: Optional[str] = None) -> int:
+    """Drop in-memory JOBS entries matching a domain or audit_id."""
+    removed = 0
+    with JOBS_LOCK:
+        if audit_id:
+            if JOBS.pop(audit_id, None) is not None:
+                removed += 1
+        elif domain:
+            reg = _registrable(domain)
+            for aid in [a for a, j in JOBS.items()
+                        if _registrable(j.get('url', '')) == reg]:
+                JOBS.pop(aid, None)
+                removed += 1
+    return removed
+
+
+def _active_audit_count() -> int:
+    """Count queued+running jobs. Caller must hold JOBS_LOCK."""
+    return sum(1 for j in JOBS.values()
+               if j.get('status') in ('queued', 'running'))
+
+
+def _reap_and_evict_locked() -> None:
+    """Reap hung 'running' jobs and evict old finished ones. Holds JOBS_LOCK."""
+    now = time.time()
+    # Reap hung audits. Note MAX_AUDIT_SECONDS (default 1200) is deliberately >
+    # the agent loop's own TOTAL_BUDGET_SECONDS (900): the audit thread breaks
+    # itself at 900s, so by the time the reaper fires the worker has already
+    # exited on its own. The reaper is the backstop for the rare case where a
+    # tool subprocess wedged past its own timeout. We record it so a spike in
+    # reaps is visible rather than silent (ENG-6/SD-5).
+    for aid, j in JOBS.items():
+        if j.get('status') == 'running':
+            sub = j.get('_submitted_at') or 0
+            if sub and now - sub > MAX_AUDIT_SECONDS:
+                j['status'] = 'error'
+                j['error'] = f'audit exceeded {MAX_AUDIT_SECONDS}s wall-clock; reaped'
+                j['completed_at'] = datetime.now(timezone.utc).isoformat()
+                if monitoring:
+                    monitoring.audit_reaped(aid, now - sub)
+    # Evict oldest finished jobs over the cap
+    if len(JOBS) > MAX_TRACKED_JOBS:
+        finished = [(j.get('_submitted_at') or 0, aid)
+                    for aid, j in JOBS.items()
+                    if j.get('status') in ('completed', 'error')]
+        finished.sort()
+        for _, aid in finished[:len(JOBS) - MAX_TRACKED_JOBS]:
+            JOBS.pop(aid, None)
+
+
+# ----------------------------------------------------------------------
+# REQUEST / RESPONSE MODELS
+# ----------------------------------------------------------------------
+
+class AuditRequest(BaseModel):
+    url: HttpUrl
+
+
+class AuditResponse(BaseModel):
+    audit_id: str
+    status: str  # 'queued' | 'running' | 'completed' | 'error'
+    message: str
+    poll_url: str
+
+
+class AuditStatusResponse(BaseModel):
+    audit_id: str
+    status: str
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    duration_seconds: Optional[float] = None
+    error: Optional[str] = None
+    result_summary: Optional[dict] = None
+    artifacts: Optional[dict] = None
+    # Live progress (populated while status == 'running'):
+    # {phase, tool, turn, tool_count, elapsed_seconds, last_tool_ms}
+    progress: Optional[dict] = None
+    # Agent diagnostic fields — populated when status == 'error' and the
+    # failure originated in the agent loop (vs an exception at orchestration).
+    agent_errors: Optional[list] = None
+    raw_final_text_preview: Optional[str] = None
+    agent_turns: Optional[int] = None
+    tool_call_count: Optional[int] = None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+
+
+# ----------------------------------------------------------------------
+# FASTAPI APP
+# ----------------------------------------------------------------------
+
+# Interactive API docs (/docs, /redoc, /openapi.json) enumerate every route and
+# schema — useful in dev, needless attack-surface in prod. Disabled when a
+# production signal is present.
+app = FastAPI(
+    title='AEO/SEO/GEO Auditor',
+    description='Deterministic website audit service. '
+                'Sieve-brain-backed + Anthropic Sonnet, with runtime-authoritative scoring.',
+    version='5.0',
+    docs_url=None if IS_PRODUCTION else '/docs',
+    redoc_url=None if IS_PRODUCTION else '/redoc',
+    openapi_url=None if IS_PRODUCTION else '/openapi.json',
+)
+
+
+# ----------------------------------------------------------------------
+# AUTH — HTTP Basic, credentials from env vars (never in code)
+# ----------------------------------------------------------------------
+# Set in Railway: AUDIT_USERNAME and AUDIT_PASSWORD env vars.
+# If either is unset, AUTH IS DISABLED (service is fully public).
+# Always set both in production.
+
+AUDIT_USERNAME = os.getenv('AUDIT_USERNAME', '')
+AUDIT_PASSWORD = os.getenv('AUDIT_PASSWORD', '')
+AUTH_ENABLED = bool(AUDIT_USERNAME and AUDIT_PASSWORD)
+
+if not AUTH_ENABLED:
+    log.warning('AUTH DISABLED — AUDIT_USERNAME / AUDIT_PASSWORD env vars not set. '
+                'Service is publicly accessible. Set both in Railway to enable auth.')
+else:
+    log.info('AUTH enabled for user=%s', AUDIT_USERNAME)
+
+# API key auth — for server-to-server integrations (AnswerMonk, etc.)
+# Set in Railway: AUDIT_API_KEY env var. Independent of Basic Auth above.
+AUDIT_API_KEY = os.getenv('AUDIT_API_KEY', '')
+API_KEY_ENABLED = bool(AUDIT_API_KEY)
+
+if not API_KEY_ENABLED:
+    log.warning('API KEY AUTH DISABLED — AUDIT_API_KEY env var not set. '
+                'Programmatic endpoints /api/audit/* are unauthenticated.')
+
+
+def require_api_key(request: Request):
+    """Verify X-API-Key header against env-var-defined AUDIT_API_KEY.
+
+    If API_KEY_ENABLED is False (env var unset): fail CLOSED in production
+    (refuse rather than silently expose a paid, LLM-spending endpoint), but
+    stay open in local dev where no production signal is present.
+    Constant-time comparison.
+    """
+    if not API_KEY_ENABLED:
+        if IS_PRODUCTION:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail='API key auth not configured. Set AUDIT_API_KEY '
+                       '(fail-closed in production).',
+            )
+        return True
+    key = request.headers.get('X-API-Key', '')
+    if not key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Missing X-API-Key header',
+        )
+    if not secrets.compare_digest(key, AUDIT_API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Invalid API key',
+        )
+    return True
+
+
+_basic = HTTPBasic(auto_error=False)
+
+
+def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(_basic)):
+    """Verify HTTP Basic credentials against env-var-defined username/password.
+
+    If AUTH_ENABLED is False (env vars unset): fail CLOSED in production
+    (refuse rather than silently expose internal/enumeration/expensive routes),
+    but stay open in local dev where no production signal is present.
+    Uses constant-time comparison to prevent timing attacks.
+    Raises 401 with WWW-Authenticate header so browsers auto-prompt.
+    """
+    if not AUTH_ENABLED:
+        if IS_PRODUCTION:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail='Auth not configured. Set AUDIT_USERNAME and '
+                       'AUDIT_PASSWORD (fail-closed in production).',
+            )
+        return True
+
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Authentication required',
+            headers={'WWW-Authenticate': 'Basic realm="AEO Auditor"'},
+        )
+
+    user_ok = secrets.compare_digest(credentials.username, AUDIT_USERNAME)
+    pass_ok = secrets.compare_digest(credentials.password, AUDIT_PASSWORD)
+    if not (user_ok and pass_ok):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail='Invalid credentials',
+            headers={'WWW-Authenticate': 'Basic realm="AEO Auditor"'},
+        )
+    return True
+
+
+def require_admin(request: Request,
+                  credentials: Optional[HTTPBasicCredentials] = Depends(_basic)):
+    """Auth for destructive admin ops (delete / suppress). Passes when EITHER
+    a valid X-API-Key (server-to-server) OR valid HTTP Basic credentials (a
+    logged-in browser admin) are presented — so the homepage delete button
+    works without embedding the API key in client JS. Fail-closed in
+    production when no auth is configured at all."""
+    if API_KEY_ENABLED:
+        key = request.headers.get('X-API-Key', '')
+        if key and secrets.compare_digest(key, AUDIT_API_KEY):
+            return True
+    if AUTH_ENABLED and credentials is not None:
+        if (secrets.compare_digest(credentials.username, AUDIT_USERNAME)
+                and secrets.compare_digest(credentials.password, AUDIT_PASSWORD)):
+            return True
+    if not API_KEY_ENABLED and not AUTH_ENABLED:
+        # Nothing configured. Fail closed in production, allow in local dev.
+        if IS_PRODUCTION:
+            raise HTTPException(status_code=503, detail='Admin auth not configured')
+        return True
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail='Admin authentication required',
+        headers={'WWW-Authenticate': 'Basic realm="AEO Auditor"'},
+    )
+
+
+@app.middleware('http')
+async def request_logging_middleware(request, call_next):
+    """Log slow or non-2xx HTTP responses. Skips the normal 2xx/<1s noise
+    that uvicorn already prints, but always surfaces server errors and
+    audit-related calls (which can be slow)."""
+    t0 = time.time()
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        elapsed_ms = int((time.time() - t0) * 1000)
+        log.exception('request crashed: %s %s in %dms: %s',
+                      request.method, request.url.path, elapsed_ms, e)
+        raise
+    elapsed_ms = int((time.time() - t0) * 1000)
+    code = response.status_code
+    is_audit_path = request.url.path.startswith('/audit')
+    # Log conditions: server error, slow (>2s), or audit-related anomaly (>=400)
+    if code >= 500:
+        log.error('%s %s → %d in %dms', request.method, request.url.path, code, elapsed_ms)
+    elif code >= 400 and is_audit_path:
+        log.warning('%s %s → %d in %dms', request.method, request.url.path, code, elapsed_ms)
+    elif elapsed_ms > 2000:
+        log.info('SLOW %s %s → %d in %dms', request.method, request.url.path, code, elapsed_ms)
+    return response
+
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AEO / SEO / GEO Auditor</title>
+<style>
+  :root {
+    --bg:#0a0c0f; --bg-2:#0f1216; --panel:#14181d; --panel-2:#191e25;
+    --border:#262c33; --border-2:#2f3640;
+    --fg:#e7ecf2; --fg-2:#c5cdd9; --muted:#8a95a3; --muted-2:#5a6573;
+    --accent:#6ea8ff; --accent-2:#3d6fd9;
+    --good:#3ecf8e; --good-bg:#0f3a2a;
+    --warn:#f5b14b; --warn-bg:#3a2c10;
+    --bad:#ef6464; --bad-bg:#3a1414;
+    --crit:#ff4d4d; --crit-bg:#3d0d0d;
+    --code-bg:#0a0d11;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; padding:0; background:var(--bg); color:var(--fg);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;
+    -webkit-font-smoothing:antialiased; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 56px 24px 80px; }
+  h1 { font-size: 30px; margin: 0 0 6px; letter-spacing:-0.015em; font-weight:600; }
+  h2 { font-size: 13px; margin: 0 0 14px; text-transform:uppercase;
+       letter-spacing:0.08em; color:var(--muted); font-weight:600; }
+  h3 { font-size: 17px; margin: 0; font-weight:600; letter-spacing:-0.005em; }
+  h4 { font-size: 11px; margin: 0 0 6px; text-transform:uppercase;
+       letter-spacing:0.08em; color:var(--muted-2); font-weight:600; }
+  p { margin: 0 0 8px; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+
+  /* Header / form */
+  .tagline { color: var(--muted); margin-bottom: 28px; font-size: 14px; }
+  form { display:flex; gap:10px; margin-bottom:28px; }
+  input[type=url] { flex:1; background:var(--panel); border:1px solid var(--border);
+    color:var(--fg); padding:14px 16px; border-radius:10px; font-size:15px; outline:none;
+    transition: border-color 0.15s; }
+  input[type=url]:focus { border-color: var(--accent); }
+  button { background:var(--accent); color:#0a0c0f; border:0; padding:14px 24px;
+    border-radius:10px; font-weight:600; cursor:pointer; font-size:15px;
+    transition: background 0.15s; }
+  button:hover:not(:disabled) { background:#7fb3ff; }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
+
+  /* Status / spinner */
+  .status-card { background:var(--panel); border:1px solid var(--border);
+    border-radius:12px; padding:20px; }
+  .status { display:inline-flex; align-items:center; gap:8px; padding:5px 12px;
+    border-radius:999px; font-size:12px; background:#1b2330; color:var(--accent);
+    font-weight:500; }
+  .status.error { background:var(--bad-bg); color:var(--bad); }
+  .spinner { display:inline-block; width:10px; height:10px; border:2px solid var(--border);
+    border-top-color:var(--accent); border-radius:50%; animation:spin 0.8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .err { color:var(--bad); white-space:pre-wrap; font-family:ui-monospace,Menlo,monospace;
+    font-size:12px; margin-top:10px; }
+
+  /* Section card */
+  section { margin-top: 24px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:12px;
+    padding:22px 24px; }
+  .card.tight { padding:16px 18px; }
+
+  /* Hero */
+  .hero { background:linear-gradient(180deg, #131820, #0f1318);
+    border:1px solid var(--border); border-radius:14px; padding:24px 26px;
+    display:grid; grid-template-columns: 1fr auto; gap:18px 24px; align-items:start; }
+  .hero-meta-url { font-size:14px; color:var(--fg-2); font-weight:500;
+    word-break:break-all; }
+  .hero-meta-tags { color:var(--muted); font-size:13px; margin-top:4px; }
+  .hero-score { display:flex; align-items:center; gap:14px; }
+  .score-num { font-size:48px; font-weight:700; letter-spacing:-0.025em;
+    line-height:1; font-variant-numeric:tabular-nums; }
+  .grade { font-size:24px; font-weight:700; padding:6px 16px; border-radius:10px;
+    background:#222; line-height:1; }
+  .grade.A { background:var(--good-bg); color:var(--good); }
+  .grade.B { background:var(--good-bg); color:var(--good); }
+  .grade.C { background:var(--warn-bg); color:var(--warn); }
+  .grade.D, .grade.F { background:var(--bad-bg); color:var(--bad); }
+  .hero-diag { grid-column: 1 / -1; color:var(--fg-2); font-size:15.5px;
+    line-height:1.6; padding-top:16px; border-top:1px solid var(--border); }
+
+  /* Top fixes — the marquee section */
+  .fixes h2 { font-size:14px; color:var(--fg); }
+  .fix { background:var(--panel); border:1px solid var(--border); border-radius:12px;
+    padding:20px 22px; margin-bottom:14px; }
+  .fix-header { display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+    margin-bottom:14px; }
+  .fix-rank { font-size:13px; font-weight:700; color:var(--muted-2);
+    background:var(--bg-2); padding:3px 9px; border-radius:6px;
+    font-variant-numeric:tabular-nums; }
+  .fix-title { flex:1; font-size:17px; font-weight:600; min-width:200px; }
+  .fix-body { display:grid; grid-template-columns: 1fr; gap:12px; }
+  @media (min-width: 720px) {
+    .fix-body { grid-template-columns: 1fr 1fr; }
+    .fix-body .why { grid-column: 1 / -1; }
+  }
+  .fix-block { background:var(--bg-2); border:1px solid var(--border);
+    border-radius:8px; padding:12px 14px; }
+  .fix-block.why { background:transparent; border-color:transparent; padding:6px 0; }
+  .fix-block p, .fix-block pre { margin:0; font-size:14px; line-height:1.55;
+    color:var(--fg-2); }
+  pre { white-space:pre-wrap; word-break:break-word; font-family:ui-monospace,Menlo,monospace;
+    font-size:12.5px; background:var(--code-bg); border:1px solid var(--border);
+    padding:10px 12px; border-radius:6px; margin:6px 0; overflow-x:auto; }
+  code { font-family:ui-monospace,Menlo,monospace; font-size:12.5px;
+    background:var(--code-bg); padding:1px 5px; border-radius:4px; }
+
+  /* Badges */
+  .badge { display:inline-flex; align-items:center; font-size:11px; font-weight:600;
+    text-transform:uppercase; letter-spacing:0.04em; padding:3px 9px;
+    border-radius:5px; background:var(--bg-2); color:var(--fg-2);
+    border:1px solid var(--border); }
+  .badge.impact-critical { background:var(--crit-bg); color:var(--crit); border-color:#5a1a1a; }
+  .badge.impact-high { background:var(--bad-bg); color:var(--bad); border-color:#5a1f1f; }
+  .badge.impact-medium { background:var(--warn-bg); color:var(--warn); border-color:#5a3f15; }
+  .badge.impact-low { background:var(--bg-2); color:var(--muted); }
+  .badge.effort-trivial, .badge.effort-easy { background:var(--good-bg); color:var(--good); border-color:#1a4f3a; }
+  .badge.effort-moderate { background:var(--warn-bg); color:var(--warn); border-color:#5a3f15; }
+  .badge.effort-heavy { background:var(--bad-bg); color:var(--bad); border-color:#5a1f1f; }
+  .badge.truth { background:#1a2335; color:var(--accent); border-color:#2a3a55; }
+  .badge.type { background:var(--bg-2); color:var(--muted); }
+
+  /* Why not cited cards */
+  .wnc-grid { display:grid; gap:14px; }
+  @media (min-width:720px) { .wnc-grid { grid-template-columns: repeat(3, 1fr); } }
+  .wnc { background:var(--panel); border:1px solid var(--border); border-radius:12px;
+    padding:18px 20px; }
+  .wnc h3 { font-size:15px; margin:8px 0 10px; }
+  .wnc p { color:var(--fg-2); font-size:14px; line-height:1.55; }
+
+  /* Score breakdown */
+  .scorebars { display:grid; gap:8px; }
+  .sb-row { display:grid; grid-template-columns: 180px 1fr 50px; gap:12px;
+    align-items:center; }
+  .sb-label { font-size:13px; color:var(--fg-2); }
+  .sb-bar { background:var(--bg-2); height:8px; border-radius:999px; overflow:hidden;
+    border:1px solid var(--border); }
+  .sb-fill { height:100%; background:var(--accent); border-radius:999px;
+    transition: width 0.4s; }
+  .sb-fill.bad { background:var(--bad); }
+  .sb-fill.warn { background:var(--warn); }
+  .sb-fill.good { background:var(--good); }
+  .sb-val { font-size:13px; text-align:right; font-variant-numeric:tabular-nums;
+    color:var(--fg-2); }
+  .sb-val.na { color:var(--muted-2); }
+
+  /* Two-column diagnostic (bots eye + perf) */
+  .twocol { display:grid; gap:14px; }
+  @media (min-width:720px) { .twocol { grid-template-columns: 1fr 1fr; } }
+  .stat-table { width:100%; border-collapse:collapse; font-size:13px; }
+  .stat-table td { padding:7px 0; border-bottom:1px solid var(--border); vertical-align:top; }
+  .stat-table tr:last-child td { border-bottom:0; }
+  .stat-table td:first-child { color:var(--muted); width:50%; }
+  .stat-table td:last-child { color:var(--fg-2); text-align:right;
+    font-variant-numeric:tabular-nums; word-break:break-word; }
+
+  /* Competitor table */
+  .comp-table { width:100%; border-collapse:collapse; font-size:13px; }
+  .comp-table th, .comp-table td { padding:9px 10px; border-bottom:1px solid var(--border);
+    text-align:left; vertical-align:top; }
+  .comp-table th { color:var(--muted); font-weight:600; font-size:11px;
+    text-transform:uppercase; letter-spacing:0.04em; background:var(--bg-2); }
+  .comp-table tr.target td { background:#162030; }
+  .comp-table td { font-variant-numeric:tabular-nums; }
+  .comp-table td:first-child { font-weight:500; color:var(--fg); }
+
+  /* Findings table (Layer 2) */
+  details { background:var(--panel); border:1px solid var(--border);
+    border-radius:12px; padding:14px 18px; }
+  details > summary { cursor:pointer; user-select:none; color:var(--fg-2);
+    font-size:14px; font-weight:500; padding:4px 0; }
+  details[open] > summary { margin-bottom:12px; }
+  .findings-table { width:100%; border-collapse:collapse; font-size:13px; }
+  .findings-table th, .findings-table td { padding:8px 10px;
+    border-bottom:1px solid var(--border); text-align:left; vertical-align:top; }
+  .findings-table th { color:var(--muted); font-weight:600; font-size:11px;
+    text-transform:uppercase; letter-spacing:0.04em; }
+  .status-icon { display:inline-block; width:18px; text-align:center; font-weight:700; }
+  .status-icon.fail { color:var(--bad); }
+  .status-icon.warn { color:var(--warn); }
+  .status-icon.pass { color:var(--good); }
+  .check-id { font-family:ui-monospace,Menlo,monospace; font-size:12px;
+    color:var(--muted); }
+
+  /* Quick wins */
+  .qw-list { padding-left:0; list-style:none; }
+  .qw-list li { padding:8px 0; padding-left:24px; position:relative;
+    border-bottom:1px solid var(--border); color:var(--fg-2); font-size:14px; }
+  .qw-list li:last-child { border-bottom:0; }
+  .qw-list li:before { content:'✓'; position:absolute; left:0; color:var(--good);
+    font-weight:700; }
+
+  /* Citations / brain */
+  .tier { margin-bottom:16px; }
+  .tier h3 { font-size:13px; color:var(--muted); margin-bottom:8px;
+    text-transform:uppercase; letter-spacing:0.05em; font-weight:600; }
+  .citation { font-size:13px; color:var(--fg-2); padding:5px 0;
+    border-bottom:1px solid var(--border); }
+  .citation:last-child { border-bottom:0; }
+  .citation .src { color:var(--accent); font-weight:500; }
+  .citation .nm { color:var(--fg-2); }
+
+  /* Downloads */
+  .links { display:flex; gap:10px; flex-wrap:wrap; }
+  .links a { background:var(--bg-2); border:1px solid var(--border); color:var(--fg);
+    padding:10px 16px; border-radius:8px; font-size:13px; font-weight:500;
+    transition: border-color 0.15s, color 0.15s; }
+  .links a:hover { border-color: var(--accent); color:var(--accent);
+    text-decoration:none; }
+
+  /* Library — audit cards grid */
+  .lib-head { display:flex; align-items:baseline; justify-content:space-between;
+    margin:36px 0 14px; }
+  .lib-head h2 { margin:0; }
+  .lib-count { color:var(--muted-2); font-size:12px; }
+  .lib-grid { display:grid; gap:12px;
+    grid-template-columns:repeat(auto-fill,minmax(230px,1fr)); }
+  .lib-card { position:relative; display:block; background:var(--panel);
+    border:1px solid var(--border); border-radius:11px; padding:16px 18px;
+    color:inherit; transition:border-color 0.15s, transform 0.1s, background 0.15s; }
+  .lib-card:hover { border-color:var(--accent); transform:translateY(-2px);
+    background:var(--panel-2); }
+  /* Whole-card overlay link (sits under the delete button). */
+  .lib-link { position:absolute; inset:0; z-index:1; border-radius:11px;
+    text-decoration:none; }
+  .lib-del { position:absolute; top:8px; right:8px; z-index:2; width:24px;
+    height:24px; padding:0; border:1px solid var(--border); border-radius:6px;
+    background:var(--panel-2); color:var(--muted-2); font-size:13px;
+    line-height:1; cursor:pointer; opacity:0.4; transition:opacity 0.12s,
+    background 0.12s, color 0.12s; }
+  .lib-card:hover .lib-del, .lib-del:focus { opacity:1; }
+  .lib-del:hover { background:var(--bad-bg); color:var(--bad);
+    border-color:var(--bad); }
+  .lib-domain { font-weight:600; font-size:14.5px; color:var(--fg);
+    word-break:break-all; line-height:1.35; }
+  .lib-sub { color:var(--muted); font-size:12px; margin-top:3px; }
+  .lib-row { display:flex; align-items:center; gap:12px; margin-top:14px; }
+  .lib-score { font-size:30px; font-weight:700; letter-spacing:-0.02em;
+    line-height:1; font-variant-numeric:tabular-nums; }
+  .lib-grade { font-size:14px; font-weight:700; padding:3px 10px; border-radius:6px;
+    background:#222; line-height:1; }
+  .lib-grade.A, .lib-grade.B { background:var(--good-bg); color:var(--good); }
+  .lib-grade.C { background:var(--warn-bg); color:var(--warn); }
+  .lib-grade.D, .lib-grade.F { background:var(--bad-bg); color:var(--bad); }
+  .lib-meta { margin-left:auto; text-align:right; color:var(--muted-2);
+    font-size:11px; line-height:1.5; }
+  .lib-empty { color:var(--muted); font-size:13px; padding:20px;
+    background:var(--panel); border:1px solid var(--border); border-radius:11px;
+    text-align:center; }
+
+  /* Footer */
+  footer { color:var(--muted); font-size:12px; margin-top:48px;
+    text-align:center; padding-top:20px; border-top:1px solid var(--border); }
+  footer a { color:var(--muted); }
+
+  /* Misc */
+  .err-block { background:var(--bad-bg); border:1px solid #5a1f1f;
+    border-radius:8px; padding:12px 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>AEO / SEO / GEO Auditor</h1>
+  <div class="tagline">Full 97-check audit · Sieve brain (12,764 entries) · Claude Sonnet 4.6</div>
+
+  <form id="f">
+    <input id="url" type="text" inputmode="url" autocomplete="url"
+           placeholder="example.com   (or https://example.com/page)"
+           required autofocus spellcheck="false" autocapitalize="off">
+    <button id="go" type="submit">Run audit</button>
+  </form>
+
+  <div id="out"></div>
+
+  <div id="library"></div>
+
+  <footer>
+    JSON API: <a href="/api">/api</a> · Health: <a href="/healthz">/healthz</a> · Docs: <a href="/docs">/docs</a>
+  </footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const out = $('out');
+
+function normalizeUrl(raw) {
+  // Trim + auto-prepend https:// when the user types a bare domain like
+  // "feelvaleo.com" or "www.feelvaleo.com/path". Leaves explicit http:// /
+  // https:// untouched. Strips leading "//".
+  let s = String(raw || '').trim();
+  if (!s) return '';
+  // Common paste artifacts: "http://https://..." or scheme typos
+  s = s.replace(/^\s+|\s+$/g, '');
+  if (/^https?:\/\//i.test(s)) return s;
+  if (s.startsWith('//')) return 'https:' + s;
+  return 'https://' + s;
+}
+
+$('f').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const url = normalizeUrl($('url').value);
+  if (!url) return;
+  // Reflect the normalized URL back in the field so the user sees what we sent
+  $('url').value = url;
+  $('go').disabled = true;
+  out.innerHTML = '<div class="status-card"><span class="status"><span class="spinner"></span>Submitting…</span></div>';
+
+  try {
+    const r = await fetch('/audit', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({url})
+    });
+    if (!r.ok) throw new Error('Submit failed: ' + r.status + ' ' + (await r.text()));
+    const {audit_id} = await r.json();
+    await poll(audit_id);
+  } catch (err) {
+    out.innerHTML = renderError(err.message);
+  } finally {
+    $('go').disabled = false;
+  }
+});
+
+async function poll(id) {
+  const started = Date.now();
+  let consecutive404 = 0;
+  while (true) {
+    const r = await fetch('/audit/' + id);
+    const elapsed = Math.round((Date.now() - started) / 1000);
+
+    // 404 = audit not in server's JOBS dict. Either it was never created,
+    // or the server restarted (Railway redeploy) and the in-memory state
+    // was wiped. Tolerate 2 consecutive 404s in case of a race; bail on 3rd.
+    if (r.status === 404) {
+      consecutive404 += 1;
+      if (consecutive404 >= 3) {
+        out.innerHTML = renderError(
+          'Audit ' + id.slice(0,8) + '… not found on the server.\n\n' +
+          'Most likely cause: the service redeployed mid-audit (Railway in-memory ' +
+          'job state is wiped on every container restart). Please resubmit the URL.'
+        );
+        return;
+      }
+      await new Promise(r => setTimeout(r, 3000));
+      continue;
+    }
+    consecutive404 = 0;
+
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      out.innerHTML = renderError('Status check failed: HTTP ' + r.status +
+        (body ? '\n\n' + body.slice(0, 500) : ''));
+      return;
+    }
+
+    const data = await r.json();
+
+    if (data.status === 'completed') {
+      // Fetch full audit JSON for rich render
+      try {
+        const rJson = await fetch('/audit/' + id + '/json');
+        if (rJson.ok) {
+          const fullAudit = await rJson.json();
+          renderFull(fullAudit, data, id);
+          loadLibrary();  // refresh the grid so the new audit appears
+          return;
+        }
+      } catch(e) { /* fall through to summary render */ }
+      renderSummary(data, id);
+      loadLibrary();
+      return;
+    }
+    if (data.status === 'error') {
+      let msg = data.error || 'unknown error';
+      if (data.agent_errors && data.agent_errors.length) {
+        msg += '\n\nAgent errors:\n  - ' + data.agent_errors.join('\n  - ');
+      }
+      if (data.raw_final_text_preview) {
+        msg += '\n\nLast assistant text (preview):\n' + data.raw_final_text_preview.slice(0, 800);
+      }
+      const stats = [];
+      if (data.agent_turns != null) stats.push(data.agent_turns + ' turns');
+      if (data.tool_call_count != null) stats.push(data.tool_call_count + ' tool calls');
+      if (data.input_tokens != null) stats.push((data.input_tokens + (data.output_tokens||0)) + ' tokens');
+      if (stats.length) msg += '\n\nAgent stats: ' + stats.join(' · ');
+      out.innerHTML = renderError(msg);
+      return;
+    }
+
+    const prog = data.progress || {};
+    const phaseLine = prog.phase || (data.status === 'queued' ? 'Queued' : 'Starting up...');
+    const statsLine = [];
+    if (prog.turn) statsLine.push('turn ' + prog.turn);
+    if (prog.tool_count) statsLine.push(prog.tool_count + ' tool calls');
+    if (prog.last_tool_ms) statsLine.push('last ' + prog.last_tool_ms + 'ms');
+    const statsStr = statsLine.length ? ' · ' + statsLine.join(' · ') : '';
+
+    out.innerHTML =
+      '<div class="status-card">' +
+        '<span class="status"><span class="spinner"></span>' +
+          escapeHtml(phaseLine) + ' · ' + elapsed + 's' +
+        '</span>' +
+        (statsStr ? '<div style="color:var(--muted-2);font-size:12px;margin-top:6px;font-variant-numeric:tabular-nums">' + escapeHtml(statsStr.slice(3)) + '</div>' : '') +
+        '<div style="color:var(--muted);font-size:13px;margin-top:12px;line-height:1.55">' +
+          'Typical completion: 90–300 seconds depending on site complexity. The agent is running 95+ checks across Technical, Performance, On-Page, Schema, AEO Discovery/Extraction/Trust/Selection, GEO, and Entity Consistency — including a 5-competitor crawl and Sieve brain citation enrichment.' +
+        '</div>' +
+      '</div>';
+    await new Promise(r => setTimeout(r, 3000));
+  }
+}
+
+function renderError(msg) {
+  return '<div class="status-card"><span class="status error">Error</span>' +
+    '<div class="err">' + escapeHtml(msg) + '</div></div>';
+}
+
+function renderSummary(data, id) {
+  // Fallback render when full JSON unavailable
+  const s = data.result_summary || {};
+  out.innerHTML = renderHero(s, data.duration_seconds, s.findings_count || 0) +
+    renderDownloads(id, data.artifacts || {});
+}
+
+function renderFull(audit, status, id) {
+  const cls = audit.classification || {};
+  const sc = audit.scoring || {};
+  const narr = audit.narrative || {};
+  const findings = audit.findings || [];
+  const competitors = audit.competitor_comparison || [];
+  const bev = audit.bots_eye_view || (audit.scripts_output && audit.scripts_output.bots_eye_view) || {};
+  const perf = audit.performance || {};
+
+  const heroData = {
+    url: audit.url,
+    page_type: cls.page_type,
+    industry: cls.industry,
+    company_name: cls.company_name,
+    overall_score: sc.overall_score ?? sc.page_citation_readiness,
+    overall_grade: sc.overall_grade,
+    executive_diagnosis: narr.executive_diagnosis,
+  };
+
+  const html = [
+    renderHero(heroData, audit.duration_seconds, findings.length),
+    renderTopFixes(narr.top_5_fixes || []),
+    renderWhyNotCited(narr.why_not_cited || [], (narr.top_5_fixes || []).length ? null : (findings.find(f => f.citations && f.citations.length))),
+    renderScoreBreakdown(sc),
+    renderTwoCol(bev, perf, audit),
+    renderCompetitors(competitors, audit.domain),
+    renderQuickWins(narr.quick_wins || []),
+    renderSummary_text(narr.summary_what_to_do),
+    renderAllFindings(findings),
+    renderBrainSources(findings),
+    renderDownloads(id, status.artifacts || {}),
+  ];
+  out.innerHTML = html.filter(Boolean).join('');
+  // Reflect the audited domain in the URL so the page is bookmarkable /
+  // shareable as audits.growthmonk.ai/{domain}.
+  if (audit && audit.domain) {
+    try { history.replaceState({}, '', '/' + audit.domain); } catch (e) {}
+  }
+}
+
+function renderHero(s, duration, findingsCount) {
+  const grade = (s.overall_grade || '').charAt(0).toUpperCase();
+  const meta = [s.page_type, s.industry, s.company_name].filter(Boolean).join(' · ');
+  return (
+    '<div class="hero">' +
+      '<div>' +
+        '<div class="hero-meta-url">' + escapeHtml(s.url || '') + '</div>' +
+        '<div class="hero-meta-tags">' + escapeHtml(meta || '—') +
+          ' · ' + (duration || '?') + 's · ' + findingsCount + ' findings' +
+        '</div>' +
+      '</div>' +
+      '<div class="hero-score">' +
+        '<div class="score-num">' + numOrDash(s.overall_score) + '</div>' +
+        '<div class="grade ' + escapeHtml(grade) + '">' + escapeHtml(s.overall_grade || '—') + '</div>' +
+      '</div>' +
+      (s.executive_diagnosis ? '<div class="hero-diag">' + escapeHtml(s.executive_diagnosis) + '</div>' : '') +
+    '</div>'
+  );
+}
+
+function renderTopFixes(fixes) {
+  if (!fixes || !fixes.length) return '';
+  let html = '<section class="fixes"><h2>Top fixes that matter</h2>';
+  for (const f of fixes) {
+    const impact = String(f.impact || '').toLowerCase();
+    const effort = String(f.effort || '').toLowerCase();
+    html +=
+      '<div class="fix">' +
+        '<div class="fix-header">' +
+          '<span class="fix-rank">#' + (f.rank || '?') + '</span>' +
+          '<span class="fix-title">' + escapeHtml(f.title || '') + '</span>' +
+          (f.impact ? '<span class="badge impact-' + escapeHtml(impact) + '">' + escapeHtml(f.impact) + ' impact</span>' : '') +
+          (f.effort ? '<span class="badge effort-' + escapeHtml(effort) + '">' + escapeHtml(f.effort) + ' effort</span>' : '') +
+          (f.type ? '<span class="badge type">' + escapeHtml(f.type) + '</span>' : '') +
+          (f.truth_badge ? '<span class="badge truth">' + escapeHtml(f.truth_badge) + '</span>' : '') +
+        '</div>' +
+        '<div class="fix-body">' +
+          (f.before ? '<div class="fix-block"><h4>Currently</h4>' + formatBlock(f.before) + '</div>' : '') +
+          (f.after ? '<div class="fix-block"><h4>Recommended</h4>' + formatBlock(f.after) + '</div>' : '') +
+          (f.why ? '<div class="fix-block why"><h4>Why this matters</h4><p>' + escapeHtml(f.why) + '</p></div>' : '') +
+        '</div>' +
+      '</div>';
+  }
+  html += '</section>';
+  return html;
+}
+
+function renderWhyNotCited(items) {
+  if (!items || !items.length) return '';
+  let html = '<section><h2>Why this page isn\'t being cited</h2><div class="wnc-grid">';
+  for (const it of items) {
+    html +=
+      '<div class="wnc">' +
+        (it.badge ? '<span class="badge truth">' + escapeHtml(it.badge) + '</span>' : '') +
+        '<h3>' + escapeHtml(it.title || '') + '</h3>' +
+        '<p>' + escapeHtml(it.body || '') + '</p>' +
+      '</div>';
+  }
+  html += '</div></section>';
+  return html;
+}
+
+function renderScoreBreakdown(sc) {
+  const sec = sc.section_scores || {};
+  const order = ['A_technical','B_performance','C_onpage','D_schema',
+    'E_aeo_discovery','F_aeo_extraction','G_aeo_trust','H_aeo_selection',
+    'I_geo','J_entity'];
+  const labels = {
+    'A_technical': 'A · Technical SEO',
+    'B_performance': 'B · Performance',
+    'C_onpage': 'C · On-Page SEO',
+    'D_schema': 'D · Schema',
+    'E_aeo_discovery': 'E · AEO Discovery',
+    'F_aeo_extraction': 'F · AEO Extraction',
+    'G_aeo_trust': 'G · AEO Trust',
+    'H_aeo_selection': 'H · AEO Selection',
+    'I_geo': 'I · GEO',
+    'J_entity': 'J · Entity Consistency',
+  };
+  let rows = '';
+  for (const k of order) {
+    if (!(k in sec)) continue;
+    const v = sec[k];
+    if (v === null || v === undefined) {
+      rows += '<div class="sb-row"><div class="sb-label">' + escapeHtml(labels[k] || k) +
+        '</div><div class="sb-bar"></div><div class="sb-val na">N/A</div></div>';
+    } else {
+      const cls = v >= 75 ? 'good' : v >= 50 ? 'warn' : 'bad';
+      rows += '<div class="sb-row">' +
+        '<div class="sb-label">' + escapeHtml(labels[k] || k) + '</div>' +
+        '<div class="sb-bar"><div class="sb-fill ' + cls + '" style="width:' + pctWidth(v) + '%"></div></div>' +
+        '<div class="sb-val">' + numOrDash(v) + '</div>' +
+      '</div>';
+    }
+  }
+  let extras = '';
+  if (sc.brand_ai_presence != null) {
+    const bapConf = sc.brand_ai_presence_confidence
+      ? ' <span style="color:var(--muted-2)">(' + escapeHtml(String(sc.brand_ai_presence_confidence)) + ' confidence, directional)</span>'
+      : '';
+    extras += '<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border);font-size:13px;color:var(--muted)">' +
+      'Brand AI Presence (BAP): <strong style="color:var(--fg)">' + numOrDash(sc.brand_ai_presence) + '</strong>' + bapConf +
+      (sc.seo_score != null ? ' · SEO: <strong style="color:var(--fg)">' + numOrDash(sc.seo_score) + '</strong>' : '') +
+      (sc.aeo_score != null ? ' · AEO: <strong style="color:var(--fg)">' + numOrDash(sc.aeo_score) + '</strong>' : '') +
+      (sc.citation_readiness != null ? ' · Citation readiness: <strong style="color:var(--fg)">' + numOrDash(sc.citation_readiness) + '</strong>' : '') +
+      '</div>';
+  }
+  return '<section><h2>Score breakdown</h2><div class="card"><div class="scorebars">' +
+    rows + '</div>' + extras + '</div></section>';
+}
+
+function renderTwoCol(bev, perf, audit) {
+  const cvb = bev.content_visible_to_bots || {};
+  const pid = bev.page_identity || {};
+  const summary = bev.summary || {};
+
+  // Handle multiple possible field-name conventions across agent vs script outputs
+  const faqVisible = cvb.faq_visible_pairs ?? cvb.faq_visible ?? summary.faq_visible ?? bev.faq_visible_pairs;
+  const faqSchema = cvb.faq_schema_pairs ?? cvb.faq_schema ?? summary.faq_schema ?? bev.faq_schema_pairs;
+  const faqStr = (faqVisible !== undefined && faqSchema !== undefined)
+    ? faqVisible + ' / ' + faqSchema
+    : null;
+  const wordCount = cvb.visible_word_count ?? summary.visible_words_default ?? cvb.visible_words ?? bev.visible_word_count;
+
+  const bevRows = [
+    ['Visible word count', wordCount],
+    ['Schema blocks', cvb.schema_block_count ?? summary.schema_blocks ?? bev.schema_block_count],
+    ['FAQ visible / in schema', faqStr],
+    ['Title', pid.title || bev.title],
+    ['H1', pid.h1_first || bev.h1_first],
+    ['Canonical', pid.canonical_tag || bev.canonical || 'none'],
+    ['Meta robots', pid.meta_robots || bev.meta_robots || 'none'],
+    ['Classification', bev.classification],
+  ];
+  const perfRows = [
+    ['TTFB', perf.ttfb_ms != null ? perf.ttfb_ms + ' ms' : null],
+    ['LCP', perf.lcp_ms != null ? perf.lcp_ms + ' ms' : null],
+    ['CLS', perf.cls != null ? perf.cls.toFixed ? perf.cls.toFixed(3) : perf.cls : null],
+    ['Load time', perf.load_time_ms != null ? perf.load_time_ms + ' ms' : null],
+    ['Request count', perf.request_count],
+    ['SPA framework', (perf.spa_signals || []).join(', ') || 'none detected'],
+    ['Console errors', perf.console_errors ? perf.console_errors.length : null],
+  ];
+
+  function tableRows(rows) {
+    return rows.filter(r => r[1] !== null && r[1] !== undefined && r[1] !== '')
+      .map(r => '<tr><td>' + escapeHtml(r[0]) + '</td><td>' + escapeHtml(String(r[1])) + '</td></tr>')
+      .join('');
+  }
+
+  const bevHtml = tableRows(bevRows);
+  const perfHtml = tableRows(perfRows);
+
+  if (!bevHtml && !perfHtml) return '';
+
+  return '<section><h2>How crawlers see this page</h2><div class="twocol">' +
+    (bevHtml ? '<div class="card"><h3 style="font-size:14px;margin-bottom:10px">Bot\'s eye view</h3><table class="stat-table"><tbody>' + bevHtml + '</tbody></table></div>' : '') +
+    (perfHtml ? '<div class="card"><h3 style="font-size:14px;margin-bottom:10px">Performance</h3><table class="stat-table"><tbody>' + perfHtml + '</tbody></table></div>' : '') +
+    '</div></section>';
+}
+
+function renderCompetitors(comps, ourDomain) {
+  if (!comps || !comps.length) return '';
+  let rows = '';
+  for (const c of comps) {
+    const isUs = c.domain === ourDomain;
+    rows +=
+      '<tr' + (isUs ? ' class="target"' : '') + '>' +
+        '<td>' + escapeHtml(c.domain || '') + (isUs ? ' (you)' : '') + '</td>' +
+        '<td>' + (c.word_count ?? '—') + '</td>' +
+        '<td>' + (c.faq_pairs ?? '—') + '</td>' +
+        '<td>' + escapeHtml(((c.schema_types || [])).join(', ') || '—') + '</td>' +
+        '<td>' + escapeHtml(c.dateModified || '—') + '</td>' +
+        '<td>' + escapeHtml(c.author || '—') + '</td>' +
+        '<td>' + (c.outbound_links ?? '—') + '</td>' +
+      '</tr>';
+  }
+  return '<section><h2>How you compare to competitors</h2><div class="card tight">' +
+    '<table class="comp-table"><thead><tr>' +
+      '<th>Domain</th><th>Words</th><th>FAQ</th><th>Schema types</th>' +
+      '<th>Modified</th><th>Author</th><th>Outbound</th>' +
+    '</tr></thead><tbody>' + rows + '</tbody></table></div></section>';
+}
+
+function renderQuickWins(items) {
+  if (!items || !items.length) return '';
+  let lis = '';
+  for (const it of items) lis += '<li>' + escapeHtml(it) + '</li>';
+  return '<section><h2>Quick wins (under 5 min each)</h2><div class="card"><ul class="qw-list">' +
+    lis + '</ul></div></section>';
+}
+
+function renderSummary_text(s) {
+  if (!s) return '';
+  return '<section><h2>What to do this week</h2><div class="card" style="line-height:1.65;color:var(--fg-2)">' +
+    escapeHtml(s) + '</div></section>';
+}
+
+function renderAllFindings(findings) {
+  if (!findings || !findings.length) return '';
+  // Group: failures first, then warnings, then passes
+  const sortKey = f => (f.status === 'fail' ? 0 : f.status === 'warn' ? 1 : 2);
+  const sorted = [...findings].sort((a,b) => sortKey(a) - sortKey(b));
+  let rows = '';
+  for (const f of sorted.slice(0, 120)) {
+    const icon = f.status === 'fail' ? '✗' : f.status === 'warn' ? '⚠' : f.status === 'pass' ? '✓' : '·';
+    rows +=
+      '<tr>' +
+        '<td><span class="status-icon ' + escapeHtml(f.status || '') + '">' + icon + '</span></td>' +
+        '<td><span class="check-id">' + escapeHtml(f.check_id || '') + '</span></td>' +
+        '<td>' + escapeHtml(f.severity || '—') + '</td>' +
+        '<td>' + escapeHtml((f.evidence || '').slice(0, 220)) + '</td>' +
+        '<td>' + (f.truth_badge ? '<span class="badge truth">' + escapeHtml(f.truth_badge) + '</span>' : '') + '</td>' +
+      '</tr>';
+  }
+  return '<section><details><summary>All findings (' + findings.length + ' checks · click to expand)</summary>' +
+    '<table class="findings-table"><thead><tr>' +
+      '<th></th><th>Check</th><th>Severity</th><th>Evidence</th><th>Truth</th>' +
+    '</tr></thead><tbody>' + rows + '</tbody></table></details></section>';
+}
+
+function renderBrainSources(findings) {
+  // Collect unique citations grouped by tier. Skip citations that have no
+  // usable content (no name AND no source_org AND no source_url) — those
+  // are the agent emitting partial/reshaped objects.
+  const seen = new Set();
+  const byTier = {1:[], 2:[], 3:[], 4:[], 5:[]};
+  for (const f of findings) {
+    for (const c of (f.citations || [])) {
+      const name = c.name || c.title;
+      const hasContent = name || c.source_org || c.source_url;
+      if (!hasContent) continue;  // skip empty/malformed
+      const dedupKey = (c.id ?? name) + ':' + (c.kind || '?');
+      if (seen.has(dedupKey)) continue;
+      seen.add(dedupKey);
+      const tier = c.tier || 5;
+      (byTier[tier] = byTier[tier] || []).push(c);
+    }
+  }
+  const totalCites = seen.size;
+  if (!totalCites) return '';
+  const tierLabels = {1:'🥇 Tier 1 — Authoritative', 2:'🥈 Tier 2 — Reputable',
+                       3:'🥉 Tier 3 — Industry', 4:'📎 Tier 4 — Specialized', 5:'Other'};
+  let html = '<section><h2>Sources cited (' + totalCites + ' from Sieve brain)</h2><div class="card">';
+  for (const t of [1,2,3,4,5]) {
+    if (!byTier[t] || !byTier[t].length) continue;
+    html += '<div class="tier"><h3>' + tierLabels[t] + '</h3>';
+    for (const c of byTier[t].slice(0, 12)) {
+      const kind = c.kind === 'rule' ? 'Rule' : c.kind === 'anti_pattern' ? 'AP' : 'Item';
+      const name = c.name || c.title || '(no name)';
+      // Confidence/risk badges where available
+      const conf = (c.confidence_score != null) ? ' (conf ' + c.confidence_score + ')' : '';
+      const risk = c.risk_level ? ' [' + escapeHtml(c.risk_level) + ' risk]' : '';
+      // Only show [#id] if id is actually a usable number
+      const idTag = (c.id != null && c.id !== '' && !isNaN(c.id))
+        ? ' <code style="font-size:11px">[Sieve ' + kind + ' #' + escapeHtml(String(c.id)) + ']</code>'
+        : '';
+      const safeUrl = c.source_url ? safeHref(c.source_url) : '';
+      html += '<div class="citation">' +
+        '<span class="src">' + escapeHtml(c.source_org || 'unknown') + '</span> — ' +
+        (safeUrl ? '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' : '') +
+        '<span class="nm">' + escapeHtml(name) + '</span>' +
+        (safeUrl ? '</a>' : '') +
+        conf + risk + idTag +
+        '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div></section>';
+  return html;
+}
+
+function renderDownloads(id, artifacts) {
+  return '<section><h2>Download artifacts</h2><div class="card tight">' +
+    '<div class="links">' +
+      '<a href="' + (artifacts.json || '/audit/'+id+'/json') + '" target="_blank">Full JSON</a>' +
+      '<a href="' + (artifacts.markdown || '/audit/'+id+'/md') + '" target="_blank">Markdown report</a>' +
+      '<a href="' + (artifacts.pdf || '/audit/'+id+'/pdf') + '" target="_blank">PDF summary</a>' +
+    '</div></div></section>';
+}
+
+function formatBlock(text) {
+  // Detect code-like content (JSON, HTML, multiline indented blocks) vs prose.
+  if (!text) return '';
+  const t = String(text);
+  const looksCode = /^(\s*[<{]|<\w|<!|```)/m.test(t.trim()) || /\n\s{2,}/.test(t);
+  if (looksCode) {
+    // Strip ```lang fences if present
+    const stripped = t.replace(/^```\w*\n?|\n?```$/g, '').trim();
+    return '<pre>' + escapeHtml(stripped) + '</pre>';
+  }
+  return '<p>' + escapeHtml(t).replace(/\n/g, '<br>') + '</p>';
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// Only allow http(s) hrefs. Citation source_url is model/page-derived, so a
+// 'javascript:'/'data:' scheme would execute in this origin when clicked.
+// Returns a safe href string, or '' when the scheme isn't http(s).
+function safeHref(u) {
+  try {
+    const parsed = new URL(String(u), window.location.origin);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return escapeHtml(parsed.href);
+    }
+  } catch (e) { /* malformed URL → no link */ }
+  return '';
+}
+
+// Score values originate from the model and round-trip through the DB. A
+// non-numeric value (e.g. '85"><script>...') interpolated into HTML text or a
+// style attribute is a stored-XSS vector. numOrDash coerces to a finite number
+// (rendered as-is — a number can't carry markup) or a safe em-dash. pctWidth
+// additionally clamps to [0,100] for use inside style="width:...%". The server
+// also validates scores before persisting (scoring.validate_audit) — this is
+// defense in depth at the render layer.
+function numOrDash(x) {
+  const n = Number(x);
+  return Number.isFinite(n) ? String(n) : '—';
+}
+function pctWidth(x) {
+  const n = Number(x);
+  if (!Number.isFinite(n)) return '0';
+  return String(Math.max(0, Math.min(100, n)));
+}
+
+// ---- Slug routing: audits.growthmonk.ai/{domain} ----------------------
+// On load, if the path is /{domain}, fetch and render that domain's
+// latest persisted audit. Path '/' shows the empty form as normal.
+
+async function loadAuditByDomain(domain) {
+  out.innerHTML = '<div class="status-card"><span class="status">' +
+    '<span class="spinner"></span>Loading latest audit for ' +
+    escapeHtml(domain) + '…</span></div>';
+  try {
+    const r = await fetch('/api/by-domain/' + encodeURIComponent(domain));
+    if (r.status === 404) {
+      $('url').value = /^https?:\/\//.test(domain) ? domain : 'https://' + domain;
+      out.innerHTML = '<div class="status-card">No saved audit for <strong>' +
+        escapeHtml(domain) + '</strong> yet. Click "Run audit" above to create one.' +
+        '</div>';
+      return;
+    }
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + (await r.text()));
+    const audit = await r.json();
+    const id = audit.audit_id;
+    renderFull(audit, {artifacts: {
+      json: '/audit/' + id + '/json',
+      markdown: '/audit/' + id + '/md',
+      pdf: '/audit/' + id + '/pdf',
+    }}, id);
+  } catch (err) {
+    out.innerHTML = renderError('Could not load audit for ' +
+      escapeHtml(domain) + '\n\n' + escapeHtml(err.message));
+  }
+}
+
+// ---- Library: grid of past audits on the homepage --------------------
+
+async function loadLibrary() {
+  const lib = document.getElementById('library');
+  if (!lib) return;
+  try {
+    const r = await fetch('/api/audits');
+    if (!r.ok) return;
+    const data = await r.json();
+    renderLibrary(data.audits || []);
+  } catch (e) { /* library is non-critical — fail silent */ }
+}
+
+function renderLibrary(audits) {
+  const lib = document.getElementById('library');
+  if (!lib) return;
+  if (!audits.length) {
+    lib.innerHTML =
+      '<div class="lib-head"><h2>Recent audits</h2></div>' +
+      '<div class="lib-empty">No audits yet — run your first one above. ' +
+      'Once an audit completes it appears here, and you can reopen it any ' +
+      'time at audits.growthmonk.ai/&lt;domain&gt;.</div>';
+    return;
+  }
+  let cards = '';
+  for (const a of audits) {
+    const grade = (a.overall_grade || '').charAt(0).toUpperCase();
+    const date = (a.created_at || a.audit_date || '').slice(0, 10);
+    const meta = [a.page_type, a.industry].filter(Boolean).join(' · ');
+    const domAttr = encodeURIComponent(a.domain || '');
+    cards +=
+      '<div class="lib-card">' +
+        '<a class="lib-link" href="/' + domAttr +
+          '" aria-label="Open ' + escapeHtml(a.domain || '') + '"></a>' +
+        '<button class="lib-del" title="Delete this audit" ' +
+          'data-id="' + escapeHtml(a.audit_id || '') + '" ' +
+          'data-domain="' + escapeHtml(a.domain || '') + '" ' +
+          'onclick="deleteAuditCard(event, this)">✕</button>' +
+        '<div class="lib-domain">' + escapeHtml(a.domain || a.url || '—') + '</div>' +
+        (meta ? '<div class="lib-sub">' + escapeHtml(meta) + '</div>' : '') +
+        '<div class="lib-row">' +
+          '<span class="lib-score">' + numOrDash(a.overall_score) + '</span>' +
+          '<span class="lib-grade ' + escapeHtml(grade) + '">' +
+            escapeHtml(a.overall_grade || '—') + '</span>' +
+          '<span class="lib-meta">' +
+            (a.findings_count != null ? a.findings_count + ' findings<br>' : '') +
+            escapeHtml(date) +
+          '</span>' +
+        '</div>' +
+      '</div>';
+  }
+  lib.innerHTML =
+    '<div class="lib-head"><h2>Recent audits</h2>' +
+    '<span class="lib-count">' + audits.length + ' audit' +
+    (audits.length === 1 ? '' : 's') + '</span></div>' +
+    '<div class="lib-grid">' + cards + '</div>';
+}
+
+async function deleteAuditCard(ev, btn) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  const auditId = btn.getAttribute('data-id') || '';
+  const domain = btn.getAttribute('data-domain') || 'this domain';
+  if (!auditId) { alert('No audit id on this card.'); return; }
+  const blockToo = confirm(
+    'Delete this audit for ' + domain + '?\\n\\n' +
+    'OK = delete just this audit.\\n' +
+    'Cancel = stop (nothing is deleted).'
+  );
+  if (!blockToo) return;
+  const alsoBlock = confirm(
+    'Also BLOCK ' + domain + ' from being re-audited or re-published?\\n\\n' +
+    'OK = delete ALL audits for ' + domain + ' and block it (use for takedown requests).\\n' +
+    'Cancel = delete only this one audit.'
+  );
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const url = alsoBlock
+      ? '/api/audit/by-domain/' + encodeURIComponent(domain) + '?suppress=1'
+      : '/api/audit/' + encodeURIComponent(auditId);
+    const r = await fetch(url, { method: 'DELETE', credentials: 'same-origin' });
+    if (r.status === 200) {
+      loadLibrary();
+    } else if (r.status === 401) {
+      alert('Not authorized to delete. Refresh and sign in again.');
+      btn.disabled = false; btn.textContent = '✕';
+    } else {
+      const t = await r.text();
+      alert('Delete failed (' + r.status + '): ' + t.slice(0, 200));
+      btn.disabled = false; btn.textContent = '✕';
+    }
+  } catch (e) {
+    alert('Delete error: ' + e.message);
+    btn.disabled = false; btn.textContent = '✕';
+  }
+}
+
+(function init() {
+  // Strip leading/trailing slashes from the path. '' => homepage form + library.
+  const path = window.location.pathname.replace(/^\/+|\/+$/g, '');
+  if (path) {
+    // Customer-facing view: hide the internal "Run audit" form and the
+    // library — show only the audit itself.
+    const form = document.getElementById('f');
+    const lib = document.getElementById('library');
+    if (form) form.style.display = 'none';
+    if (lib) lib.style.display = 'none';
+    loadAuditByDomain(decodeURIComponent(path));
+  } else {
+    loadLibrary();
+  }
+})();
+</script>
+</body>
+</html>
+"""
+
+
+@app.get('/', response_class=HTMLResponse)
+def root(_: bool = Depends(require_auth)):
+    return HTMLResponse(INDEX_HTML)
+
+
+@app.get('/api')
+def api_info(_: bool = Depends(require_auth)):
+    return {
+        'service': 'aeo-seo-auditor',
+        'version': '4.0',
+        'endpoints': {
+            'POST /audit': 'Submit a URL for audit',
+            'GET /audit/{id}': 'Fetch status + result',
+            'GET /audit/{id}/{json,md,pdf}': 'Fetch specific artifact',
+            'GET /healthz': 'Health check',
+        },
+        'docs': '/docs',
+    }
+
+
+def _brain_ok() -> bool:
+    """Verify the brain snapshots load. Imports are module-load-safe."""
+    from ranker import BrainIndex
+    BrainIndex.from_export_dir(str(THIS_DIR / 'ruleset'))
+    return True
+
+
+@app.get('/healthz')
+def healthz():
+    """Public liveness check — minimal surface. Returns 200 when the brain
+    loads. Does NOT expose auth/config posture (that was a 'service is wide
+    open' beacon); the detailed readiness lives behind auth at /readyz."""
+    try:
+        _brain_ok()
+        return {
+            'status': 'ok',
+            'brain_loaded': True,
+            # Public on GitHub already; lets callers verify the live build.
+            'git_sha': os.getenv('RAILWAY_GIT_COMMIT_SHA'),
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={'status': 'degraded', 'error': f'{type(e).__name__}: {e}'},
+        )
+
+
+@app.get('/readyz')
+def readyz(_: bool = Depends(require_auth)):
+    """Authenticated detailed readiness — config posture, brain stats,
+    diagnostics. Gated so it can't be used to fingerprint the deployment."""
+    try:
+        from ranker import BrainIndex
+        stats = BrainIndex.from_export_dir(
+            str(THIS_DIR / 'ruleset')).stats()
+    except Exception as e:
+        return JSONResponse(status_code=503,
+                            content={'status': 'degraded', 'error': f'{type(e).__name__}: {e}'})
+    return {
+        'status': 'ok',
+        'brain_stats': stats,
+        'anthropic_key_set': bool(os.getenv('ANTHROPIC_API_KEY')),
+        'audit_mode': AUDIT_MODE,
+        'agent_available': AGENT_AVAILABLE,
+        'agent_import_error': None if AGENT_AVAILABLE else _AGENT_IMPORT_ERROR,
+        'web_tools': 'anthropic_native_server_tools',
+        'auth_enabled': AUTH_ENABLED,
+        'api_key_enabled': API_KEY_ENABLED,
+        'is_production': IS_PRODUCTION,
+        'supabase_configured': bool(
+            os.getenv('SUPABASE_URL') and os.getenv('SUPABASE_SERVICE_KEY')),
+        'output_dir': str(OUTPUT_DIR),
+        'active_audits': sum(1 for j in JOBS.values()
+                             if j.get('status') in ('queued', 'running')),
+        'tracked_jobs': len(JOBS),
+        'git_sha': os.getenv('RAILWAY_GIT_COMMIT_SHA'),
+    }
+
+
+@app.post('/audit', response_model=AuditResponse)
+async def submit_audit(req: AuditRequest, background_tasks: BackgroundTasks,
+                        _: bool = Depends(require_auth)):
+    """Submit a URL for audit. Returns audit_id immediately; audit runs async.
+
+    Poll GET /audit/{id} for status. Typical completion: 60-120 seconds.
+    """
+    # Fail closed: in production, a missing auth config must not leave this
+    # paid, chromium-spawning endpoint open to the internet.
+    if IS_PRODUCTION and not AUTH_ENABLED:
+        raise HTTPException(status_code=503,
+                            detail='Auth not configured; submission disabled')
+
+    audit_id = str(uuid.uuid4())
+    url_str = str(req.url)
+
+    # Suppressed domain — a brand that has objected must not be re-audited.
+    if _is_suppressed(url_str):
+        raise HTTPException(status_code=403,
+                            detail='This domain has been suppressed and cannot be audited.')
+
+    # SSRF guard — refuse internal / metadata / non-http(s) targets.
+    safe, reason = check_url_safe(url_str)
+    if not safe:
+        log.warning('[%s] rejected unsafe url=%s (%s)', audit_id[:8], url_str, reason)
+        raise HTTPException(status_code=400, detail=f'URL not allowed: {reason}')
+
+    log.info('[%s] submitted url=%s mode=%s', audit_id[:8], url_str, AUDIT_MODE)
+
+    with JOBS_LOCK:
+        _reap_and_evict_locked()
+        if _active_audit_count() >= MAX_CONCURRENT_AUDITS:
+            raise HTTPException(
+                status_code=429,
+                detail=f'Too many audits in progress (max {MAX_CONCURRENT_AUDITS}); retry shortly')
+        JOBS[audit_id] = {
+            'audit_id': audit_id,
+            'status': 'queued',
+            'url': url_str,
+            'started_at': None,
+            'completed_at': None,
+            'result': None,
+            'error': None,
+            '_submitted_at': time.time(),
+        }
+
+    background_tasks.add_task(_run_audit_background, audit_id, url_str)
+
+    return AuditResponse(
+        audit_id=audit_id,
+        status='queued',
+        message='Audit queued. Poll the audit endpoint for status.',
+        poll_url=f'/audit/{audit_id}',
+    )
+
+
+def _maybe_fire_webhook(audit_id: str):
+    """If this audit was started with a webhookUrl, POST the compact result
+    (or failure payload) to it. Best-effort, no retries — pollers fall back."""
+    with JOBS_LOCK:
+        job = dict(JOBS.get(audit_id) or {})
+    webhook_url = job.get('webhook_url')
+    if not webhook_url:
+        return
+    status_ = job.get('status')
+    if status_ == 'completed':
+        result = job.get('result') or {}
+        payload = _audit_to_compact(result) if isinstance(result, dict) else {}
+        payload['status'] = 'complete'
+    elif status_ == 'error':
+        payload = {
+            'status': 'failed',
+            'auditId': audit_id,
+            'reason': job.get('error') or 'audit failed',
+            'agentErrors': job.get('agent_errors') or [],
+        }
+    else:
+        return  # mid-flight — don't fire
+    _send_webhook(webhook_url, payload)
+
+
+def _run_audit_background(audit_id: str, url: str):
+    """Background runner — invoked via FastAPI background_tasks."""
+    sid = audit_id[:8]
+    started = time.time()
+    log.info('[%s] mode=%s dispatching url=%s', sid, AUDIT_MODE, url)
+
+    with JOBS_LOCK:
+        JOBS[audit_id]['status'] = 'running'
+        JOBS[audit_id]['started_at'] = datetime.now(timezone.utc).isoformat()
+    if monitoring:
+        monitoring.audit_started(audit_id, url, AUDIT_MODE)
+
+    def _update_progress(info: Dict):
+        """Bound to this audit_id. Receives {phase, tool, turn, tool_count,
+        elapsed_seconds, last_tool_ms} from the agent loop after each tool
+        call. Writes into JOBS so the /audit/{id} endpoint can surface it."""
+        with JOBS_LOCK:
+            if audit_id in JOBS:
+                JOBS[audit_id]['progress'] = info
+
+    try:
+        result = run_audit(url, output_dir=str(OUTPUT_DIR),
+                            progress_callback=_update_progress)
+        elapsed = round(time.time() - started, 1)
+
+        # Agent path returns an error envelope (no exception) when it can't
+        # produce a valid audit JSON. Detect that and mark as error so the
+        # homepage doesn't think the audit succeeded.
+        if isinstance(result, dict) and result.get('error'):
+            log.error('[%s] failed in %ss: %s', sid, elapsed, result['error'])
+            for ae in (result.get('agent_errors') or [])[:5]:
+                log.error('[%s]   agent_error: %s', sid, ae)
+            preview = (result.get('raw_final_text_preview') or '')[:300]
+            if preview:
+                log.error('[%s]   last_text_preview: %s', sid, preview.replace('\n', ' \\n '))
+            with JOBS_LOCK:
+                JOBS[audit_id]['status'] = 'error'
+                JOBS[audit_id]['error'] = result['error']
+                JOBS[audit_id]['agent_errors'] = result.get('agent_errors', [])
+                JOBS[audit_id]['raw_final_text_preview'] = result.get('raw_final_text_preview', '')
+                JOBS[audit_id]['agent_turns'] = result.get('agent_turns')
+                JOBS[audit_id]['tool_call_count'] = result.get('tool_call_count')
+                JOBS[audit_id]['input_tokens'] = result.get('input_tokens')
+                JOBS[audit_id]['output_tokens'] = result.get('output_tokens')
+                JOBS[audit_id]['completed_at'] = datetime.now(timezone.utc).isoformat()
+            if monitoring:
+                monitoring.audit_failed(audit_id, url, result.get('error', 'agent error'), elapsed)
+            _persist_job_status(audit_id)
+            _maybe_fire_webhook(audit_id)
+            return
+
+        score = (result.get('scoring') or {}).get('overall_score') if isinstance(result, dict) else None
+        grade = (result.get('scoring') or {}).get('overall_grade') if isinstance(result, dict) else None
+        log.info('[%s] completed in %ss score=%s grade=%s', sid, elapsed, score, grade)
+        with JOBS_LOCK:
+            JOBS[audit_id]['status'] = 'completed'
+            JOBS[audit_id]['completed_at'] = datetime.now(timezone.utc).isoformat()
+            JOBS[audit_id]['result'] = result
+        if monitoring and isinstance(result, dict):
+            monitoring.audit_completed(result)
+        _persist_job_status(audit_id)
+        _maybe_fire_webhook(audit_id)
+    except Exception as e:
+        elapsed = round(time.time() - started, 1)
+        # Full traceback to stdout — Railway captures it in the log viewer.
+        log.error('[%s] background task crashed in %ss: %s: %s',
+                  sid, elapsed, type(e).__name__, e)
+        log.error('[%s] traceback:\n%s', sid, traceback.format_exc())
+        with JOBS_LOCK:
+            JOBS[audit_id]['status'] = 'error'
+            JOBS[audit_id]['error'] = f'{type(e).__name__}: {e}'
+            JOBS[audit_id]['traceback'] = traceback.format_exc()
+            JOBS[audit_id]['completed_at'] = datetime.now(timezone.utc).isoformat()
+        if monitoring:
+            monitoring.audit_failed(audit_id, url, f'{type(e).__name__}: {e}', elapsed)
+        _persist_job_status(audit_id)
+        _maybe_fire_webhook(audit_id)
+
+
+def _persist_job_status(audit_id: str) -> None:
+    """Write-through a job's terminal status to Supabase so the RECORD survives
+    a redeploy even though the in-memory JOBS entry won't. Best-effort."""
+    with JOBS_LOCK:
+        job = dict(JOBS.get(audit_id) or {})
+    if not job:
+        return
+    result = job.get('result') or {}
+    summary = None
+    if isinstance(result, dict):
+        scoring = result.get('scoring') or {}
+        summary = {
+            'overall_score': scoring.get('overall_score'),
+            'overall_grade': scoring.get('overall_grade'),
+            'domain': result.get('domain'),
+        }
+    try:
+        save_job_status({
+            'audit_id': audit_id,
+            'url': job.get('url'),
+            'status': job.get('status'),
+            'error': job.get('error'),
+            'submitted_at': job.get('_submitted_at_iso') or job.get('started_at'),
+            'completed_at': job.get('completed_at'),
+            'result_summary': summary,
+        })
+    except Exception:
+        pass
+
+
+@app.get('/audit/{audit_id}', response_model=AuditStatusResponse)
+def get_audit(audit_id: str, _: bool = Depends(require_auth)):
+    """Fetch audit status + summary. Poll until status == 'completed'."""
+    with JOBS_LOCK:
+        job = JOBS.get(audit_id)
+    if not job:
+        raise HTTPException(status_code=404, detail='audit not found')
+
+    response = {
+        'audit_id': audit_id,
+        'status': job['status'],
+        'started_at': job.get('started_at'),
+        'completed_at': job.get('completed_at'),
+    }
+
+    # Live progress info (only meaningful while status == 'running')
+    if job.get('progress'):
+        response['progress'] = job['progress']
+
+    if job['status'] == 'error':
+        response['error'] = job.get('error')
+        # Surface agent diagnostic fields if present (set by _run_audit_background
+        # when the agent returned an error envelope). These are critical for
+        # debugging why the agent failed to produce valid output.
+        for k in ('agent_errors', 'raw_final_text_preview', 'agent_turns',
+                  'tool_call_count', 'input_tokens', 'output_tokens'):
+            if k in job:
+                response[k] = job[k]
+        return response
+
+    if job['status'] == 'completed' and job.get('result'):
+        result = job['result']
+        response['duration_seconds'] = result.get('duration_seconds')
+
+        # Compact summary — full data via .json artifact
+        response['result_summary'] = {
+            'url': result.get('url'),
+            'domain': result.get('domain'),
+            'page_type': result.get('classification', {}).get('page_type'),
+            'industry': result.get('classification', {}).get('industry'),
+            'overall_score': result.get('scoring', {}).get('overall_score'),
+            'overall_grade': result.get('scoring', {}).get('overall_grade'),
+            'section_scores': result.get('scoring', {}).get('section_scores'),
+            'findings_count': len(result.get('findings', [])),
+            'executive_diagnosis': result.get('narrative', {}).get('executive_diagnosis'),
+        }
+
+        response['artifacts'] = {
+            'json': f'/audit/{audit_id}/json',
+            'markdown': f'/audit/{audit_id}/md',
+            'pdf': f'/audit/{audit_id}/pdf',
+        }
+
+    return response
+
+
+# Artifact endpoints use /audit/{id}/{format} (slash separator) to avoid
+# greedy-matching with the bare /audit/{id} route.
+@app.get('/audit/{audit_id}/json')
+def get_audit_json(audit_id: str):
+    """Full audit JSON — PUBLIC so customers can download their report.
+    Serves the on-disk file if the audit is still in memory; otherwise
+    falls back to Supabase (so old audit_ids survive Railway redeploys)."""
+    with JOBS_LOCK:
+        job = JOBS.get(audit_id)
+    if job and job['status'] == 'completed':
+        json_path = job['result'].get('json_path')
+        if json_path and Path(json_path).exists():
+            return FileResponse(json_path, media_type='application/json',
+                                 filename=f'{audit_id}.json')
+        # In memory but the ephemeral file is gone — serve the dict directly.
+        return JSONResponse(job['result'])
+    # Not in memory — reload from Supabase.
+    audit = fetch_audit(audit_id=audit_id)
+    if audit:
+        return JSONResponse(audit)
+    raise HTTPException(status_code=404, detail='audit not found')
+
+
+@app.get('/audit/{audit_id}/md')
+def get_audit_markdown(audit_id: str):
+    """Markdown audit report — PUBLIC for customer download. Serves the on-disk
+    artifact if present; otherwise regenerates it from the persisted audit JSON
+    so the link survives redeploys identically to /json (no inconsistent 404)."""
+    with JOBS_LOCK:
+        job = JOBS.get(audit_id)
+    if job and job['status'] == 'completed':
+        md_path = job['result'].get('md_path')
+        if md_path and Path(md_path).exists():
+            return FileResponse(md_path, media_type='text/markdown',
+                                 filename=f'{audit_id}.md')
+    # Artifact gone or job evicted — rebuild from Supabase.
+    md_text = regenerate_markdown(audit_id)
+    if md_text is not None:
+        return PlainTextResponse(md_text, media_type='text/markdown')
+    raise HTTPException(status_code=404, detail='audit not found')
+
+
+@app.get('/audit/{audit_id}/pdf')
+def get_audit_pdf(audit_id: str):
+    """1-page PDF summary — PUBLIC for customer download. Regenerates from the
+    persisted audit JSON when the local artifact is gone (redeploy-safe)."""
+    with JOBS_LOCK:
+        job = JOBS.get(audit_id)
+    if job and job['status'] == 'completed':
+        pdf_path = job['result'].get('pdf_path')
+        if pdf_path and Path(pdf_path).exists():
+            return FileResponse(pdf_path, media_type='application/pdf',
+                                 filename=f'{audit_id}.pdf')
+    # Rebuild from Supabase into the output dir.
+    regenerated = regenerate_pdf(audit_id, out_dir=OUTPUT_DIR)
+    if regenerated and Path(regenerated).exists():
+        return FileResponse(str(regenerated), media_type='application/pdf',
+                             filename=f'{audit_id}.pdf')
+    raise HTTPException(
+        status_code=404,
+        detail='PDF not available (audit not found or no PDF renderer on host)'
+    )
+
+
+@app.get('/audits')
+def list_audits(_: bool = Depends(require_auth)):
+    """List all audits in this service instance (in-memory only, lost on restart)."""
+    with JOBS_LOCK:
+        return {
+            'count': len(JOBS),
+            'audits': [
+                {
+                    'audit_id': a['audit_id'],
+                    'url': a['url'],
+                    'status': a['status'],
+                    'started_at': a.get('started_at'),
+                    'completed_at': a.get('completed_at'),
+                }
+                for a in JOBS.values()
+            ],
+        }
+
+
+@app.post('/debug/persist-test')
+def debug_persist_test(_: bool = Depends(require_auth)):
+    """Diagnostic — write a synthetic dummy audit via persist_audit() to
+    verify Supabase connectivity from THIS container, without running a
+    full (~$2, ~7min) audit.
+
+    Returns the persist result + non-secret env diagnostics. The test row
+    has a recognizable 'persist-test-*' audit_id and can be cleaned up
+    afterwards. Gated behind auth like every other route.
+    """
+    try:
+        from tools import persist_audit
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={'error': f'cannot import persist_audit: {e}'})
+
+    test_id = f'persist-test-{uuid.uuid4().hex[:8]}'
+    now = datetime.now(timezone.utc)
+    dummy = {
+        'audit_id': test_id,
+        'url': 'https://persist-test.example.com/',
+        'domain': 'persist-test.example.com',
+        'date': now.strftime('%Y-%m-%d'),
+        'classification': {'page_type': 'homepage', 'industry': 'saas',
+                            'company_name': 'Persist Test', 'confidence': 'high'},
+        'context': {'competitors': ['example-a.com'],
+                    'test_queries': {'primary': 'persistence test'}},
+        'gates': {'crawlability': 'pass', 'content_access': 'pass',
+                  'page_existence': 'pass'},
+        'scoring': {'section_scores': {'A_technical': 100, 'B_performance': 100},
+                    'page_citation_readiness': 99, 'brand_ai_presence': 99,
+                    'seo_score': 99, 'aeo_score': 99, 'citation_readiness': 99,
+                    'overall_score': 99, 'overall_grade': 'A+'},
+        'narrative': {'executive_diagnosis': 'Synthetic persistence test row — '
+                                             'safe to delete.'},
+        'competitor_comparison': [],
+        'bots_eye_view': {'classification': 'fully_accessible'},
+        'performance': {'ttfb_ms': 1},
+        'supplementary_findings': [],
+        'metadata': {'version': 'persist-test'},
+        'duration_seconds': 0.0,
+        'findings': [
+            {'check_id': 'TEST_A1', 'section': 'A', 'status': 'pass',
+             'severity': 'info', 'evidence': 'Synthetic finding for persist test.',
+             'truth_badge': 'HARD EVIDENCE', 'fix_type': None,
+             'citations': [{'id': 1, 'kind': 'rule', 'tier': 1,
+                            'source_org': 'TestOrg'}]},
+        ],
+    }
+    result = persist_audit(dummy)
+
+    # Non-secret env diagnostics — URL is not a secret; key shown only as
+    # prefix + length so a wrong-key paste is visible without leaking it.
+    surl = os.getenv('SUPABASE_URL', '')
+    skey = os.getenv('SUPABASE_SERVICE_KEY', '')
+    return {
+        'test_audit_id': test_id,
+        'persist_result': result,
+        'env_diagnostics': {
+            'SUPABASE_URL': surl or '(unset)',
+            'SUPABASE_SERVICE_KEY_set': bool(skey),
+            'SUPABASE_SERVICE_KEY_prefix': (skey[:10] + '...') if skey else None,
+            'SUPABASE_SERVICE_KEY_length': len(skey),
+        },
+        'hint': 'If persisted=true, the integration works. If false, read '
+                'persist_result.error. A service key should start with '
+                '"sb_secret_" or "eyJ" — anything else is the wrong key.',
+    }
+
+
+# ----------------------------------------------------------------------
+# AUDIT RELOAD — fetch persisted audits by domain or id (from Supabase)
+# ----------------------------------------------------------------------
+
+@app.get('/api/by-domain/{domain:path}')
+def api_by_domain(domain: str):
+    """Latest persisted audit for a domain, reassembled into the full
+    audit-JSON shape the homepage renderer consumes.
+
+    PUBLIC — powers the customer-facing /{domain} page. Customers visit
+    the share link, the page JS calls this endpoint to fetch the audit."""
+    audit = fetch_audit(domain=domain)
+    if not audit:
+        raise HTTPException(status_code=404,
+                            detail=f'no persisted audit for domain: {domain}')
+    return JSONResponse(audit)
+
+
+@app.get('/api/by-id/{audit_id}')
+def api_by_id(audit_id: str):
+    """A specific audit by id — PUBLIC for shareable specific-run links.
+    Checks in-memory JOBS first (freshest), then falls back to Supabase
+    (survives redeploys)."""
+    with JOBS_LOCK:
+        job = JOBS.get(audit_id)
+    if job and job.get('result') and not job['result'].get('error'):
+        return JSONResponse(job['result'])
+    audit = fetch_audit(audit_id=audit_id)
+    if not audit:
+        raise HTTPException(status_code=404, detail='audit not found')
+    return JSONResponse(audit)
+
+
+@app.get('/api/history/{domain:path}')
+def api_history(domain: str):
+    """Compact list of past audits for a domain (newest first).
+    PUBLIC — for the "previous audits" section on customer-facing pages."""
+    return {'domain': domain, 'audits': list_audits_for_domain(domain)}
+
+
+@app.get('/api/audits')
+def api_audits(_: bool = Depends(require_auth)):
+    """All persisted audits, newest first — powers the homepage library grid."""
+    return {'audits': list_all_audits()}
+
+
+# ======================================================================
+# PROGRAMMATIC API — for server-to-server integrations (AnswerMonk, etc.)
+# All routes here require X-API-Key (set as AUDIT_API_KEY in Railway).
+# Clean contract: 3 endpoints, idempotent start, never-lies status, compact
+# result + ?full=1 escape hatch, optional webhook on completion.
+# ======================================================================
+
+# Section letter → human-readable category, for compact result mapping
+_SECTION_LABELS = {
+    'A': 'Technical SEO', 'B': 'Performance', 'C': 'On-Page SEO',
+    'D': 'Schema', 'E': 'AEO Discovery', 'F': 'AEO Extraction',
+    'G': 'AEO Trust', 'H': 'AEO Selection', 'I': 'GEO',
+    'J': 'Entity Consistency',
+}
+
+# Idempotency window — same URL within this many seconds returns same audit_id
+_IDEMPOTENCY_WINDOW_SECONDS = 60
+
+
+class StartAuditRequest(BaseModel):
+    url: str
+    webhookUrl: Optional[str] = None
+
+
+class StartAuditResponse(BaseModel):
+    auditId: str
+    estimatedSeconds: int
+    reused: bool
+
+
+def _normalize_url(raw: str) -> str:
+    """Auto-prepend https:// when a bare domain is passed (e.g. 'feelvaleo.com')."""
+    s = (raw or '').strip()
+    if not s:
+        return s
+    if s.startswith('//'):
+        return 'https:' + s
+    if not s.lower().startswith(('http://', 'https://')):
+        return 'https://' + s
+    return s
+
+
+def _find_recent_audit_for_url(url: str) -> Optional[str]:
+    """Idempotency check — return an existing audit_id for `url` if one was
+    submitted within the last _IDEMPOTENCY_WINDOW_SECONDS seconds and is
+    queued, running, or recently completed. Otherwise None.
+
+    Checks in-memory JOBS first (covers in-flight audits), then Supabase
+    (covers completed audits that finished within the window)."""
+    cutoff = time.time() - _IDEMPOTENCY_WINDOW_SECONDS
+    with JOBS_LOCK:
+        for aid, j in JOBS.items():
+            if j.get('url') != url:
+                continue
+            started = j.get('_submitted_at') or 0
+            if started < cutoff:
+                continue
+            # Skip outright failures — let the caller try again
+            if j.get('status') == 'error':
+                continue
+            return aid
+    # Supabase fallback for completed audits within the window
+    try:
+        domain = re.sub(r'^https?://', '', url).rstrip('/').split('/')[0]
+        recents = list_audits_for_domain(domain, limit=3)
+        from datetime import datetime as _dt
+        for r in recents:
+            created = r.get('created_at') or ''
+            if not created:
+                continue
+            try:
+                # Postgres returns ISO with offset; parse leniently
+                ts = _dt.fromisoformat(created.replace('Z', '+00:00')).timestamp()
+            except Exception:
+                continue
+            if ts >= cutoff:
+                return r.get('audit_id')
+    except Exception:
+        pass
+    return None
+
+
+def _derive_progress_pct(job: Dict) -> int:
+    """Rough 0–100 progress for status polling. Based on tool_count;
+    typical complete audit emits ~28 tool calls."""
+    status_ = job.get('status', 'queued')
+    if status_ == 'completed':
+        return 100
+    if status_ == 'error':
+        return 0
+    if status_ == 'queued':
+        return 2
+    p = (job.get('progress') or {})
+    tc = p.get('tool_count') or 0
+    return max(5, min(95, int(tc / 30 * 95)))
+
+
+def _public_status(job: Dict, in_supabase: bool) -> str:
+    """Map internal JOBS status to the public 5-state enum."""
+    s = job.get('status', 'queued') if job else None
+    if s == 'queued':    return 'pending'
+    if s == 'running':   return 'running'
+    if s == 'completed': return 'complete'
+    if s == 'error':     return 'failed'
+    if in_supabase:      return 'complete'  # persisted; in-mem evicted
+    return 'lost'
+
+
+def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
+    """Map the full audit dict to the compact result shape AnswerMonk
+    consumes for the third-segment card."""
+    if not audit:
+        return {}
+    scoring = audit.get('scoring', {}) or {}
+    findings = audit.get('findings', []) or []
+    failed_or_warn = [f for f in findings if f.get('status') in ('fail', 'warn')]
+    counts = {'critical': 0, 'high': 0, 'medium': 0, 'low': 0}
+    for f in failed_or_warn:
+        sev = (f.get('severity') or 'medium').lower()
+        if sev in counts:
+            counts[sev] += 1
+
+    # Top issues sorted: critical → high → medium → low; fail before warn
+    sev_rank = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3, 'info': 4}
+    sorted_issues = sorted(failed_or_warn, key=lambda f: (
+        0 if f.get('status') == 'fail' else 1,
+        sev_rank.get((f.get('severity') or 'medium').lower(), 5),
+    ))
+
+    # Index top fixes by check_id for quicker "fix" hint lookup
+    narrative = audit.get('narrative', {}) or {}
+    fixes_by_topic = {}
+    for fx in (narrative.get('top_5_fixes') or []):
+        title_lc = (fx.get('title') or '').lower()
+        fixes_by_topic[title_lc] = (fx.get('after') or fx.get('title') or '')[:200]
+
+    issues = []
+    for f in sorted_issues[:20]:
+        section_letter = (f.get('section') or (f.get('check_id') or '')[:1]).upper()
+        evidence = f.get('evidence') or ''
+        # Title = first sentence/clause of evidence, capped
+        title = evidence.split('.')[0][:120] or f.get('check_id', 'Issue')
+        # Try to match a top fix by keyword
+        fix_hint = None
+        check_id_lc = (f.get('check_id') or '').lower()
+        for topic, after in fixes_by_topic.items():
+            if any(tok in topic for tok in check_id_lc.split('_') if len(tok) > 3):
+                fix_hint = (after.split('.')[0])[:160]
+                break
+        if not fix_hint:
+            fix_hint = (f.get('fix_type') or '').replace('_', ' ').title() or None
+
+        issues.append({
+            'severity': f.get('severity'),
+            'category': _SECTION_LABELS.get(section_letter, section_letter or 'General'),
+            'title': title,
+            'fix': fix_hint,
+            'checkId': f.get('check_id'),
+        })
+
+    total = len(failed_or_warn)
+    crit_high = counts['critical'] + counts['high']
+    summary = (f"{total} issue{'s' if total != 1 else ''} found — "
+               f"{crit_high} critical or high severity")
+
+    domain = audit.get('domain') or ''
+    # Build full report URL — prefer the request's host if available
+    if request is not None:
+        scheme = request.url.scheme
+        netloc = request.url.netloc
+        full_url = f"{scheme}://{netloc}/{domain}" if domain else None
+    else:
+        full_url = f"/{domain}" if domain else None
+
+    return {
+        'status': 'complete',
+        'auditId': audit.get('audit_id'),
+        'url': audit.get('url'),
+        'domain': domain,
+        'score': scoring.get('overall_score'),
+        'grade': scoring.get('overall_grade'),
+        'pageCitationReadiness': scoring.get('page_citation_readiness'),
+        'brandAiPresence': scoring.get('brand_ai_presence'),
+        'summary': summary,
+        'severityCounts': counts,
+        'issues': issues,
+        'executiveDiagnosis': narrative.get('executive_diagnosis'),
+        'fullReportUrl': full_url,
+        'completedAt': audit.get('date') or audit.get('created_at'),
+        'durationSeconds': audit.get('duration_seconds'),
+    }
+
+
+WEBHOOK_SECRET = os.getenv('AUDIT_WEBHOOK_SECRET', '')
+WEBHOOK_MAX_ATTEMPTS = int(os.getenv('WEBHOOK_MAX_ATTEMPTS', '3'))
+
+
+def _send_webhook(webhook_url: str, payload: Dict) -> None:
+    """Signed, retried webhook POST. Never raises.
+
+    - Signs the exact JSON body with HMAC-SHA256 (X-Auditor-Signature:
+      sha256=<hex>) when AUDIT_WEBHOOK_SECRET is set, so the receiver can verify
+      origin + integrity (SEC-6 — receivers previously could not tell a real
+      callback from a forged one).
+    - Retries transient failures with backoff instead of a single best-effort
+      shot (durable delivery)."""
+    import hashlib
+    import hmac
+    import json as _json
+    try:
+        import httpx
+    except Exception:
+        return
+
+    body = _json.dumps(payload, default=str, ensure_ascii=False).encode('utf-8')
+    headers = {
+        'User-Agent': 'growthmonk-auditor/1.0',
+        'Content-Type': 'application/json',
+    }
+    if WEBHOOK_SECRET:
+        sig = hmac.new(WEBHOOK_SECRET.encode('utf-8'), body, hashlib.sha256).hexdigest()
+        headers['X-Auditor-Signature'] = f'sha256={sig}'
+
+    for attempt in range(WEBHOOK_MAX_ATTEMPTS):
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                r = client.post(webhook_url, content=body, headers=headers)
+            log.info('webhook → %s status=%d audit_id=%s attempt=%d',
+                     webhook_url, r.status_code, payload.get('auditId', ''),
+                     attempt + 1)
+            if r.status_code < 500:
+                return  # delivered (or a client error the receiver owns)
+        except Exception as e:
+            log.warning('webhook → %s attempt %d failed: %s',
+                        webhook_url, attempt + 1, e)
+        if attempt < WEBHOOK_MAX_ATTEMPTS - 1:
+            time.sleep(2 ** attempt)
+
+
+@app.post('/api/audit/start', response_model=StartAuditResponse)
+async def api_audit_start(req: StartAuditRequest,
+                           background_tasks: BackgroundTasks,
+                           request: Request,
+                           _: bool = Depends(require_api_key)):
+    """Server-to-server audit trigger.
+
+    Body: {url, webhookUrl?}
+    Auth: X-API-Key
+    Returns: {auditId, estimatedSeconds, reused}
+
+    Idempotent: same URL submitted within 60s returns the same auditId
+    with reused=true (prevents double-billing on retries / double-clicks).
+
+    If webhookUrl is provided, the auditor will POST the compact result
+    (or failure payload) to that URL when the audit settles. The webhook
+    is best-effort — clients should still implement polling as a fallback."""
+    # Fail closed in production when the API key isn't configured.
+    if IS_PRODUCTION and not API_KEY_ENABLED:
+        raise HTTPException(status_code=503,
+                            detail='API key not configured; endpoint disabled')
+
+    url = _normalize_url(req.url)
+    if not url or '.' not in url:
+        raise HTTPException(status_code=400,
+                            detail='Invalid url — must be a domain or full URL')
+
+    # Suppressed domain — refuse to (re-)audit a brand that has objected.
+    if _is_suppressed(url):
+        raise HTTPException(status_code=403,
+                            detail='This domain has been suppressed and cannot be audited.')
+
+    # SSRF guard for the audit target.
+    safe, reason = check_url_safe(url)
+    if not safe:
+        log.warning('rejected unsafe api url=%s (%s)', url, reason)
+        raise HTTPException(status_code=400, detail=f'URL not allowed: {reason}')
+
+    # SSRF guard for the webhook callback — an API-key holder must not be able
+    # to make the server POST to internal services.
+    if req.webhookUrl:
+        wsafe, wreason = check_url_safe(req.webhookUrl)
+        if not wsafe:
+            raise HTTPException(status_code=400,
+                                detail=f'webhookUrl not allowed: {wreason}')
+
+    # Idempotency first — a retry/double-click for an in-flight URL returns the
+    # existing audit and must NOT be rejected by the concurrency gate below.
+    existing = _find_recent_audit_for_url(url)
+    if existing:
+        log.info('[%s] idempotency hit for url=%s', existing[:8], url)
+        return StartAuditResponse(auditId=existing,
+                                   estimatedSeconds=180, reused=True)
+
+    with JOBS_LOCK:
+        _reap_and_evict_locked()
+        if _active_audit_count() >= MAX_CONCURRENT_AUDITS:
+            raise HTTPException(
+                status_code=429,
+                detail=f'Too many audits in progress (max {MAX_CONCURRENT_AUDITS}); retry shortly')
+
+    # Metering / quota — charge only genuinely-new audits (idempotency hits above
+    # already returned). Fails open on infra error, closed on confirmed quota.
+    if billing is not None:
+        decision = billing.check_and_meter(
+            request.headers.get('X-API-Key', ''),
+            now_iso=datetime.now(timezone.utc).isoformat(),
+        )
+        if not decision.get('allowed'):
+            raise HTTPException(status_code=402,
+                                detail=f"Quota exceeded: {decision.get('reason')}")
+
+    audit_id = str(uuid.uuid4())
+    log.info('[%s] api/start url=%s webhook=%s', audit_id[:8], url,
+             '(yes)' if req.webhookUrl else '(no)')
+    with JOBS_LOCK:
+        JOBS[audit_id] = {
+            'audit_id': audit_id,
+            'status': 'queued',
+            'url': url,
+            'started_at': None,
+            'completed_at': None,
+            'result': None,
+            'error': None,
+            'webhook_url': req.webhookUrl,
+            'submitted_via': 'api',
+            '_submitted_at': time.time(),
+        }
+    background_tasks.add_task(_run_audit_background, audit_id, url)
+    return StartAuditResponse(auditId=audit_id, estimatedSeconds=180, reused=False)
+
+
+@app.get('/api/audit/{audit_id}/delta')
+def api_audit_delta(audit_id: str, vs: Optional[str] = None,
+                    _: bool = Depends(require_api_key)):
+    """Fix-verification / re-score delta — THE product loop.
+
+    Diffs this audit against a prior one of the same domain by check_id and
+    returns what resolved / regressed / newly appeared / still open, plus the
+    score change. This is the ROI artifact ("62 → 81, 7 resolved").
+
+    Query param `vs` optionally pins a specific prior audit_id; otherwise the
+    most recent earlier audit for the same domain is used.
+    """
+    # Prefer the in-memory result, else reload the persisted audit.
+    current = None
+    with JOBS_LOCK:
+        job = JOBS.get(audit_id)
+    if job and job.get('status') == 'completed' and isinstance(job.get('result'), dict):
+        current = job['result']
+    if current is None:
+        current = fetch_audit(audit_id=audit_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail='audit not found')
+
+    result = delta_against_prior(current, prior_audit_id=vs)
+    if result is None:
+        return {
+            'audit_id': audit_id,
+            'delta': None,
+            'message': 'No prior audit for this domain to compare against. '
+                       'Re-audit after applying fixes to see movement.',
+        }
+    return {'audit_id': audit_id, 'delta': result}
+
+
+@app.get('/api/audit/{audit_id}/status')
+def api_audit_status(audit_id: str, _: bool = Depends(require_api_key)):
+    """Status of an audit — always returns 200 with one of 5 statuses:
+    pending | running | complete | failed | lost.
+
+    'lost' = the audit_id is unknown to both in-memory state AND Supabase.
+    This is the state your polling code should treat as 'give up silently'
+    (e.g., a Railway redeploy wiped state before Supabase captured it)."""
+    with JOBS_LOCK:
+        job = dict(JOBS.get(audit_id) or {})
+    # Confirm presence in Supabase if not in memory
+    in_supabase = False
+    if not job:
+        persisted = fetch_audit(audit_id=audit_id)
+        if persisted:
+            in_supabase = True
+            job = {'status': 'completed', 'result': persisted}
+
+    status_ = _public_status(job, in_supabase) if job else 'lost'
+    resp = {
+        'auditId': audit_id,
+        'status': status_,
+        'progressPct': _derive_progress_pct(job) if job else 0,
+    }
+    if job.get('progress'):
+        p = job['progress']
+        resp['phase'] = p.get('phase')
+        resp['elapsedSeconds'] = p.get('elapsed_seconds')
+        resp['toolCount'] = p.get('tool_count')
+    if status_ == 'failed':
+        resp['error'] = job.get('error')
+        if job.get('agent_errors'):
+            resp['agentErrors'] = job['agent_errors']
+    if status_ == 'complete':
+        resp['durationSeconds'] = job.get('result', {}).get('duration_seconds') \
+            if isinstance(job.get('result'), dict) else None
+    return resp
+
+
+@app.get('/api/audit/{audit_id}/result')
+def api_audit_result(audit_id: str, request: Request,
+                      full: int = 0, _: bool = Depends(require_api_key)):
+    """The audit result.
+
+    Default (?full not set, or full=0): compact shape — score, grade,
+    summary, issues[], fullReportUrl — sized for the card render.
+
+    ?full=1: the rich audit JSON (the same shape /api/by-id returns).
+
+    Never returns 4xx for a known but not-yet-complete audit — returns
+    200 with status='not_ready' so the polling loop stays simple.
+    Failures return 200 with status='failed'. Unknown audit_id returns 404."""
+    with JOBS_LOCK:
+        job = dict(JOBS.get(audit_id) or {})
+
+    audit_obj = None
+    if job:
+        result = job.get('result')
+        if isinstance(result, dict) and not result.get('error'):
+            audit_obj = result
+        elif job.get('status') == 'error':
+            return {'status': 'failed', 'auditId': audit_id,
+                    'reason': job.get('error') or 'audit failed',
+                    'agentErrors': job.get('agent_errors') or []}
+        elif job.get('status') in ('queued', 'running'):
+            return {'status': 'not_ready', 'auditId': audit_id,
+                    'progressPct': _derive_progress_pct(job)}
+
+    if audit_obj is None:
+        audit_obj = fetch_audit(audit_id=audit_id)
+
+    if audit_obj is None:
+        raise HTTPException(status_code=404, detail='audit not found')
+
+    if full:
+        return audit_obj
+    return _audit_to_compact(audit_obj, request=request)
+
+
+# ----------------------------------------------------------------------
+# ADMIN: DELETE / SUPPRESS AUDITS
+# Removes a published audit from Supabase + disk + memory, and (optionally)
+# suppresses the domain so it can't be re-audited or re-published. Use for
+# takedown requests (a brand that objects under UWG/GDPR, etc.).
+# Gated by the API key; fail-closed in production when no key is configured.
+# ----------------------------------------------------------------------
+
+
+@app.delete('/api/audit/by-domain/{domain:path}')
+def delete_audit_by_domain(domain: str, suppress: int = 1,
+                           _: bool = Depends(require_admin)):
+    """Delete ALL persisted audits for a domain (Supabase + disk + memory).
+
+    suppress=1 (default) also adds the domain to the in-process denylist so it
+    can't be re-audited/re-published until restart. For a durable block, add
+    the bare domain to the SUPPRESSED_DOMAINS env var on the host.
+    """
+    reg = _registrable(domain)
+    if not reg or '.' not in reg:
+        raise HTTPException(status_code=400, detail='invalid domain')
+
+    db_result = delete_audits(domain=reg)
+    files_removed = _purge_local_artifacts(domain=reg)
+    jobs_removed = _purge_jobs(domain=reg)
+
+    suppressed = False
+    durable = False
+    if suppress:
+        with SUPPRESS_LOCK:
+            SUPPRESSED_DOMAINS.add(reg)
+        suppressed = True
+        # Durable across redeploys (was in-memory-only — ENG-7).
+        durable = persist_suppression(reg)
+
+    log.warning('ADMIN delete domain=%s db=%s files=%d jobs=%d suppressed=%s durable=%s',
+                reg, db_result, files_removed, jobs_removed, suppressed, durable)
+    return {
+        'domain': reg,
+        'supabase': db_result,
+        'local_files_removed': files_removed,
+        'jobs_removed': jobs_removed,
+        'suppressed': suppressed,
+        'suppressed_durable': durable,
+        'suppressed_note': (None if durable else
+                            'In-memory only (Supabase not configured); also set SUPPRESSED_DOMAINS env var'),
+    }
+
+
+@app.delete('/api/audit/{audit_id}')
+def delete_audit_by_id(audit_id: str, _: bool = Depends(require_admin)):
+    """Delete a single audit by id (Supabase + disk + memory). Does not
+    suppress the domain — use the by-domain route for that."""
+    db_result = delete_audits(audit_id=audit_id)
+    files_removed = _purge_local_artifacts(audit_id=audit_id)
+    jobs_removed = _purge_jobs(audit_id=audit_id)
+    log.warning('ADMIN delete audit_id=%s db=%s files=%d jobs=%d',
+                audit_id, db_result, files_removed, jobs_removed)
+    return {'audit_id': audit_id, 'supabase': db_result,
+            'local_files_removed': files_removed, 'jobs_removed': jobs_removed}
+
+
+@app.get('/api/suppressed')
+def list_suppressed(_: bool = Depends(require_admin)):
+    """List domains currently suppressed (env + in-process additions)."""
+    with SUPPRESS_LOCK:
+        return {'suppressed_domains': sorted(SUPPRESSED_DOMAINS)}
+
+
+@app.delete('/api/suppressed/{domain:path}')
+def unsuppress(domain: str, _: bool = Depends(require_admin)):
+    """Remove a domain from the denylist, in-process AND durably (Supabase).
+    A domain seeded via the SUPPRESSED_DOMAINS env var will reappear on restart
+    — edit that on the host for env-seeded entries."""
+    reg = _registrable(domain)
+    with SUPPRESS_LOCK:
+        SUPPRESSED_DOMAINS.discard(reg)
+    durable_removed = remove_suppression(reg)
+    return {'domain': reg, 'suppressed': False, 'durable_removed': durable_removed}
+
+
+# ----------------------------------------------------------------------
+# CATCH-ALL SLUG ROUTE — audits.growthmonk.ai/{domain}
+# MUST be the LAST route registered so it never shadows explicit routes.
+# Serves the homepage HTML; the page JS reads the path and fetches that
+# domain's persisted audit via /api/by-domain.
+# ----------------------------------------------------------------------
+
+_RESERVED_SLUGS = {
+    'api', 'healthz', 'audit', 'audits', 'debug', 'docs', 'redoc',
+    'openapi.json', 'favicon.ico', 'static', 'robots.txt',
+}
+
+
+@app.get('/{slug}', response_class=HTMLResponse)
+def slug_page(slug: str):
+    """Catch-all for /{domain} — PUBLIC. This is the customer-facing audit
+    view: share audits.growthmonk.ai/{their-domain} and they can see the
+    audit without an auth prompt. Serves the SPA homepage; client JS
+    resolves the slug to a persisted audit via /api/by-domain.
+
+    Reserved words and audit-prefixed paths are excluded so explicit
+    routes (which may still be auth-gated) are never shadowed."""
+    if slug in _RESERVED_SLUGS or slug.startswith('audit'):
+        raise HTTPException(status_code=404, detail='not found')
+    return HTMLResponse(INDEX_HTML)
+
+
+if __name__ == '__main__':
+    import uvicorn
+    port = int(os.getenv('PORT', 8000))
+    uvicorn.run(app, host='0.0.0.0', port=port)

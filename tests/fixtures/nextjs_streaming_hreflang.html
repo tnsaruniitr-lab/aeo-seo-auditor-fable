@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <title>Next.js Streaming Hreflang</title>
+  <!-- NO top-level <link rel="alternate"> in <head> —
+       hreflang is encoded in streaming data below. The
+       naive grep check reports "0 hreflang" (false fail).
+       After the Next.js streaming parser patch, this
+       should detect 9 hreflang locales. -->
+</head>
+<body>
+  <h1>Next.js App Router with Streaming Metadata</h1>
+  <div id="__next">Content here</div>
+
+  <!-- Next.js App Router streams <head> content via self.__next_f.push.
+       Real-world example from feelvaleo.com homepage: -->
+  <script>
+    self.__next_f.push([1, "a:[[[\"$\",\"link\",\"4\",{\"rel\":\"alternate\",\"hrefLang\":\"en-AE\",\"href\":\"https://example.com/en-ae/\"}],[\"$\",\"link\",\"5\",{\"rel\":\"alternate\",\"hrefLang\":\"ar-AE\",\"href\":\"https://example.com/ar-ae/\"}],[\"$\",\"link\",\"6\",{\"rel\":\"alternate\",\"hrefLang\":\"en-SA\",\"href\":\"https://example.com/en-sa/\"}],[\"$\",\"link\",\"7\",{\"rel\":\"alternate\",\"hrefLang\":\"ar-SA\",\"href\":\"https://example.com/ar-sa/\"}],[\"$\",\"link\",\"8\",{\"rel\":\"alternate\",\"hrefLang\":\"en-QA\",\"href\":\"https://example.com/en-qa/\"}],[\"$\",\"link\",\"9\",{\"rel\":\"alternate\",\"hrefLang\":\"ar-QA\",\"href\":\"https://example.com/ar-qa/\"}],[\"$\",\"link\",\"10\",{\"rel\":\"alternate\",\"hrefLang\":\"en-KW\",\"href\":\"https://example.com/en-kw/\"}],[\"$\",\"link\",\"11\",{\"rel\":\"alternate\",\"hrefLang\":\"ar-KW\",\"href\":\"https://example.com/ar-kw/\"}],[\"$\",\"link\",\"14\",{\"rel\":\"alternate\",\"hrefLang\":\"x-default\",\"href\":\"https://example.com\"}]]\n"]);
+  </script>
+</body>
+</html>
