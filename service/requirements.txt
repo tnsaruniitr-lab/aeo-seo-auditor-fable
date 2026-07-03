@@ -14,3 +14,4 @@ python-dotenv==1.0.1
 # Agent-mode dependencies (parity layer)
 httpx==0.27.0          # Supabase REST + webhooks
 playwright==1.60.0     # render_page_js — JS rendering + perf metrics + PDF fallback
+psycopg2-binary==2.9.9 # Postgres backend (Railway Postgres) — used when DATABASE_URL is set

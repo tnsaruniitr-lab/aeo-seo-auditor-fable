@@ -357,6 +357,22 @@ app = FastAPI(
 )
 
 
+@app.on_event('startup')
+def _init_storage():
+    """Create the Postgres schema on boot when DATABASE_URL is set (Railway
+    Postgres). No-op when using Supabase or no DB. Never blocks startup."""
+    try:
+        import db
+        if db.pg_enabled():
+            ok = db.init_schema()
+            log.info('storage backend = postgres (schema_ready=%s)', ok)
+        else:
+            log.info('storage backend = %s',
+                     'supabase' if os.getenv('SUPABASE_URL') else 'none (in-memory only)')
+    except Exception as e:
+        log.warning('storage init skipped: %s', e)
+
+
 # ----------------------------------------------------------------------
 # AUTH — HTTP Basic, credentials from env vars (never in code)
 # ----------------------------------------------------------------------

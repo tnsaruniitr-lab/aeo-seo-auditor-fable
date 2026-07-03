@@ -105,8 +105,22 @@ def regenerate_pdf(audit_id: str, out_dir: Optional[Path] = None) -> Optional[Pa
 #   result_summary jsonb.
 # ---------------------------------------------------------------------------
 
+def _pg():
+    """Return the Postgres backend if DATABASE_URL is configured, else None."""
+    try:
+        import db
+        if db.pg_enabled():
+            return db
+    except Exception:
+        pass
+    return None
+
+
 def save_job_status(job: Dict[str, Any]) -> bool:
-    """Upsert a job's status to Supabase. Best-effort; returns success bool."""
+    """Upsert a job's status. Postgres if configured, else Supabase. Best-effort."""
+    pg = _pg()
+    if pg:
+        return pg.save_job_status(job)
     try:
         from tools import _supabase_base_headers
         base, headers = _supabase_base_headers()
@@ -138,6 +152,9 @@ def persist_suppression(domain: str) -> bool:
     """Durably record a suppressed (taken-down) domain in Supabase so it survives
     a redeploy (in-memory suppression alone was lost on restart — ENG-7). Table
     `suppressed_domains` (domain text primary key, created_at timestamptz)."""
+    pg = _pg()
+    if pg:
+        return pg.persist_suppression(domain)
     try:
         from tools import _supabase_base_headers
         base, headers = _supabase_base_headers()
@@ -157,6 +174,9 @@ def persist_suppression(domain: str) -> bool:
 
 def load_suppressions() -> list:
     """Load durable suppressed domains at startup. Returns [] if unavailable."""
+    pg = _pg()
+    if pg:
+        return pg.load_suppressions()
     try:
         from tools import _supabase_base_headers
         base, headers = _supabase_base_headers()
@@ -175,6 +195,9 @@ def load_suppressions() -> list:
 
 def remove_suppression(domain: str) -> bool:
     """Delete a durable suppression (un-suppress)."""
+    pg = _pg()
+    if pg:
+        return pg.remove_suppression(domain)
     try:
         from tools import _supabase_base_headers
         base, headers = _supabase_base_headers()
@@ -191,8 +214,11 @@ def remove_suppression(domain: str) -> bool:
 
 
 def load_job_status(audit_id: str) -> Optional[Dict[str, Any]]:
-    """Load a job's status from Supabase (used when it's gone from memory after
-    a redeploy). None if not found / not configured."""
+    """Load a job's status (Postgres if configured, else Supabase). Used when
+    it's gone from memory after a redeploy. None if not found / not configured."""
+    pg = _pg()
+    if pg:
+        return pg.load_job_status(audit_id)
     try:
         from tools import _supabase_base_headers
         base, headers = _supabase_base_headers()

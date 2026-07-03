@@ -62,6 +62,18 @@ sys.path.insert(0, str(RULESET_DIR))
 # previously only wired at HTTP submission, never on the tools themselves).
 from safety import check_url_safe
 
+# Storage backend selector. When DATABASE_URL is set (Railway Postgres attached),
+# persistence goes to Postgres; otherwise it falls through to the Supabase REST
+# path below. Same shapes either way — callers don't change.
+try:
+    import db as _pgdb
+except Exception:
+    _pgdb = None
+
+
+def _use_pg() -> bool:
+    return _pgdb is not None and _pgdb.pg_enabled()
+
 
 # ============================================================================
 # NOTE: web_fetch and web_search are Anthropic SERVER-side tools.
@@ -411,6 +423,8 @@ def persist_audit(audit_data: Dict[str, Any]) -> Dict[str, Any]:
           "error": str | None,
         }
     """
+    if _use_pg():
+        return _pgdb.persist_audit(audit_data)
     supabase_url = os.getenv("SUPABASE_URL")
     supabase_key = os.getenv("SUPABASE_SERVICE_KEY")
     audit_id = audit_data.get("audit_id")
@@ -586,8 +600,10 @@ def fetch_audit(domain: Optional[str] = None,
         domain   — returns the LATEST audit for that domain
         audit_id — returns that specific audit
 
-    Returns the audit dict, or None if not found / Supabase not configured.
+    Returns the audit dict, or None if not found / storage not configured.
     """
+    if _use_pg():
+        return _pgdb.fetch_audit(domain=domain, audit_id=audit_id)
     base, headers = _supabase_base_headers()
     if base is None:
         return None
@@ -680,6 +696,8 @@ def fetch_audit(domain: Optional[str] = None,
 def list_audits_for_domain(domain: str, limit: int = 10) -> list:
     """Return a compact list of past audits for a domain (newest first) —
     audit_id, score, grade, date — for the 'previous audits' UI."""
+    if _use_pg():
+        return _pgdb.list_audits_for_domain(domain, limit)
     base, headers = _supabase_base_headers()
     if base is None:
         return []
@@ -703,6 +721,8 @@ def list_audits_for_domain(domain: str, limit: int = 10) -> list:
 def list_all_audits(limit: int = 60) -> list:
     """Return all persisted audits, newest first — powers the homepage
     library grid. Compact projection: enough for an audit card."""
+    if _use_pg():
+        return _pgdb.list_all_audits(limit)
     base, headers = _supabase_base_headers()
     if base is None:
         return []
@@ -738,6 +758,8 @@ def delete_audits(domain: Optional[str] = None,
     audit rows. Provide exactly one of `domain` (removes ALL audits for that
     domain, www/bare) or `audit_id` (removes that one). Returns a summary
     with the audit_ids removed and row counts. Never raises."""
+    if _use_pg():
+        return _pgdb.delete_audits(domain=domain, audit_id=audit_id)
     base, headers = _supabase_base_headers()
     if base is None:
         return {"deleted": False, "error": "Supabase not configured"}

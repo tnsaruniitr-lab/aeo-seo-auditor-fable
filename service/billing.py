@@ -92,7 +92,20 @@ def check_and_meter(api_key: str, *, now_iso: Optional[str] = None) -> Dict[str,
 #   count int, updated_at timestamptz; primary key (key_id, month).
 # ---------------------------------------------------------------------------
 
+def _pg():
+    try:
+        import db
+        if db.pg_enabled():
+            return db
+    except Exception:
+        pass
+    return None
+
+
 def _get_usage(kid: str, bucket: str) -> int:
+    pg = _pg()
+    if pg:
+        return pg.get_usage(kid, bucket)
     from tools import _supabase_base_headers
     base, headers = _supabase_base_headers()
     if base is None:
@@ -108,7 +121,11 @@ def _get_usage(kid: str, bucket: str) -> int:
 
 
 def _increment_usage(kid: str, bucket: str) -> None:
-    """Upsert count+1 for (key_id, month). Uses PostgREST merge-duplicates."""
+    """Upsert count+1 for (key_id, month). Postgres if configured, else Supabase."""
+    pg = _pg()
+    if pg:
+        pg.increment_usage(kid, bucket)
+        return
     from tools import _supabase_base_headers
     base, headers = _supabase_base_headers()
     if base is None:
