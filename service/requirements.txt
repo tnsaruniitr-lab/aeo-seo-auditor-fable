@@ -4,7 +4,10 @@
 # deliberately, not implicitly.
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
-pydantic==2.7.1
+# pydantic 2.13.x pairs with pydantic_core >=2.46 — required by anthropic 0.84.0's
+# streaming serialization. The old 2.7.1 pin threw a by_alias/PyBool TypeError on
+# the 2nd tool-use turn (verified against the live agent loop). Keep these two in lockstep.
+pydantic==2.13.4
 anthropic==0.84.0
 python-dotenv==1.0.1
 
