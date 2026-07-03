@@ -304,6 +304,23 @@ def query_brain(check_id: str, page_type: str = "homepage",
     the brain mapping was authored against the parent 'A2_title_tag'. Falling
     back to the parent gives reasonable citations for sub-checks.
     """
+    # LIVE brain (opt-in via SIEVE_LIVE): retrieve from the fresh Sieve DB
+    # (23k rules, real source_url + authority-tier ranking + last_verified).
+    # ADDITIVE — on any miss/error this returns None and we fall straight
+    # through to the snapshot ranker below. The static path is never touched.
+    try:
+        import sieve_brain
+        live = sieve_brain.live_citations(check_id, page_type, industry, max_citations)
+        if live:
+            return {
+                "check_id": check_id,
+                "resolved_to": None,
+                "citations": live,
+                "source": "sieve-live",
+            }
+    except Exception as _live_err:  # noqa: BLE001 — never let live path break query_brain
+        log.debug('live brain unavailable, using snapshot: %s', _live_err)
+
     try:
         from ranker import select_citations
         brain = _get_brain()
