@@ -1,0 +1,13 @@
+# Keep the Docker build context small and reproducible.
+.git
+.github
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+service/audits/
+**/.env
+**/.env.*
+!**/.env.example
+*.log
+.DS_Store
