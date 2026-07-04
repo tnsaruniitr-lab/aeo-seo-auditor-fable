@@ -528,6 +528,18 @@ INDEX_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AEO / SEO / GEO Auditor</title>
+<script>
+  // Set the theme BEFORE first paint: saved choice wins, else system.
+  (function () {
+    try {
+      var saved = localStorage.getItem('aeo-theme');
+      var dark = (saved === 'dark' || saved === 'light')
+        ? saved === 'dark'
+        : window.matchMedia('(prefers-color-scheme: dark)').matches;
+      document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+    } catch (e) { document.documentElement.dataset.theme = 'light'; }
+  })();
+</script>
 <style>
   /* Luminous design system — from tnsaruniitr-lab/design-principles, as
      implemented in the growthmonk operator console: quiet tinted canvas,
@@ -536,7 +548,7 @@ INDEX_HTML = r"""<!doctype html>
      ambient + reactive + entrance motion, all reduced-motion guarded. */
   * { box-sizing:border-box; }
   :root {
-    color-scheme: light dark;
+    color-scheme: light;
     --brand:#6366f1; --brand-ink:#4f46e5; --teal:#14b8a6;
     --canvas-a:#f7f9fc; --canvas-b:#eef2f7; --surface:#ffffff; --inset:#f1f5f9;
     --ink:#0f172a; --ink-soft:#475569; --ink-faint:#94a3b8;
@@ -558,27 +570,26 @@ INDEX_HTML = r"""<!doctype html>
     --fg-2:#475569; --muted:#64748b; --muted-2:#94a3b8; --accent:#4f46e5;
     --border:rgb(15 23 42 / .07);
   }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --brand-ink:#a5b4fc;
-      --canvas-a:#0d1526; --canvas-b:#0b1220; --surface:#0f172a; --inset:#1e293b;
-      --ink:#e2e8f0; --ink-soft:#94a3b8; --ink-faint:#64748b;
-      --hairline:rgb(148 163 184 / .08); --edge:rgb(148 163 184 / .07);
-      --track:rgb(148 163 184 / .14); --row-hover:rgb(99 102 241 / .09);
-      --mut-bg:rgb(148 163 184 / .13); --mut-ink:#94a3b8;
-      --ok-ink:#34d399; --ok-bg:rgb(16 185 129 / .16);
-      --run-ink:#38bdf8; --run-bg:rgb(56 189 248 / .16);
-      --warn-ink:#fbbf24; --warn-bg:rgb(245 158 11 / .15);
-      --err-ink:#fb7185; --err-bg:rgb(244 63 94 / .16);
-      --crit-ink:#fb7185; --crit-bg:rgb(244 63 94 / .22);
-      --glow-a:rgb(99 102 241 / .1); --glow-b:rgb(20 184 166 / .07);
-      --shadow-card:0 1px 2px rgb(2 6 23 / .5), 0 4px 18px rgb(2 6 23 / .42);
-      --shadow-lift:0 18px 44px rgb(2 6 23 / .6);
-      --aurora-o:.38; --aura-o:.16; --aura-o-hover:.32;
-      --code-bg:#0b1220; --code-ink:#cbd5e1;
-      --fg-2:#94a3b8; --muted:#94a3b8; --muted-2:#64748b; --accent:#a5b4fc;
-      --border:rgb(148 163 184 / .08);
-    }
+  :root[data-theme="dark"] {
+    --brand-ink:#a5b4fc;
+    --canvas-a:#0d1526; --canvas-b:#0b1220; --surface:#0f172a; --inset:#1e293b;
+    --ink:#e2e8f0; --ink-soft:#94a3b8; --ink-faint:#64748b;
+    --hairline:rgb(148 163 184 / .08); --edge:rgb(148 163 184 / .07);
+    --track:rgb(148 163 184 / .14); --row-hover:rgb(99 102 241 / .09);
+    --mut-bg:rgb(148 163 184 / .13); --mut-ink:#94a3b8;
+    --ok-ink:#34d399; --ok-bg:rgb(16 185 129 / .16);
+    --run-ink:#38bdf8; --run-bg:rgb(56 189 248 / .16);
+    --warn-ink:#fbbf24; --warn-bg:rgb(245 158 11 / .15);
+    --err-ink:#fb7185; --err-bg:rgb(244 63 94 / .16);
+    --crit-ink:#fb7185; --crit-bg:rgb(244 63 94 / .22);
+    --glow-a:rgb(99 102 241 / .1); --glow-b:rgb(20 184 166 / .07);
+    --shadow-card:0 1px 2px rgb(2 6 23 / .5), 0 4px 18px rgb(2 6 23 / .42);
+    --shadow-lift:0 18px 44px rgb(2 6 23 / .6);
+    --aurora-o:.38; --aura-o:.16; --aura-o-hover:.32;
+    --code-bg:#0b1220; --code-ink:#cbd5e1;
+    --fg-2:#94a3b8; --muted:#94a3b8; --muted-2:#64748b; --accent:#a5b4fc;
+    --border:rgb(148 163 184 / .08);
+    color-scheme: dark;
   }
   html { background:var(--canvas-b); scroll-behavior:smooth; }
   html,body { margin:0; padding:0; }
@@ -999,6 +1010,18 @@ INDEX_HTML = r"""<!doctype html>
   .err-block { background:var(--err-bg); border:1px solid rgb(244 63 94 / .2);
     border-radius:12px; padding:14px 16px; color:var(--err-ink); }
 
+  /* Theme toggle */
+  #theme-toggle { position:fixed; top:18px; right:18px; z-index:60;
+    width:42px; height:42px; padding:0; border-radius:50%;
+    background:var(--surface); color:var(--ink-soft);
+    border:1px solid var(--edge); box-shadow:var(--shadow-card);
+    font-size:17px; line-height:1; display:grid; place-items:center;
+    cursor:pointer; transition:transform .22s cubic-bezier(.2,.7,.2,1),
+      box-shadow .22s, color .2s; }
+  #theme-toggle:hover { background:var(--surface); color:var(--brand-ink);
+    filter:none; transform:translateY(-1px); box-shadow:var(--shadow-lift); }
+  #theme-toggle:active { transform:scale(.94); }
+
   @media (prefers-reduced-motion: reduce) {
     .aurora { animation:none; }
     section, .tile, .hero { animation-duration:.01ms; }
@@ -1008,6 +1031,7 @@ INDEX_HTML = r"""<!doctype html>
 </head>
 <body>
 <div class="aurora-wrap"><div class="aurora"></div></div>
+<button id="theme-toggle" type="button" aria-label="Toggle dark / light mode" title="Toggle dark / light mode">☾</button>
 <div class="wrap">
   <h1>AEO / SEO / GEO Auditor</h1>
   <div class="tagline">Full 97-check audit · Sieve brain (12,764 entries) · Claude Sonnet 4.6</div>
@@ -1031,6 +1055,32 @@ INDEX_HTML = r"""<!doctype html>
 <script>
 const $ = (id) => document.getElementById(id);
 const out = $('out');
+
+// Dark / light toggle: click flips + persists; glyph mirrors the mode.
+// With no saved choice we keep following the system preference live.
+(function () {
+  const btn = $('theme-toggle');
+  if (!btn) return;
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+  const glyph = () => {
+    btn.textContent = document.documentElement.dataset.theme === 'dark' ? '☀' : '☾';
+  };
+  glyph();
+  btn.addEventListener('click', () => {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem('aeo-theme', next); } catch (e) {}
+    glyph();
+  });
+  mq.addEventListener('change', (e) => {
+    let saved = null;
+    try { saved = localStorage.getItem('aeo-theme'); } catch (err) {}
+    if (saved !== 'dark' && saved !== 'light') {
+      document.documentElement.dataset.theme = e.matches ? 'dark' : 'light';
+      glyph();
+    }
+  });
+})();
 
 function normalizeUrl(raw) {
   // Trim + auto-prepend https:// when the user types a bare domain like

@@ -92,6 +92,12 @@ must produce identical cited reports — HANDOFF invariant 3).
 |---|---|---|
 | **LUM-1** Report + homepage re-skinned to the Luminous design system (tnsaruniitr-lab/design-principles, as implemented in the growthmonk operator console) | Quiet tinted light canvas (auto dark via `prefers-color-scheme`), white surfaces with two-layer shadows, drifting header aurora, gradient indigo→teal wordmark, eyebrow pills. Section scores are now a **jewel constellation**: each of the 10 sections carries only `--g1/--g2` (cool spine, warm anchors) rendering a gradient orb with inner-light highlight + tinted outer glow, corner auras that bloom on hover, staggered 45ms entrances. Engine tiles, fix cards, tier cards, citation quote blocks, tables, library cards all re-tokenized to the shared `--ink/--surface/--hairline/--shadow-card` system. Reduced-motion guarded; all escaping and numeric-only interpolation preserved. | `main.py` (INDEX_HTML CSS + render fns) |
 
+## LUM-2 — Manual dark / light toggle (2026-07-05)
+
+| Change | Detail | Where |
+|---|---|---|
+| **LUM-2** Theme control | Dark tokens moved from media-query-only to `:root[data-theme="dark"]`; a pre-paint head script applies the saved choice (localStorage `aeo-theme`) or falls back to the system preference — no flash of wrong theme. Floating sun/moon button (top-right) flips + persists; with no saved choice the page keeps following OS scheme changes live. | `main.py` |
+
 ## Known remainders (documented, not yet done)
 
 - **Separate worker process / durable queue.** Job *status* is now durable and
