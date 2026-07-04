@@ -98,7 +98,13 @@ assert_contains "delta classifies check transitions + score change" "$OUT" "DELT
 
 # ----------------------------------------------------------------------
 echo ""
-echo "[5] py_compile — every service module + script parses"
+echo "[5] Citation re-grounding — verbatim-by-construction quotes"
+OUT=$(cd "${SERVICE_DIR}" && python3 citation_grounding.py 2>&1)
+assert_contains "citations re-fetched from brain by id; paraphrase overwritten; degrades safely" "$OUT" "GROUNDING_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[6] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do
     if ! python3 -m py_compile "$f" 2>/dev/null; then

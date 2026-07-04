@@ -700,6 +700,28 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
         log.error('%sscore recompute failed: %s\n%s',
                   f'[{audit_id[:8]}] ', e, traceback.format_exc())
 
+    # ------------------------------------------------------------------
+    # CITATION RE-GROUNDING — the model only MAPS checks to citation ids.
+    # Quoted rule text, source org/url and tier are re-fetched from the
+    # brain by (kind, id) and overwritten here, so every quote that reaches
+    # the renderers and persistence is verbatim-by-construction (the LLM
+    # copy step measurably paraphrases ~half of them otherwise).
+    # ------------------------------------------------------------------
+    try:
+        from citation_grounding import reground_citations
+        audit, ground_stats = reground_citations(audit)
+        md["citation_grounding"] = ground_stats
+        if ground_stats.get("text_corrected"):
+            log.info('%sre-grounded citations: %d corrected, %d live, %d snapshot, %d unresolved',
+                     f'[{audit_id[:8]}] ', ground_stats["text_corrected"],
+                     ground_stats["regrounded_live"], ground_stats["regrounded_snapshot"],
+                     ground_stats["unresolved"])
+    except Exception as e:
+        md["citation_grounding"] = {"applied": False,
+                                    "error": f"{type(e).__name__}: {e}"}
+        log.error('%scitation re-grounding failed: %s\n%s',
+                  f'[{audit_id[:8]}] ', e, traceback.format_exc())
+
     # Render artifacts using the existing renderers from audit_pipeline.py
     # (they consume the same shape we produce).
     try:

@@ -1223,7 +1223,9 @@ function renderBrainSources(findings) {
       const dedupKey = (c.id ?? name) + ':' + (c.kind || '?');
       if (seen.has(dedupKey)) continue;
       seen.add(dedupKey);
-      const tier = c.tier || 5;
+      // Citations the grounding step could NOT verify against the brain keep
+      // only LLM-claimed fields — never let them claim an authoritative tier.
+      const tier = (c.verbatim === false) ? 5 : (c.tier || 5);
       (byTier[tier] = byTier[tier] || []).push(c);
     }
   }
@@ -1236,25 +1238,42 @@ function renderBrainSources(findings) {
     if (!byTier[t] || !byTier[t].length) continue;
     html += '<div class="tier"><h3>' + tierLabels[t] + '</h3>';
     for (const c of byTier[t].slice(0, 12)) {
-      const kind = c.kind === 'rule' ? 'Rule' : c.kind === 'anti_pattern' ? 'AP' : 'Item';
+      const kindLabels = {rule:'Rule', ap:'AP', anti_pattern:'AP', principle:'Principle'};
+      const kind = kindLabels[c.kind] || 'Item';
       const name = c.name || c.title || '(no name)';
-      // Confidence/risk badges where available
-      const conf = (c.confidence_score != null) ? ' (conf ' + c.confidence_score + ')' : '';
+      // Confidence rendered numeric-only: citation fields originate in crawled
+      // rule text, so nothing from them is concatenated into HTML unescaped.
+      // Guard empty/whitespace strings — Number('') is 0, not NaN.
+      const confRaw = c.confidence_score;
+      const confNum = (confRaw == null || String(confRaw).trim() === '') ? NaN : Number(confRaw);
+      const conf = Number.isFinite(confNum) ? ' (conf ' + confNum.toFixed(2) + ')' : '';
       const risk = c.risk_level ? ' [' + escapeHtml(c.risk_level) + ' risk]' : '';
+      const unverified = (c.verbatim === false)
+        ? ' <span style="font-size:11px;color:var(--warn,#c90)">unverified</span>' : '';
+      const verified = (c.last_verified && c.verbatim !== false)
+        ? ' <span class="ver" style="font-size:11px;color:var(--fg-2)">· verified ' + escapeHtml(String(c.last_verified)) + '</span>' : '';
       // Only show [#id] if id is actually a usable number
       const idTag = (c.id != null && c.id !== '' && !isNaN(c.id))
         ? ' <code style="font-size:11px">[Sieve ' + kind + ' #' + escapeHtml(String(c.id)) + ']</code>'
         : '';
       const safeUrl = c.source_url ? safeHref(c.source_url) : '';
-      const verified = c.last_verified
-        ? ' <span class="ver" style="font-size:11px;color:#888">· verified ' + escapeHtml(String(c.last_verified)) + '</span>'
+      // The rule's own reasoning, verbatim from the brain: when it applies →
+      // what to do. Suppressed for unverified citations — their text is
+      // LLM-claimed, not brain-backed.
+      const why = (c.verbatim !== false) ? (c.if_condition || c.statement || c.description || '') : '';
+      const act = (c.verbatim !== false) ? (c.then_action || c.explanation || '') : '';
+      const reasoning = (why || act)
+        ? '<div style="font-size:12px;color:var(--fg-2);margin:2px 0 0 2px">' +
+          (why ? escapeHtml(String(why).slice(0, 240)) : '') +
+          (why && act ? ' → ' : '') +
+          (act ? escapeHtml(String(act).slice(0, 240)) : '') + '</div>'
         : '';
       html += '<div class="citation">' +
         '<span class="src">' + escapeHtml(c.source_org || 'unknown') + '</span> — ' +
         (safeUrl ? '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' : '') +
         '<span class="nm">' + escapeHtml(name) + '</span>' +
         (safeUrl ? '</a>' : '') +
-        conf + risk + idTag + verified +
+        conf + risk + idTag + verified + unverified + reasoning +
         '</div>';
     }
     html += '</div>';
@@ -1517,6 +1536,10 @@ def healthz():
         )
 
 
+# Cached live-brain stats for /readyz (60s TTL; probing must stay cheap).
+_SIEVE_STATS_CACHE = {'at': 0.0, 'value': None}
+
+
 @app.get('/readyz')
 def readyz(_: bool = Depends(require_auth)):
     """Authenticated detailed readiness — config posture, brain stats,
@@ -1528,9 +1551,22 @@ def readyz(_: bool = Depends(require_auth)):
     except Exception as e:
         return JSONResponse(status_code=503,
                             content={'status': 'degraded', 'error': f'{type(e).__name__}: {e}'})
+    # Live sieve brain (the DB the citations actually come from when
+    # SIEVE_LIVE=1) — best-effort AND cached (60s TTL) so a slow DB can't
+    # stall readiness probes into platform-healthcheck timeouts.
+    now = time.time()
+    if _SIEVE_STATS_CACHE['value'] is None or now - _SIEVE_STATS_CACHE['at'] > 60:
+        try:
+            import sieve_brain
+            _SIEVE_STATS_CACHE['value'] = sieve_brain.stats()
+        except Exception as e:
+            _SIEVE_STATS_CACHE['value'] = {'live': False,
+                                           'error': f'{type(e).__name__}: {e}'}
+        _SIEVE_STATS_CACHE['at'] = now
     return {
         'status': 'ok',
         'brain_stats': stats,
+        'sieve_live_stats': _SIEVE_STATS_CACHE['value'],
         'anthropic_key_set': bool(os.getenv('ANTHROPIC_API_KEY')),
         'audit_mode': AUDIT_MODE,
         'agent_available': AGENT_AVAILABLE,
