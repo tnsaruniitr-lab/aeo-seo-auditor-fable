@@ -86,6 +86,12 @@ must produce identical cited reports — HANDOFF invariant 3).
 |---|---|---|
 | **VIS-1** The product generated 4 test queries + crawled 5 competitors per audit and never used them — "Brand AI Presence" was an LLM inference, not a measurement (graded D in the product evaluation) | New `ai_visibility.py`: post-loop, the audit's test queries are executed K times (default 2) against real answer engines (OpenAI + Anthropic web search now; adapter slots for Perplexity/Gemini/AI Overviews keys), recording cited URLs + brand mentions per run. Reports per-engine cited/mentioned **rates** (honest about stochasticity), share of voice vs the crawled competitors, and top-cited domains. Every raw answer is logged permanently to `public.ai_answer_runs` — the longitudinal dataset. Renders as "Measured AI visibility" (engine tiles + SOV table) directly under the hero. No-ops safely without keys; stats under `metadata.ai_visibility`. | `ai_visibility.py`, `agent.py`, `main.py` |
 
+## LUM — Luminous re-skin: one design family with GrowthMonk (2026-07-05)
+
+| Change | Detail | Where |
+|---|---|---|
+| **LUM-1** Report + homepage re-skinned to the Luminous design system (tnsaruniitr-lab/design-principles, as implemented in the growthmonk operator console) | Quiet tinted light canvas (auto dark via `prefers-color-scheme`), white surfaces with two-layer shadows, drifting header aurora, gradient indigo→teal wordmark, eyebrow pills. Section scores are now a **jewel constellation**: each of the 10 sections carries only `--g1/--g2` (cool spine, warm anchors) rendering a gradient orb with inner-light highlight + tinted outer glow, corner auras that bloom on hover, staggered 45ms entrances. Engine tiles, fix cards, tier cards, citation quote blocks, tables, library cards all re-tokenized to the shared `--ink/--surface/--hairline/--shadow-card` system. Reduced-motion guarded; all escaping and numeric-only interpolation preserved. | `main.py` (INDEX_HTML CSS + render fns) |
+
 ## Known remainders (documented, not yet done)
 
 - **Separate worker process / durable queue.** Job *status* is now durable and
