@@ -15,4 +15,4 @@ python-dotenv==1.0.1
 httpx==0.27.0          # Supabase REST + webhooks
 playwright==1.60.0     # render_page_js — JS rendering + perf metrics + PDF fallback
 psycopg2-binary==2.9.9 # Postgres backend (Railway Postgres) — used when DATABASE_URL is set
-openai==1.54.4         # semantic citation retrieval — embeds the check query (text-embedding-3-small) for vector search over the Sieve brain; optional (FTS fallback if unset)
+openai==2.44.0         # semantic citation retrieval (embeddings) + measured AI visibility (Responses API web_search tool — needs >=2.x; 1.54 predates client.responses)

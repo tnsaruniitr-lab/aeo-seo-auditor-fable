@@ -55,25 +55,41 @@ def _engine_openai(query: str) -> Dict[str, Any]:
     from openai import OpenAI
     client = OpenAI(timeout=CALL_TIMEOUT)
     model = os.getenv('AI_VIS_OPENAI_MODEL', 'gpt-4o-mini')
-    last_err = None
-    for tool_type in ('web_search', 'web_search_preview'):
-        try:
-            r = client.responses.create(
-                model=model,
-                tools=[{'type': tool_type}],
-                input=query,
-            )
-            urls: List[str] = []
-            for item in (getattr(r, 'output', None) or []):
-                for block in (getattr(item, 'content', None) or []):
-                    for ann in (getattr(block, 'annotations', None) or []):
-                        u = getattr(ann, 'url', None)
-                        if u:
-                            urls.append(u)
-            return {'answer': getattr(r, 'output_text', '') or '', 'cited_urls': urls}
-        except Exception as e:  # noqa: BLE001 — try the older tool name once
-            last_err = e
-    raise last_err
+    if hasattr(client, 'responses'):
+        last_err = None
+        for tool_type in ('web_search', 'web_search_preview'):
+            try:
+                r = client.responses.create(
+                    model=model,
+                    tools=[{'type': tool_type}],
+                    input=query,
+                )
+                urls: List[str] = []
+                for item in (getattr(r, 'output', None) or []):
+                    for block in (getattr(item, 'content', None) or []):
+                        for ann in (getattr(block, 'annotations', None) or []):
+                            u = getattr(ann, 'url', None)
+                            if u:
+                                urls.append(u)
+                return {'answer': getattr(r, 'output_text', '') or '', 'cited_urls': urls}
+            except Exception as e:  # noqa: BLE001 — try the older tool name once
+                last_err = e
+        raise last_err
+    # Pre-Responses-API SDK (openai 1.x): use the dedicated search model on
+    # chat.completions, which returns url_citation annotations on the message.
+    r = client.chat.completions.create(
+        model=os.getenv('AI_VIS_OPENAI_SEARCH_MODEL', 'gpt-4o-mini-search-preview'),
+        web_search_options={},
+        messages=[{'role': 'user', 'content': query}],
+    )
+    msg = r.choices[0].message
+    urls = []
+    for ann in (getattr(msg, 'annotations', None) or []):
+        uc = getattr(ann, 'url_citation', None)
+        u = getattr(uc, 'url', None) if uc else None
+        if u:
+            urls.append(u)
+    return {'answer': msg.content or '', 'cited_urls': urls}
 
 
 def _engine_anthropic(query: str) -> Dict[str, Any]:
