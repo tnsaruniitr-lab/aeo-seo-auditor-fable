@@ -413,10 +413,10 @@ def call_sonnet_for_narrative(
                 'evidence': f['evidence'][:300],
                 'citations': [
                     {
-                        'kind': c['kind'],
-                        'id': c['id'],
-                        'tier': c['tier'],
-                        'tier_icon': c['tier_icon'],
+                        'kind': c.get('kind', 'rule'),
+                        'id': c.get('id'),
+                        'tier': c.get('tier', 5),
+                        'tier_icon': c.get('tier_icon', ''),
                         'name': c.get('name') or c.get('title', ''),
                         'source_org': c.get('source_org'),
                         'source_url': c.get('source_url'),

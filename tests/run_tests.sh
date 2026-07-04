@@ -110,7 +110,13 @@ assert_contains "variant check_ids renamed; sub-checks/unknowns preserved; colli
 
 # ----------------------------------------------------------------------
 echo ""
-echo "[7] py_compile — every service module + script parses"
+echo "[7] Deterministic citation attachment — Python cites every fail/warn"
+OUT=$(cd "${SERVICE_DIR}" && python3 citation_attach.py 2>&1)
+assert_contains "fail/warn findings get top-3 brain citations; LLM picks replaced; fault-tolerant" "$OUT" "ATTACH_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[8] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do
     if ! python3 -m py_compile "$f" 2>/dev/null; then
