@@ -202,11 +202,26 @@ def _row_to_cite(r) -> Dict[str, Any]:
         'domain_tag': r.get('domain_tag'),
         'last_verified': str(r.get('created_at'))[:10] if r.get('created_at') else None,
         'relevance': round(float(r.get('score') or 0.0), 4),
-        # url specificity for a gentle tiebreak: 0=specific page, 1=has url, 2=none
-        'url_spec': (0 if (r.get('source_url') or '').count('/') >= 4
-                     else (1 if r.get('source_url') else 2)),
+        'url_spec': _url_spec(r.get('source_url')),
         'from': 'sieve-live',
     }
+
+
+# Known generic hubs (not exact pages) — a citation should prefer a real page over these.
+_GENERIC_HUBS = {
+    'developers.google.com/search', 'developers.google.com/search/docs',
+    'docs.perplexity.ai', 'platform.openai.com/docs', 'www.bing.com/webmasters/help',
+}
+
+
+def _url_spec(u: Optional[str]) -> int:
+    """Tiebreak rank: 0 = specific page, 1 = generic hub / bare domain, 2 = no url."""
+    if not u:
+        return 2
+    path = u.split('://', 1)[-1].rstrip('/')
+    if path in _GENERIC_HUBS or '/' not in path:
+        return 1
+    return 0
 
 
 # ---------------------------------------------------------------------------
