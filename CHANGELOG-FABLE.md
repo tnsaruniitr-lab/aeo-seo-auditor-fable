@@ -60,6 +60,18 @@ citation, live double-run E2E).
 | **GROUND-2** Report showed a source's name/org/tier but not its *reasoning* or freshness; principles mislabeled 'Item' | "Sources cited" now renders the rule's verbatim if/then reasoning (escaped, 240-char capped), a `verified <date>` badge from `last_verified`, and correct kind labels (Rule/AP/Principle). | `main.py` render JS |
 | **OBS-1** `/readyz` reported only the static 4,980-row snapshot; whether the 23k-row live brain was reachable was invisible | `/readyz` now includes `sieve_live_stats` (best-effort `sieve_brain.stats()`: per-table rows + embedded counts + semantic-layer flag). | `main.py` |
 
+## DET — Retrieval & report determinism (2026-07-04)
+
+Closes the determinism findings from the grounding audit (identical inputs
+must produce identical cited reports — HANDOFF invariant 3).
+
+| Finding | Fix | Where |
+|---|---|---|
+| **DET-1** OpenAI query embeddings drift call-to-call (~1e-4/component, survives 7-decimal rounding) → 8/13 checks not byte-identical across runs | **Pinned query embeddings**: first vector per query text is stored in `public.check_query_embeddings` (auditor's own schema) and reused forever; in-process memo + ON CONFLICT re-read converges concurrent audits. Verified byte-identical across 3 fresh processes. Side effects: near-zero embedding cost after warm-up, and cached checks retrieve semantically even when OpenAI is down (kills the semantic→FTS layer-flapping failure). `scripts/warm_query_embeddings.py` pre-pins all 108 canonical checks. | `sieve_brain.py`, `scripts/warm_query_embeddings.py` |
+| **DET-2** FTS `ORDER BY score DESC LIMIT k` has no tie-break; ts_rank ties at the cut changed citation identity run-to-run (12/13 checks ambiguous) | `ORDER BY score DESC, t.id::bigint ASC`; python re-rank tie-break extended with `kind` (rules/principles id spaces collide). Vector path needs no SQL tie-break — pinned vector ⇒ deterministic HNSW scan. Verified pure-FTS byte-identical across 3 fresh processes. | `sieve_brain.py` |
+| **DET-3** LLM renames check_ids between runs (74/~100 stable: `A10_robots_txt` vs `A10_robots_txt_crawling`), breaking cross-run comparison + delta engine | New `check_vocab.py`: post-loop canonicalization against the brain-mappings registry (108 checks, letter+number prefixes unique). Conservative: exact ids and script sub-checks (`A2b_…`) untouched, renames refused on collision, unknowns flagged. Wired before `finalize_scoring` so scores/persistence/deltas see stable ids; stats under `metadata.check_id_normalization`. System prompt now demands exact ids. | `check_vocab.py`, `agent.py`, `system_prompt.py` |
+| **OBS-2** No visibility into pinned-query coverage | `sieve_brain.stats()` (surfaced in `/readyz`) reports `pinned_query_embeddings`. | `sieve_brain.py` |
+
 ## Known remainders (documented, not yet done)
 
 - **Separate worker process / durable queue.** Job *status* is now durable and

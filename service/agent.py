@@ -683,6 +683,26 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
                                        loop_result.get("output_tokens") or 0)
 
     # ------------------------------------------------------------------
+    # CHECK-ID VOCABULARY — the model emits variant check_ids between runs
+    # (A10_robots_txt vs A10_robots_txt_crawling), breaking cross-run
+    # comparability and the delta engine. Canonicalize against the
+    # brain-mappings registry BEFORE scoring so scores, persistence and
+    # deltas all see stable ids.
+    # ------------------------------------------------------------------
+    try:
+        from check_vocab import normalize_check_ids
+        audit, vocab_stats = normalize_check_ids(audit)
+        md["check_id_normalization"] = vocab_stats
+        if vocab_stats.get("renamed"):
+            log.info('%scheck_ids canonicalized: %d renamed, %d unknown, %d collisions',
+                     f'[{audit_id[:8]}] ', vocab_stats["renamed"],
+                     vocab_stats["unknown"], vocab_stats["collisions"])
+    except Exception as e:
+        md["check_id_normalization"] = {"applied": False,
+                                        "error": f"{type(e).__name__}: {e}"}
+        log.error('%scheck_id normalization failed: %s', f'[{audit_id[:8]}] ', e)
+
+    # ------------------------------------------------------------------
     # AUTHORITATIVE SCORING — the model only CLASSIFIES checks (pass/warn/
     # fail/na). Python GRADES. recompute_scores() overwrites whatever the
     # model put in `scoring` with numbers derived deterministically from the

@@ -258,7 +258,7 @@ object wrapped in `<audit>` ... `</audit>` tags, matching this schema:
   },
   "findings": [
     {
-      "check_id": "D14_hreflang_coverage",
+      "check_id": "D14_hreflang_coverage",  // EXACT id from static-rules/brain-mappings (or a script-emitted sub-check id like A2b_...). NEVER invent variants or shorten ids — runs must be comparable.
       "section": "D",
       "status": "pass|warn|fail|na",
       "severity": "critical|high|medium|low|info",
