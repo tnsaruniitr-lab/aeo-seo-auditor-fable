@@ -3,17 +3,18 @@ sieve_brain.py — LIVE citation retrieval from the Sieve brain (Railway `sieve`
 
 ADDITIVE + SAFE. This is an OPT-IN alternate source for query_brain's citations:
   - Enabled only when SIEVE_LIVE=1 AND a DB URL is configured.
-  - On ANY error (no DB, no schema, query failure) it returns None, and the caller
-    falls back to the existing snapshot ranker. The static path is never touched.
+  - On ANY error it returns None, and the caller falls back to the snapshot ranker.
+    The static path is never touched.
 
-Why retrieval instead of the old id-map: the fresh brain (rules=23k, ids differ
-from the 4,980-row snapshot) can't be reached by the snapshot's hardcoded
-check_id→rule_id mapping. So we retrieve by full-text over the rule text, then
-rank by AUTHORITY TIER → confidence → relevance, and resolve each rule's source
-URL via source_refs_json → documents.source_url. Output shape matches
-ranker.select_citations so nothing downstream changes.
+Retrieval is LAYERED (best signal first, each degrades to the next):
+  1. SEMANTIC (vector): embed the check query (OpenAI text-embedding-3-small, 1536-d)
+     and cosine-search rules + principles + anti_patterns (needs embeddings + key).
+  2. KEYWORD (FTS): full-text over the same three tables (no key needed).
+  3. -> None: caller uses the snapshot ranker.
+Candidates from whichever layer are re-ranked by AUTHORITY TIER -> confidence ->
+match score, and each carries source_org + source_url + last_verified.
 
-Stdlib + psycopg2 (already a dependency).
+Stdlib + psycopg2 (dependency). OpenAI is optional (only for the semantic layer).
 """
 
 from __future__ import annotations
@@ -26,11 +27,17 @@ from typing import Any, Dict, List, Optional
 log = logging.getLogger('audit.sieve')
 
 SIEVE_LIVE = os.getenv('SIEVE_LIVE', '') in ('1', 'true', 'True')
-# Reuse the auditor's own Postgres (same instance, `sieve` schema) unless a
-# dedicated brain URL is provided.
 SIEVE_DB_URL = os.getenv('SIEVE_DB_URL') or os.getenv('DATABASE_URL')
+EMBED_MODEL = os.getenv('SIEVE_EMBED_MODEL', 'text-embedding-3-small')
 
 TIER_ICONS = {1: '🥇', 2: '🥈', 3: '🥉', 4: '📄', 5: '📝'}
+
+# Which brain tables to search + how their columns map to a uniform citation.
+_TABLE_CFG = {
+    'rules':         {'kind': 'rule',      'title': 'name',  't1': 'if_condition', 't2': 'then_logic',  'conf': 'confidence_score', 'risk': None},
+    'principles':    {'kind': 'principle', 'title': 'title', 't1': 'statement',    't2': 'explanation', 'conf': 'confidence_score', 'risk': None},
+    'anti_patterns': {'kind': 'ap',        'title': 'title', 't1': 'description',  't2': None,          'conf': None,               'risk': 'risk_level'},
+}
 
 
 def live_enabled() -> bool:
@@ -40,8 +47,8 @@ def live_enabled() -> bool:
 # ---------------------------------------------------------------------------
 # Source-org canonicalization + tiering
 # The brain stores a mix of canonical names ("Google", "Schema.org") and raw
-# domains ("backlinko.com", "ycombinator.com"). Canonicalize BEFORE tiering so
-# authoritative sources don't sink to tier 5 (the latent tier bug, now active).
+# domains ("backlinko.com"). Canonicalize BEFORE tiering so authoritative
+# sources don't sink to tier 5 (the latent tier bug, now active).
 # ---------------------------------------------------------------------------
 
 _CANON = {
@@ -62,7 +69,6 @@ _CANON = {
     'search engine land': 'Search Engine Land', 'searchengineland.com': 'Search Engine Land',
     'search engine journal': 'Search Engine Journal', 'searchenginejournal.com': 'Search Engine Journal',
 }
-# Authority tiers keyed on canonical names.
 _TIER_1 = {'Google', 'Schema.org', 'Bing', 'W3C', 'web.dev', 'MDN', 'Perplexity', 'OpenAI', 'Anthropic'}
 _TIER_2 = {'Backlinko', 'Ahrefs', 'Semrush', 'Moz'}
 _TIER_3 = {'Search Engine Land', 'Search Engine Journal'}
@@ -75,7 +81,6 @@ def canon_org(org: Optional[str]) -> str:
     key = org.strip().lower()
     if key in _CANON:
         return _CANON[key]
-    # strip www. and try the bare domain
     key2 = re.sub(r'^www\.', '', key)
     if key2 in _CANON:
         return _CANON[key2]
@@ -90,12 +95,11 @@ def tier_of(org: Optional[str]) -> int:
         return 2
     if c in _TIER_3:
         return 3
-    # unknown authoritative-ish domains vs the "Personal Blog" long tail
     return 4 if (org and '.' in org and org.strip().lower() != 'personal blog') else _DEFAULT_TIER
 
 
 # ---------------------------------------------------------------------------
-# check_id → search query
+# check_id -> search query
 # ---------------------------------------------------------------------------
 
 _SECTION_HINT = {
@@ -108,14 +112,98 @@ _SECTION_HINT = {
 
 
 def _query_for(check_id: str) -> str:
-    """Turn 'D6_required_fields' into a search query 'required fields' + a
-    section-topic hint, so full-text retrieval finds relevant rules."""
+    """Turn 'D6_required_fields' into 'required fields' + a section-topic hint."""
     clean = check_id.split(':', 1)[-1]
     m = re.match(r'^([A-Z])\d', clean)
     hint = _SECTION_HINT.get(m.group(1), '') if m else ''
-    # drop the leading code token, split words
     body = re.sub(r'^[A-Z]\d+[a-z]?_', '', clean).replace('_', ' ').strip()
     return (body + ' ' + hint).strip() or clean
+
+
+# ---------------------------------------------------------------------------
+# Embedding (semantic layer) — optional
+# ---------------------------------------------------------------------------
+
+def _embed_query(text: str) -> Optional[list]:
+    """Embed the query in the same space as the corpus. None if unavailable."""
+    if not os.getenv('OPENAI_API_KEY'):
+        return None
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+        r = client.embeddings.create(model=EMBED_MODEL, input=[text[:6000]])
+        return r.data[0].embedding
+    except Exception as e:
+        log.info('query embedding unavailable (%s) — using FTS', e)
+        return None
+
+
+def _vec_literal(v) -> str:
+    return '[' + ','.join(f'{x:.7f}' for x in v) + ']'
+
+
+# ---------------------------------------------------------------------------
+# SQL builders (uniform citation shape across the 3 tables)
+# ---------------------------------------------------------------------------
+
+def _conf_expr(cfg) -> str:
+    if cfg['conf']:
+        return f"t.{cfg['conf']}"
+    # anti_patterns: map risk_level -> a confidence-ish number for ranking
+    return ("CASE lower(coalesce(t.risk_level,'')) WHEN 'high' THEN '0.9' "
+            "WHEN 'low' THEN '0.65' ELSE '0.8' END")
+
+
+def _select_head(cfg, score_sql: str) -> str:
+    t2 = f"t.{cfg['t2']}" if cfg['t2'] else "''"
+    return f"""
+        SELECT t.id, t.{cfg['title']} AS title, t.{cfg['t1']} AS text1, {t2} AS text2,
+               t.domain_tag, {_conf_expr(cfg)} AS conf, t.source_org,
+               COALESCE(NULLIF(t.source_url,''), d.source_url) AS source_url,
+               t.created_at, {score_sql} AS score
+        FROM sieve.{{table}} t
+        LEFT JOIN sieve.documents d
+          ON d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')
+    """
+
+
+def _search_vector(cur, table, cfg, qvec_literal, k):
+    sql = _select_head(cfg, '1 - (t.embedding <=> %s::vector)').format(table=table) + \
+        " WHERE t.embedding IS NOT NULL ORDER BY t.embedding <=> %s::vector LIMIT %s"
+    cur.execute(sql, (qvec_literal, qvec_literal, k))
+    return cur.fetchall()
+
+
+def _search_fts(cur, table, cfg, ts_query, k):
+    tsv = (f"to_tsvector('english', coalesce(t.{cfg['title']},'')||' '||"
+           f"coalesce(t.{cfg['t1']},'')" + (f"||' '||coalesce(t.{cfg['t2']},'')" if cfg['t2'] else '') + ")")
+    sql = _select_head(cfg, f"ts_rank({tsv}, websearch_to_tsquery('english', %s))").format(table=table) + \
+        f" WHERE {tsv} @@ websearch_to_tsquery('english', %s) ORDER BY score DESC LIMIT %s"
+    cur.execute(sql, (ts_query, ts_query, k))
+    return cur.fetchall()
+
+
+def _row_to_cite(r) -> Dict[str, Any]:
+    org = r.get('source_org')
+    t = tier_of(org)
+    try:
+        conf = float(r.get('conf') or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    return {
+        'id': r.get('id'), 'kind': r.get('kindtag', 'rule'),
+        'tier': t, 'tier_icon': TIER_ICONS.get(t, '📝'),
+        'source_org': canon_org(org) or org, 'source_org_raw': org,
+        'source_url': r.get('source_url'),
+        'name': r.get('title'),
+        'confidence_score': str(round(conf, 2)),
+        'if_condition': (r.get('text1') or '')[:500],
+        'then_action': (r.get('text2') or '')[:500],
+        'domain_tag': r.get('domain_tag'),
+        'last_verified': str(r.get('created_at'))[:10] if r.get('created_at') else None,
+        'relevance': round(float(r.get('score') or 0.0), 4),
+        'from': 'sieve-live',
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -125,8 +213,8 @@ def _query_for(check_id: str) -> str:
 def live_citations(check_id: str, page_type: Optional[str] = None,
                    industry: Optional[str] = None,
                    max_citations: int = 3) -> Optional[List[Dict[str, Any]]]:
-    """Return citation dicts for a check from the live brain, or None to signal
-    the caller to fall back to the snapshot path. Never raises."""
+    """Return citation dicts for a check from the live brain, or None so the
+    caller falls back to the snapshot path. Never raises."""
     if not live_enabled():
         return None
     try:
@@ -136,39 +224,35 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
         return None
 
     query = _query_for(check_id)
-    # websearch_to_tsquery ANDs bare words (too strict → 0 hits). OR the terms
-    # so partial matches are found, then ts_rank orders by how well each matches.
     words = list(dict.fromkeys(re.findall(r'[a-zA-Z0-9][a-zA-Z0-9-]{2,}', query.lower())))
     ts_query = ' OR '.join(words) or query
+    qvec = _embed_query(query)                       # None => FTS-only
+    qvec_lit = _vec_literal(qvec) if qvec else None
+    per_table_k = max(8, max_citations * 4)
+
+    rows: List[Dict[str, Any]] = []
     try:
         conn = psycopg2.connect(SIEVE_DB_URL, connect_timeout=10)
         conn.autocommit = True
         try:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                # Candidate pool by full-text relevance; re-ranked by tier below.
-                cur.execute(
-                    """
-                    SELECT r.id, r.name, r.if_condition, r.then_logic, r.domain_tag,
-                           r.confidence_score, r.source_org, r.created_at,
-                           r.source_refs_json,
-                           d.source_url, d.title AS doc_title,
-                           ts_rank(
-                             to_tsvector('english',
-                               coalesce(r.name,'')||' '||coalesce(r.if_condition,'')||' '||coalesce(r.then_logic,'')),
-                             websearch_to_tsquery('english', %s)
-                           ) AS relevance
-                    FROM sieve.rules r
-                    LEFT JOIN sieve.documents d
-                      ON d.id = NULLIF(substring(r.source_refs_json from '\\d+'), '')
-                    WHERE to_tsvector('english',
-                            coalesce(r.name,'')||' '||coalesce(r.if_condition,'')||' '||coalesce(r.then_logic,''))
-                          @@ websearch_to_tsquery('english', %s)
-                    ORDER BY relevance DESC
-                    LIMIT %s
-                    """,
-                    (ts_query, ts_query, max(24, max_citations * 6)),
-                )
-                rows = cur.fetchall()
+                for table, cfg in _TABLE_CFG.items():
+                    found = []
+                    try:
+                        if qvec_lit:
+                            found = _search_vector(cur, table, cfg, qvec_lit, per_table_k)
+                        else:
+                            found = _search_fts(cur, table, cfg, ts_query, per_table_k)
+                    except Exception as te:
+                        # e.g. no embedding column yet -> fall back to FTS for this table
+                        log.info('vector search on %s failed (%s), trying FTS', table, te)
+                        try:
+                            found = _search_fts(cur, table, cfg, ts_query, per_table_k)
+                        except Exception:
+                            found = []
+                    for r in found:
+                        r['kindtag'] = cfg['kind']
+                    rows += found
         finally:
             conn.close()
     except Exception as e:
@@ -178,56 +262,36 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
     if not rows:
         return None
 
-    cites = []
-    for r in rows:
-        org = r.get('source_org')
-        t = tier_of(org)
-        try:
-            conf = float(r.get('confidence_score') or 0.0)
-        except (TypeError, ValueError):
-            conf = 0.0
-        cites.append({
-            'id': r.get('id'),
-            'kind': 'rule',
-            'tier': t,
-            'tier_icon': TIER_ICONS.get(t, '📝'),
-            'source_org': canon_org(org) or org,
-            'source_org_raw': org,
-            'source_url': r.get('source_url'),
-            'source_doc_title': r.get('doc_title'),
-            'name': r.get('name'),
-            'confidence_score': str(round(conf, 2)),
-            'if_condition': (r.get('if_condition') or '')[:500],
-            'then_action': (r.get('then_logic') or '')[:500],
-            'domain_tag': r.get('domain_tag'),
-            'last_verified': str(r.get('created_at'))[:10] if r.get('created_at') else None,
-            'relevance': round(float(r.get('relevance') or 0.0), 4),
-            'from': 'sieve-live',
-        })
+    cites = [_row_to_cite(r) for r in rows]
 
-    # Authority-first ranking: tier ASC, then confidence DESC, then relevance DESC,
-    # then id ASC (deterministic). Surfaces Google/Schema.org/Perplexity above the
-    # 53%-of-corpus "Personal Blog" long tail.
+    # Authority-first ranking: tier ASC, confidence DESC, match-score DESC, id ASC.
     cites.sort(key=lambda c: (
-        c['tier'], -float(c['confidence_score']), -c['relevance'], c['id'] or 0
+        c['tier'], -float(c['confidence_score']), -c['relevance'], str(c['id'] or '')
     ))
     return cites[:max_citations]
 
 
 def stats() -> Dict[str, Any]:
-    """Lightweight liveness/coverage probe for /readyz."""
+    """Liveness/coverage probe for /readyz."""
     if not live_enabled():
         return {'live': False, 'reason': 'SIEVE_LIVE off or no DB url'}
     try:
         import psycopg2
         conn = psycopg2.connect(SIEVE_DB_URL, connect_timeout=8)
         conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM sieve.rules")
-            rules = cur.fetchone()[0]
-            cur.execute("SELECT count(*) FROM sieve.documents WHERE source_url <> '' AND source_url IS NOT NULL")
-            docs_with_url = cur.fetchone()[0]
+        out = {'live': True, 'semantic': bool(os.getenv('OPENAI_API_KEY'))}
+        for t in _TABLE_CFG:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT count(*), count(embedding) FROM sieve.{t}")
+                    total, emb = cur.fetchone()
+                    out[t] = {'rows': total, 'embedded': emb}
+            except Exception:
+                with conn.cursor() as cur:  # embedding column not present yet
+                    conn.rollback()
+                    cur.execute(f"SELECT count(*) FROM sieve.{t}")
+                    out[t] = {'rows': cur.fetchone()[0], 'embedded': 0}
         conn.close()
-        return {'live': True, 'rules': rules, 'documents_with_url': docs_with_url}
+        return out
     except Exception as e:
         return {'live': False, 'error': f'{type(e).__name__}: {e}'}
