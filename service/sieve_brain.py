@@ -202,6 +202,9 @@ def _row_to_cite(r) -> Dict[str, Any]:
         'domain_tag': r.get('domain_tag'),
         'last_verified': str(r.get('created_at'))[:10] if r.get('created_at') else None,
         'relevance': round(float(r.get('score') or 0.0), 4),
+        # url specificity for a gentle tiebreak: 0=specific page, 1=has url, 2=none
+        'url_spec': (0 if (r.get('source_url') or '').count('/') >= 4
+                     else (1 if r.get('source_url') else 2)),
         'from': 'sieve-live',
     }
 
@@ -264,9 +267,11 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
 
     cites = [_row_to_cite(r) for r in rows]
 
-    # Authority-first ranking: tier ASC, confidence DESC, match-score DESC, id ASC.
+    # Authority-first ranking: tier ASC, confidence DESC, match-score DESC, then
+    # a gentle preference for a specific source URL, then id ASC (deterministic).
     cites.sort(key=lambda c: (
-        c['tier'], -float(c['confidence_score']), -c['relevance'], str(c['id'] or '')
+        c['tier'], -float(c['confidence_score']), -c['relevance'],
+        c.get('url_spec', 2), str(c['id'] or '')
     ))
     return cites[:max_citations]
 
