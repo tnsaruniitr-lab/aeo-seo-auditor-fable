@@ -703,6 +703,28 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
         log.error('%scheck_id normalization failed: %s', f'[{audit_id[:8]}] ', e)
 
     # ------------------------------------------------------------------
+    # DETERMINISTIC CITATIONS — Phase 13 is a runtime responsibility now:
+    # every fail/warn finding gets the top-3 query_brain citations,
+    # replacing whatever subset the model chose (it cited only ~17% of
+    # eligible checks, inconsistently between runs). Runs after check_id
+    # canonicalization so lookups hit stable ids; the grounding pass below
+    # then verifies/flags every attached citation.
+    # ------------------------------------------------------------------
+    try:
+        from citation_attach import attach_citations
+        audit, attach_stats = attach_citations(audit)
+        md["citation_attachment"] = attach_stats
+        log.info('%sdeterministic citations: %d/%d checks cited (%d attached, %d LLM lists replaced)',
+                 f'[{audit_id[:8]}] ', attach_stats.get("checks_cited", 0),
+                 attach_stats.get("checks_eligible", 0),
+                 attach_stats.get("citations_attached", 0),
+                 attach_stats.get("llm_lists_replaced", 0))
+    except Exception as e:
+        md["citation_attachment"] = {"applied": False,
+                                     "error": f"{type(e).__name__}: {e}"}
+        log.error('%scitation attachment failed: %s', f'[{audit_id[:8]}] ', e)
+
+    # ------------------------------------------------------------------
     # AUTHORITATIVE SCORING — the model only CLASSIFIES checks (pass/warn/
     # fail/na). Python GRADES. recompute_scores() overwrites whatever the
     # model put in `scoring` with numbers derived deterministically from the

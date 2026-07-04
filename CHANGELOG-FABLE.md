@@ -72,6 +72,14 @@ must produce identical cited reports — HANDOFF invariant 3).
 | **DET-3** LLM renames check_ids between runs (74/~100 stable: `A10_robots_txt` vs `A10_robots_txt_crawling`), breaking cross-run comparison + delta engine | New `check_vocab.py`: post-loop canonicalization against the brain-mappings registry (108 checks, letter+number prefixes unique). Conservative: exact ids and script sub-checks (`A2b_…`) untouched, renames refused on collision, unknowns flagged. Wired before `finalize_scoring` so scores/persistence/deltas see stable ids; stats under `metadata.check_id_normalization`. System prompt now demands exact ids. | `check_vocab.py`, `agent.py`, `system_prompt.py` |
 | **OBS-2** No visibility into pinned-query coverage | `sieve_brain.stats()` (surfaced in `/readyz`) reports `pinned_query_embeddings`. | `sieve_brain.py` |
 
+## CITE+UI — Deterministic citations everywhere + report redesign (2026-07-04)
+
+| Finding | Fix | Where |
+|---|---|---|
+| **CITE-1** The model cited only ~17% of fail/warn findings, inconsistently between runs (Phase 13 applied ad hoc) | New `citation_attach.py`: post-loop, EVERY fail/warn finding gets the top-3 query_brain citations, replacing the model's selection. Live-verified on a real audit: 59/59 eligible checks cited, 177/177 citations verbatim-grounded, 0 errors. Completes "LLM classifies; Python grades, cites, grounds". Stats under `metadata.citation_attachment`. | `citation_attach.py`, `agent.py` |
+| **UI-1** Report design dated; sources shown as plain rows | Full design-system revamp of the embedded SPA: gradient typography, layered glass cards with glows, SVG score-ring gauge hero with meta pills, section scores as color-banded tiles with gradient bars, severity/status chips, tier-tinted source cards with verbatim if→then quote blocks + verified badges, hover states, entrance animations, responsive + reduced-motion safe. Verified locally (desktop + mobile screenshots) against real audits. | `main.py` (INDEX_HTML CSS + render fns) |
+| **UI-2** Markdown renderer hard-indexed citation keys and mislabeled principles as 'AP' | Tolerant key access; kind labels Rule/AP/Principle. | `audit_pipeline.py`, `ruleset/ranker.py` |
+
 ## Known remainders (documented, not yet done)
 
 - **Separate worker process / durable queue.** Job *status* is now durable and

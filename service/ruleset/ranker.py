@@ -271,9 +271,10 @@ def format_citation(citation: dict) -> str:
     icon = citation.get('tier_icon', '·')
     org = citation.get('source_org', 'unknown')
     name = citation.get('name') or citation.get('title', '(no name)')
-    rid = citation['id']
-    kind = citation['kind']
-    kind_label = 'Rule' if kind == 'rule' else 'AP'
+    rid = citation.get('id', '?')
+    kind = citation.get('kind', 'rule')
+    kind_label = {'rule': 'Rule', 'ap': 'AP', 'anti_pattern': 'AP',
+                  'principle': 'Principle'}.get(kind, 'Item')
     conf = _confidence_float(citation)
     url = citation.get('source_url', '')
     src_title = citation.get('source_title', '')
