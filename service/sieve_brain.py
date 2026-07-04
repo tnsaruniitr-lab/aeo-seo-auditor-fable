@@ -160,7 +160,8 @@ def _select_head(cfg, score_sql: str) -> str:
         SELECT t.id, t.{cfg['title']} AS title, t.{cfg['t1']} AS text1, {t2} AS text2,
                t.domain_tag, {_conf_expr(cfg)} AS conf, t.source_org,
                COALESCE(NULLIF(t.source_url,''), d.source_url) AS source_url,
-               t.created_at, {score_sql} AS score
+               COALESCE(t.last_verified::text, t.created_at) AS created_at,
+               {score_sql} AS score
         FROM sieve.{{table}} t
         LEFT JOIN sieve.documents d
           ON d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')

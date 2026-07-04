@@ -1246,12 +1246,15 @@ function renderBrainSources(findings) {
         ? ' <code style="font-size:11px">[Sieve ' + kind + ' #' + escapeHtml(String(c.id)) + ']</code>'
         : '';
       const safeUrl = c.source_url ? safeHref(c.source_url) : '';
+      const verified = c.last_verified
+        ? ' <span class="ver" style="font-size:11px;color:#888">· verified ' + escapeHtml(String(c.last_verified)) + '</span>'
+        : '';
       html += '<div class="citation">' +
         '<span class="src">' + escapeHtml(c.source_org || 'unknown') + '</span> — ' +
         (safeUrl ? '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' : '') +
         '<span class="nm">' + escapeHtml(name) + '</span>' +
         (safeUrl ? '</a>' : '') +
-        conf + risk + idTag +
+        conf + risk + idTag + verified +
         '</div>';
     }
     html += '</div>';
