@@ -98,6 +98,12 @@ must produce identical cited reports — HANDOFF invariant 3).
 |---|---|---|
 | **LUM-2** Theme control | Dark tokens moved from media-query-only to `:root[data-theme="dark"]`; a pre-paint head script applies the saved choice (localStorage `aeo-theme`) or falls back to the system preference — no flash of wrong theme. Floating sun/moon button (top-right) flips + persists; with no saved choice the page keeps following OS scheme changes live. | `main.py` |
 
+## GROUND-3 — Fix WHY paragraphs cite their receipts (2026-07-05)
+
+| Change | Detail | Where |
+|---|---|---|
+| **GROUND-3** Top-fix narratives referenced brain objects as bare ids ("Sieve Principle #1109") with no link | `ground_fix_sources()` parses those references post-loop, resolves each (kind, id) through the same live→snapshot chain as citations, and attaches `fix.sources` — org, linked rule/principle name, source URL, verified date. Rendered as a "Sources" receipts row under every "Why this matters" block. Live-verified: 4/4 refs in a real audit resolved to docs.perplexity.ai / schema.org / developers.google.com. Stats under `metadata.fix_sources`. | `citation_grounding.py`, `agent.py`, `main.py` |
+
 ## Known remainders (documented, not yet done)
 
 - **Separate worker process / durable queue.** Job *status* is now durable and

@@ -765,6 +765,24 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
                   f'[{audit_id[:8]}] ', e, traceback.format_exc())
 
     # ------------------------------------------------------------------
+    # FIX-SOURCE RESOLUTION — the top-fix WHY paragraphs reference brain
+    # objects inline ("Sieve Principle #1109"); resolve each reference to
+    # its actual source (org, URL, verified date) so the claim links to
+    # its receipt instead of a bare id.
+    # ------------------------------------------------------------------
+    try:
+        from citation_grounding import ground_fix_sources
+        audit, fix_src_stats = ground_fix_sources(audit)
+        md["fix_sources"] = fix_src_stats
+        if fix_src_stats.get("resolved"):
+            log.info('%sfix sources resolved: %d of %d refs',
+                     f'[{audit_id[:8]}] ', fix_src_stats["resolved"],
+                     fix_src_stats.get("refs_found", 0))
+    except Exception as e:
+        md["fix_sources"] = {"applied": False, "error": f"{type(e).__name__}: {e}"}
+        log.error('%sfix-source grounding failed: %s', f'[{audit_id[:8]}] ', e)
+
+    # ------------------------------------------------------------------
     # MEASURED AI VISIBILITY — execute the audit's own test queries
     # against real answer engines (per available API keys), record who
     # gets cited/mentioned, compute share of voice vs the crawled

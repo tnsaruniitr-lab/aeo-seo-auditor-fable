@@ -405,6 +405,95 @@ def reground_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
 
 
 # ---------------------------------------------------------------------------
+# Fix-source resolution — make the WHY paragraphs cite their receipts.
+# The model's top-fix narratives reference brain objects inline ("Sieve
+# Principle #1109", "rule id:25694") but carry no links. Python parses those
+# references, resolves each (kind, id) through the same live->snapshot chain
+# as citations, and attaches fix['sources'] = [{kind,id,name,source_org,
+# source_url,last_verified,...}] — so the rendered claim links to the actual
+# source document, deterministically.
+# ---------------------------------------------------------------------------
+
+_REF_RE = re.compile(
+    r'(?:sieve\s+)?(rule|principle|anti[-_\s]?pattern|ap)s?'
+    r'\s*(?:\(\s*)?(?:id\s*[:#=]?\s*|#)\s*(\d{1,6})',
+    re.IGNORECASE)
+_MAX_FIX_SOURCES = 4
+
+
+def _parse_refs(text: str) -> List[Tuple[str, str]]:
+    """Ordered, deduped (kind, id) references mentioned in narrative text."""
+    out: List[Tuple[str, str]] = []
+    for kind_word, rid in _REF_RE.findall(text or ''):
+        kind = _norm_kind(kind_word)
+        if kind and (kind, rid) not in out:
+            out.append((kind, rid))
+    return out
+
+
+def ground_fix_sources(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Resolve brain-object references in narrative.top_5_fixes into linked
+    sources. Mutates and returns (audit, stats). Never raises."""
+    stats: Dict[str, Any] = {'applied': True, 'fixes_scanned': 0,
+                             'refs_found': 0, 'resolved': 0, 'unresolved': 0}
+    try:
+        fixes = (audit.get('narrative') or {}).get('top_5_fixes')
+        if not isinstance(fixes, list) or not fixes:
+            return audit, stats
+
+        per_fix_refs: List[List[Tuple[str, str]]] = []
+        wanted: Dict[str, List[str]] = {k: [] for k in _KIND_CFG}
+        for f in fixes:
+            if not isinstance(f, dict):
+                per_fix_refs.append([])
+                continue
+            text = ' '.join(str(f.get(k) or '') for k in ('title', 'why', 'before', 'after'))
+            refs = _parse_refs(text)[:_MAX_FIX_SOURCES]
+            per_fix_refs.append(refs)
+            stats['fixes_scanned'] += 1
+            stats['refs_found'] += len(refs)
+            for kind, rid in refs:
+                if rid not in wanted[kind]:
+                    wanted[kind].append(rid)
+
+        if not stats['refs_found']:
+            return audit, stats
+
+        try:
+            live_rows = _fetch_live_rows(wanted)
+        except Exception as e:  # noqa: BLE001
+            log.warning('live fix-source fetch unavailable: %s', e)
+            live_rows = {}
+
+        for f, refs in zip(fixes, per_fix_refs):
+            if not isinstance(f, dict) or not refs:
+                continue
+            sources = []
+            for kind, rid in refs:
+                auth = live_rows.get((kind, rid)) or _snapshot_fields(kind, rid)
+                if auth is None:
+                    stats['unresolved'] += 1
+                    continue
+                stats['resolved'] += 1
+                sources.append({
+                    'kind': kind, 'id': rid,
+                    'name': auth.get('name'),
+                    'source_org': auth.get('source_org'),
+                    'source_url': auth.get('source_url'),
+                    'last_verified': auth.get('last_verified'),
+                    'confidence_score': auth.get('confidence_score'),
+                    'from': auth.get('from'),
+                })
+            if sources:
+                f['sources'] = sources
+    except Exception as e:  # noqa: BLE001
+        log.error('fix-source grounding failed: %s', e)
+        stats['applied'] = False
+        stats['error'] = f'{type(e).__name__}: {e}'
+    return audit, stats
+
+
+# ---------------------------------------------------------------------------
 # Self-test (stdlib only, no DB/network) — wired into tests/run_tests.sh
 # ---------------------------------------------------------------------------
 
@@ -415,7 +504,7 @@ def _selftest() -> None:
     # Stub the snapshot: rule 1668, an UNRELATED rule 2001 (id collides with
     # AP 2001 — mirrors the ~94% cross-table id overlap in the real brain),
     # and AP 2001. Live layer off.
-    _SNAPSHOT_CACHE = types.SimpleNamespace(
+    stub_index = _SNAPSHOT_CACHE = types.SimpleNamespace(
         rules_by_id={
             1668: {
                 'id': 1668, 'name': 'Organization schema must include name and URL',
@@ -516,6 +605,30 @@ def _selftest() -> None:
     for shape in ({}, {'findings': None}, {'findings': 'bogus'}):
         _, s3 = reground_citations(dict(shape))
         assert s3['applied'] is True and s3['citations_total'] == 0, (shape, s3)
+
+    # Fix-source resolution: WHY-paragraph references become linked sources.
+    _SNAPSHOT_CACHE = stub_index
+    audit3 = {'narrative': {'top_5_fixes': [
+        {'title': 'Fix org schema',
+         'why': 'Per Sieve Rule #1668 (confidence 0.98) this is required; '
+                'see also principle id:999 which does not exist.'},
+        {'why': 'no brain references in this one'},
+        'junk-not-a-dict',
+    ]}}
+    audit3, s4 = ground_fix_sources(audit3)
+    f0 = audit3['narrative']['top_5_fixes'][0]
+    assert [(x['kind'], x['id']) for x in f0.get('sources', [])] == [('rule', '1668')], f0
+    assert f0['sources'][0]['source_url'] == 'https://schema.org/Organization', f0
+    assert 'sources' not in audit3['narrative']['top_5_fixes'][1]
+    assert s4 == {'applied': True, 'fixes_scanned': 2, 'refs_found': 2,
+                  'resolved': 1, 'unresolved': 1}, s4
+    # Parser tolerates the real-world phrasings seen in production audits.
+    assert _parse_refs('Schema.org Principle #1250 and anti-pattern id: 42 and Rule id=25694') == \
+        [('principle', '1250'), ('ap', '42'), ('rule', '25694')], \
+        _parse_refs('Schema.org Principle #1250 and anti-pattern id: 42 and Rule id=25694')
+    for shape in ({}, {'narrative': None}, {'narrative': {'top_5_fixes': 'x'}}):
+        _, s5 = ground_fix_sources(dict(shape))
+        assert s5['applied'] is True and s5['refs_found'] == 0, (shape, s5)
 
     print('GROUNDING_OK')
 
