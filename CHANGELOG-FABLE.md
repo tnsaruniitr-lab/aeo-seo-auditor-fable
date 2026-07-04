@@ -47,6 +47,19 @@ Below, each verified audit finding maps to what changed.
 | **ENG-5** Four parallel implementations | Dropped to one; scripts + ruleset + references co-located under `service/`. | repo structure |
 | **PROD-3** Stale brain snapshots | Documented refresh-out-of-band approach; snapshots kept for reproducibility. | `README.md` |
 
+## GROUND — Citation grounding & provenance display (2026-07-04)
+
+Findings from the 6-lane grounding/determinism audit (code review, DB
+forensics, retrieval determinism battery, verbatim check of every persisted
+citation, live double-run E2E).
+
+| Finding | Fix | Where |
+|---|---|---|
+| **GROUND-1** Citations round-trip through the LLM; only ~51% of persisted quote texts verbatim vs the brain; some `then_action` texts were invented remediation attributed to tier-1 sources | New `citation_grounding.py`: after the loop, every citation is re-fetched from the live sieve brain (or snapshot) by `(kind, id)` and all content/source fields are **overwritten with the stored values** — quotes are verbatim-by-construction; the LLM contributes only the check→id mapping. Unresolvable ids are kept but flagged `grounded:'unresolved', verbatim:false`. Stats persisted under `metadata.citation_grounding`. | `citation_grounding.py`, `agent.py` |
+| **SEC-9** Stored-XSS sink: `confidence_score` (LLM/crawl-originated string) concatenated into report HTML unescaped | Confidence rendered numeric-only (`Number(...)` + `toFixed(2)`, else omitted). | `main.py` render JS |
+| **GROUND-2** Report showed a source's name/org/tier but not its *reasoning* or freshness; principles mislabeled 'Item' | "Sources cited" now renders the rule's verbatim if/then reasoning (escaped, 240-char capped), a `verified <date>` badge from `last_verified`, and correct kind labels (Rule/AP/Principle). | `main.py` render JS |
+| **OBS-1** `/readyz` reported only the static 4,980-row snapshot; whether the 23k-row live brain was reachable was invisible | `/readyz` now includes `sieve_live_stats` (best-effort `sieve_brain.stats()`: per-table rows + embedded counts + semantic-layer flag). | `main.py` |
+
 ## Known remainders (documented, not yet done)
 
 - **Separate worker process / durable queue.** Job *status* is now durable and

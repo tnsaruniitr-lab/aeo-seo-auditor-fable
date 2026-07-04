@@ -1236,25 +1236,36 @@ function renderBrainSources(findings) {
     if (!byTier[t] || !byTier[t].length) continue;
     html += '<div class="tier"><h3>' + tierLabels[t] + '</h3>';
     for (const c of byTier[t].slice(0, 12)) {
-      const kind = c.kind === 'rule' ? 'Rule' : c.kind === 'anti_pattern' ? 'AP' : 'Item';
+      const kindLabels = {rule:'Rule', ap:'AP', anti_pattern:'AP', principle:'Principle'};
+      const kind = kindLabels[c.kind] || 'Item';
       const name = c.name || c.title || '(no name)';
-      // Confidence/risk badges where available
-      const conf = (c.confidence_score != null) ? ' (conf ' + c.confidence_score + ')' : '';
+      // Confidence rendered numeric-only: citation fields originate in crawled
+      // rule text, so nothing from them is concatenated into HTML unescaped
+      const confNum = Number(c.confidence_score);
+      const conf = Number.isFinite(confNum) ? ' (conf ' + confNum.toFixed(2) + ')' : '';
       const risk = c.risk_level ? ' [' + escapeHtml(c.risk_level) + ' risk]' : '';
+      const verified = c.last_verified
+        ? ' <span class="ver" style="font-size:11px;color:var(--fg-2)">· verified ' + escapeHtml(String(c.last_verified)) + '</span>' : '';
       // Only show [#id] if id is actually a usable number
       const idTag = (c.id != null && c.id !== '' && !isNaN(c.id))
         ? ' <code style="font-size:11px">[Sieve ' + kind + ' #' + escapeHtml(String(c.id)) + ']</code>'
         : '';
       const safeUrl = c.source_url ? safeHref(c.source_url) : '';
-      const verified = c.last_verified
-        ? ' <span class="ver" style="font-size:11px;color:#888">· verified ' + escapeHtml(String(c.last_verified)) + '</span>'
+      // The rule's own reasoning, verbatim from the brain: when it applies → what to do
+      const why = c.if_condition || c.statement || c.description || '';
+      const act = c.then_action || c.explanation || '';
+      const reasoning = (why || act)
+        ? '<div style="font-size:12px;color:var(--fg-2);margin:2px 0 0 2px">' +
+          (why ? escapeHtml(String(why).slice(0, 240)) : '') +
+          (why && act ? ' → ' : '') +
+          (act ? escapeHtml(String(act).slice(0, 240)) : '') + '</div>'
         : '';
       html += '<div class="citation">' +
         '<span class="src">' + escapeHtml(c.source_org || 'unknown') + '</span> — ' +
         (safeUrl ? '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' : '') +
         '<span class="nm">' + escapeHtml(name) + '</span>' +
         (safeUrl ? '</a>' : '') +
-        conf + risk + idTag + verified +
+        conf + risk + idTag + verified + reasoning +
         '</div>';
     }
     html += '</div>';
@@ -1528,9 +1539,17 @@ def readyz(_: bool = Depends(require_auth)):
     except Exception as e:
         return JSONResponse(status_code=503,
                             content={'status': 'degraded', 'error': f'{type(e).__name__}: {e}'})
+    # Live sieve brain (the DB the citations actually come from when
+    # SIEVE_LIVE=1) — best-effort so a DB blip never degrades readiness.
+    try:
+        import sieve_brain
+        live_stats = sieve_brain.stats()
+    except Exception as e:
+        live_stats = {'live': False, 'error': f'{type(e).__name__}: {e}'}
     return {
         'status': 'ok',
         'brain_stats': stats,
+        'sieve_live_stats': live_stats,
         'anthropic_key_set': bool(os.getenv('ANTHROPIC_API_KEY')),
         'audit_mode': AUDIT_MODE,
         'agent_available': AGENT_AVAILABLE,
