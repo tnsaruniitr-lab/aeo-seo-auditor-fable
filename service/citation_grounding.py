@@ -76,6 +76,46 @@ _KIND_ALIASES = {
 # any other keys on the citation object are left untouched.
 _AUTHORITATIVE_TEXT_FIELDS = ('name', 'if_condition', 'then_action')
 
+# Kind-specific alias fields also owned by this module — popped before the
+# authoritative update so a rule citation can't keep a stale 'statement' etc.
+_ALIAS_FIELDS = ('title', 'statement', 'explanation', 'description',
+                 'risk_level', 'source_title')
+
+# The three brain tables have ~94% id overlap (rules/principles/anti_patterns
+# all start at 1), so (kind, id) with a wrong kind resolves to an UNRELATED
+# record. Before accepting a fetched record we require minimal lexical overlap
+# between what the model cited and what the store returned; on failure we try
+# the other kinds, and give up as 'unresolved' rather than mis-attribute.
+_STOPWORDS = {'the', 'and', 'for', 'with', 'that', 'this', 'must', 'should',
+              'when', 'then', 'your', 'from', 'have', 'are', 'not', 'all',
+              'any', 'use', 'page', 'site'}
+
+
+def _text_tokens(*texts: Any) -> set:
+    toks = set()
+    for s in texts:
+        if isinstance(s, str):
+            toks |= {w for w in re.findall(r'[a-z0-9]+', s.lower())
+                     if len(w) >= 3 and w not in _STOPWORDS}
+    return toks
+
+
+def _claimed_tokens(c: Dict[str, Any]) -> set:
+    return _text_tokens(c.get('name'), c.get('title'), c.get('if_condition'),
+                        c.get('statement'), c.get('description'),
+                        c.get('then_action'), c.get('explanation'))
+
+
+def _plausible(claimed: set, auth: Dict[str, Any]) -> bool:
+    """Does the fetched record plausibly match what the model cited?"""
+    fetched = _text_tokens(auth.get('name'), auth.get('if_condition'),
+                           auth.get('then_action'))
+    if not claimed or not fetched:
+        return True
+    inter = claimed & fetched
+    return len(inter) >= 2 or \
+        (len(inter) / max(1, min(len(claimed), len(fetched)))) >= 0.34
+
 
 def _norm_kind(kind: Any) -> Optional[str]:
     if not isinstance(kind, str):
@@ -138,7 +178,7 @@ def _fetch_live_rows(wanted: Dict[str, List[str]]) -> Dict[Tuple[str, str], Dict
                                {t2} AS text2, t.domain_tag, {conf} AS conf,
                                {risk} AS risk, t.source_org,
                                COALESCE(NULLIF(t.source_url,''), d.source_url) AS source_url,
-                               t.created_at
+                               COALESCE(t.last_verified::text, t.created_at) AS created_at
                         FROM sieve.{cfg['table']} t
                         LEFT JOIN sieve.documents d
                           ON d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')
@@ -153,8 +193,9 @@ def _fetch_live_rows(wanted: Dict[str, List[str]]) -> Dict[Tuple[str, str], Dict
         finally:
             conn.close()
     except Exception as e:
+        # Keep whatever was already fetched — snapshot covers the rest.
         log.warning('live re-grounding fetch failed (%s) — using snapshot', e)
-        return {}
+        return out
     return out
 
 
@@ -166,8 +207,9 @@ def _live_row_fields(kind: str, r: Dict[str, Any]) -> Dict[str, Any]:
     tier = sieve_brain.tier_of(org)
     conf = r.get('conf')
     if conf is None and kind == 'ap':
-        conf = {'high': '0.9', 'low': '0.65'}.get(
-            str(r.get('risk') or '').strip().lower(), '0.8')
+        # Same risk->confidence map as the snapshot path (ranker.py)
+        conf = {'high': 0.95, 'medium': 0.80, 'low': 0.65}.get(
+            str(r.get('risk') or '').strip().lower(), 0.75)
     try:
         conf_str = str(round(float(conf), 2))
     except (TypeError, ValueError):
@@ -245,6 +287,10 @@ def _snapshot_fields(kind: str, rid: str) -> Optional[Dict[str, Any]]:
     if kind == 'ap':
         fields['risk_level'] = row.get('risk_level')
         fields['description'] = fields['if_condition']
+    if kind == 'principle':
+        fields['title'] = fields['name']
+        fields['statement'] = fields['if_condition']
+        fields['explanation'] = fields['then_action']
     return fields
 
 
@@ -263,7 +309,9 @@ def reground_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
         if not isinstance(findings, list):
             return audit, stats
 
-        # Pass 1 — collect every (kind, id) we need, batched per kind.
+        # Pass 1 — collect every cited id, batched under ALL kinds: ids
+        # overlap across the three tables, and cross-kind lookup is what lets
+        # us both detect a mislabeled kind and recover from it.
         wanted: Dict[str, List[str]] = {k: [] for k in _KIND_CFG}
         for f in findings:
             if not isinstance(f, dict):
@@ -271,10 +319,11 @@ def reground_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
             for c in (f.get('citations') or []):
                 if not isinstance(c, dict):
                     continue
-                kind = _norm_kind(c.get('kind')) or 'rule'
                 rid = _norm_id(c.get('id'))
-                if rid and rid not in wanted[kind]:
-                    wanted[kind].append(rid)
+                if rid:
+                    for k in _KIND_CFG:
+                        if rid not in wanted[k]:
+                            wanted[k].append(rid)
 
         try:
             live_rows = _fetch_live_rows(wanted)
@@ -296,27 +345,50 @@ def reground_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
                     stats['citations_total'] += 1
                     continue
                 stats['citations_total'] += 1
-                kind = _norm_kind(c.get('kind')) or 'rule'
+                labeled = _norm_kind(c.get('kind'))
                 rid = _norm_id(c.get('id'))
+                claimed = _claimed_tokens(c)
+
+                # Candidate kinds: the labeled one first; the other tables
+                # only when the citation carries text we can sanity-check
+                # against (otherwise a bare (id) would accept any table).
+                kinds: List[str] = [labeled] if labeled else []
+                if claimed:
+                    kinds += [k for k in _KIND_CFG if k not in kinds]
+
                 auth = None
                 grounded = 'unresolved'
+                matched_kind = None
                 if rid:
-                    auth = live_rows.get((kind, rid))
-                    if auth is not None:
-                        grounded = 'sieve-live'
-                    else:
-                        auth = _snapshot_fields(kind, rid)
-                        if auth is not None:
-                            grounded = 'snapshot'
+                    for k in kinds:
+                        cand = live_rows.get((k, rid))
+                        src = 'sieve-live'
+                        if cand is None:
+                            cand = _snapshot_fields(k, rid)
+                            src = 'snapshot'
+                        if cand is None:
+                            continue
+                        # For the labeled kind with no claimed text we trust
+                        # the (kind, id) mapping; otherwise require overlap.
+                        if claimed and not _plausible(claimed, cand):
+                            continue
+                        auth, grounded, matched_kind = cand, src, k
+                        break
+
                 if auth is None:
                     c['grounded'] = 'unresolved'
                     c['verbatim'] = False
                     stats['unresolved'] += 1
                     continue
+
                 changed = any(
                     (c.get(k) or '') != (auth.get(k) or '')
                     for k in _AUTHORITATIVE_TEXT_FIELDS if k in c
                 )
+                if labeled and matched_kind != labeled:
+                    stats['kind_corrected'] = stats.get('kind_corrected', 0) + 1
+                for k in _ALIAS_FIELDS:
+                    c.pop(k, None)
                 c.update(auth)
                 c['id'] = rid
                 c['grounded'] = grounded
@@ -340,16 +412,26 @@ def _selftest() -> None:
     import types
     global _SNAPSHOT_CACHE
 
-    # Stub the snapshot with one known rule + one AP; live layer off.
+    # Stub the snapshot: rule 1668, an UNRELATED rule 2001 (id collides with
+    # AP 2001 — mirrors the ~94% cross-table id overlap in the real brain),
+    # and AP 2001. Live layer off.
     _SNAPSHOT_CACHE = types.SimpleNamespace(
-        rules_by_id={1668: {
-            'id': 1668, 'name': 'Organization schema must include name and URL',
-            'if_condition': 'IF the page declares an Organization entity',
-            'then_action': 'THEN include name, url and logo properties',
-            'confidence_score': '0.98', 'source_org': 'Schema.org',
-            'source_url': 'https://schema.org/Organization',
-            'source_title': 'Organization - Schema.org', 'domain_tag': 'seo',
-        }},
+        rules_by_id={
+            1668: {
+                'id': 1668, 'name': 'Organization schema must include name and URL',
+                'if_condition': 'IF the page declares an Organization entity',
+                'then_action': 'THEN include name, url and logo properties',
+                'confidence_score': '0.98', 'source_org': 'Schema.org',
+                'source_url': 'https://schema.org/Organization',
+                'source_title': 'Organization - Schema.org', 'domain_tag': 'seo',
+            },
+            2001: {
+                'id': 2001, 'name': 'Indicate hreflang for multi-language variants',
+                'if_condition': 'IF localized variants exist',
+                'then_action': 'THEN declare hreflang annotations',
+                'confidence_score': '0.97', 'source_org': 'Google',
+            },
+        },
         aps_by_id={2001: {
             'id': 2001, 'title': 'FAQ schema without visible FAQ content',
             'description': 'Marking up FAQs that are not visible on the page',
@@ -371,7 +453,15 @@ def _selftest() -> None:
         ]},
         {'check_id': 'D7_faq', 'status': 'warn', 'citations': [
             {'id': 2001, 'kind': 'anti_pattern', 'name': 'FAQ abuse'},
+            # kind MISLABELED as rule; text matches the AP, not the colliding
+            # hreflang rule 2001 -> must recover cross-kind, not mis-attribute
+            {'id': 2001, 'kind': 'rule', 'name': 'FAQ markup abuse',
+             'description': 'FAQs marked up but not visible'},
             'not-even-a-dict',
+            # kindless AND textless -> nothing to verify against -> unresolved
+            {'id': '1668'},
+            # labeled kind, bare id (no text): trust the (kind, id) mapping
+            {'id': 1668, 'kind': 'rule'},
         ]},
         {'check_id': 'A1_no_citations', 'status': 'pass'},
     ]}
@@ -393,10 +483,21 @@ def _selftest() -> None:
     assert ap['kind'] == 'ap' and ap['risk_level'] == 'high', ap
     assert ap['if_condition'].startswith('Marking up FAQs'), ap
 
-    # text_corrected == 2: the paraphrased rule quote AND the shortened AP name.
-    assert stats == {'applied': True, 'citations_total': 4, 'regrounded_live': 0,
-                     'regrounded_snapshot': 2, 'unresolved': 2,
-                     'text_corrected': 2}, stats
+    mislabeled = audit['findings'][1]['citations'][1]
+    assert mislabeled['kind'] == 'ap', ('mislabeled kind must recover to the '
+                                        'plausible table, not the id-colliding rule', mislabeled)
+    assert mislabeled['name'] == 'FAQ schema without visible FAQ content', mislabeled
+    assert 'hreflang' not in (mislabeled.get('name') or ''), mislabeled
+
+    kindless = audit['findings'][1]['citations'][3]
+    assert kindless['grounded'] == 'unresolved' and kindless['verbatim'] is False, kindless
+
+    bare = audit['findings'][1]['citations'][4]
+    assert bare['grounded'] == 'snapshot' and bare['name'].startswith('Organization schema'), bare
+
+    assert stats == {'applied': True, 'citations_total': 7, 'regrounded_live': 0,
+                     'regrounded_snapshot': 4, 'unresolved': 3,
+                     'text_corrected': 3, 'kind_corrected': 1}, stats
 
     # Robustness: snapshot loader exploding must degrade, never raise.
     _SNAPSHOT_CACHE = None

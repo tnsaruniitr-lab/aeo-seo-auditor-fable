@@ -187,8 +187,8 @@ from `query_brain`:
 
 ```json
 {
-  "id": 1280,                       // integer rule_id or anti-pattern id
-  "kind": "rule",                   // or "anti_pattern"
+  "id": 1280,                       // integer rule / principle / anti-pattern id
+  "kind": "rule",                   // "rule", "principle", or "anti_pattern" — copy EXACTLY as returned (ids overlap across kinds; a wrong kind points at a different record)
   "tier": 1,                        // 1=Google/Schema.org, 2=Backlinko, 3=SEL, 4=specialized
   "tier_icon": "🥇",
   "name": "Indicate hreflang for multi-language...",  // for rules
