@@ -80,6 +80,12 @@ must produce identical cited reports — HANDOFF invariant 3).
 | **UI-1** Report design dated; sources shown as plain rows | Full design-system revamp of the embedded SPA: gradient typography, layered glass cards with glows, SVG score-ring gauge hero with meta pills, section scores as color-banded tiles with gradient bars, severity/status chips, tier-tinted source cards with verbatim if→then quote blocks + verified badges, hover states, entrance animations, responsive + reduced-motion safe. Verified locally (desktop + mobile screenshots) against real audits. | `main.py` (INDEX_HTML CSS + render fns) |
 | **UI-2** Markdown renderer hard-indexed citation keys and mislabeled principles as 'AP' | Tolerant key access; kind labels Rule/AP/Principle. | `audit_pipeline.py`, `ruleset/ranker.py` |
 
+## VIS — Measured AI visibility (2026-07-04)
+
+| Finding | Fix | Where |
+|---|---|---|
+| **VIS-1** The product generated 4 test queries + crawled 5 competitors per audit and never used them — "Brand AI Presence" was an LLM inference, not a measurement (graded D in the product evaluation) | New `ai_visibility.py`: post-loop, the audit's test queries are executed K times (default 2) against real answer engines (OpenAI + Anthropic web search now; adapter slots for Perplexity/Gemini/AI Overviews keys), recording cited URLs + brand mentions per run. Reports per-engine cited/mentioned **rates** (honest about stochasticity), share of voice vs the crawled competitors, and top-cited domains. Every raw answer is logged permanently to `public.ai_answer_runs` — the longitudinal dataset. Renders as "Measured AI visibility" (engine tiles + SOV table) directly under the hero. No-ops safely without keys; stats under `metadata.ai_visibility`. | `ai_visibility.py`, `agent.py`, `main.py` |
+
 ## Known remainders (documented, not yet done)
 
 - **Separate worker process / durable queue.** Job *status* is now durable and
