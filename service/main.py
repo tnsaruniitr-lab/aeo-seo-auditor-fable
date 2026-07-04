@@ -1010,6 +1010,15 @@ INDEX_HTML = r"""<!doctype html>
   .err-block { background:var(--err-bg); border:1px solid rgb(244 63 94 / .2);
     border-radius:12px; padding:14px 16px; color:var(--err-ink); }
 
+  /* Fix sources — receipts under the WHY paragraph */
+  .fix-sources { margin-top:10px; padding-top:10px;
+    border-top:1px solid var(--hairline); font-size:12.5px;
+    color:var(--ink-faint); line-height:1.9; }
+  .fix-sources-label { font-size:10px; font-weight:800; text-transform:uppercase;
+    letter-spacing:0.12em; color:var(--ink-faint); margin-right:10px; }
+  .fix-sources a { color:var(--brand-ink); font-weight:600; }
+  .fix-src-sep { margin:0 8px; color:var(--hairline); }
+
   /* Theme toggle */
   #theme-toggle { position:fixed; top:18px; right:18px; z-index:60;
     width:42px; height:42px; padding:0; border-radius:50%;
@@ -1382,12 +1391,32 @@ function renderTopFixes(fixes) {
         '<div class="fix-body">' +
           (f.before ? '<div class="fix-block"><h4>Currently</h4>' + formatBlock(f.before) + '</div>' : '') +
           (f.after ? '<div class="fix-block"><h4>Recommended</h4>' + formatBlock(f.after) + '</div>' : '') +
-          (f.why ? '<div class="fix-block why"><h4>Why this matters</h4><p>' + escapeHtml(f.why) + '</p></div>' : '') +
+          (f.why ? '<div class="fix-block why"><h4>Why this matters</h4><p>' + escapeHtml(f.why) + '</p>' +
+            renderFixSources(f.sources) + '</div>' : '') +
         '</div>' +
       '</div>';
   }
   html += '</section>';
   return html;
+}
+
+function renderFixSources(sources) {
+  // Python-resolved receipts for the WHY paragraph's brain references
+  // (metadata.fix_sources) — org + linked rule/principle name + verified date.
+  const srcs = (sources || []).filter(s => s && typeof s === 'object' && (s.name || s.source_url));
+  if (!srcs.length) return '';
+  const items = srcs.map(s => {
+    const label = escapeHtml((s.source_org || 'source') + ' — ' + (s.name || (s.kind + ' #' + s.id)));
+    const u = s.source_url ? safeHref(s.source_url) : '';
+    const idTag = (s.id != null && !isNaN(s.id))
+      ? ' <code style="font-size:10.5px">[' + escapeHtml(String(s.kind || 'ref')) + ' #' + escapeHtml(String(s.id)) + ']</code>' : '';
+    const ver = s.last_verified
+      ? ' <span class="cite-ver">· verified ' + escapeHtml(String(s.last_verified)) + '</span>' : '';
+    return (u ? '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' : '') +
+      label + (u ? '</a>' : '') + idTag + ver;
+  });
+  return '<div class="fix-sources"><span class="fix-sources-label">Sources</span>' +
+    items.join('<span class="fix-src-sep">·</span>') + '</div>';
 }
 
 function renderWhyNotCited(items) {
