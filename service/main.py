@@ -1080,6 +1080,7 @@ function renderFull(audit, status, id) {
 
   const html = [
     renderHero(heroData, audit.duration_seconds, findings.length),
+    renderMeasuredVisibility(audit.measured_visibility || (audit.metadata || {}).measured_visibility),
     renderTopFixes(narr.top_5_fixes || []),
     renderWhyNotCited(narr.why_not_cited || [], (narr.top_5_fixes || []).length ? null : (findings.find(f => f.citations && f.citations.length))),
     renderScoreBreakdown(sc),
@@ -1146,6 +1147,48 @@ function renderHero(s, duration, findingsCount) {
       (s.executive_diagnosis ? '<div class="hero-diag">' + escapeHtml(s.executive_diagnosis) + '</div>' : '') +
     '</div>'
   );
+}
+
+function renderMeasuredVisibility(mv) {
+  if (!mv || !mv.measured || !mv.total_runs) return '';
+  const engineNames = {openai: 'ChatGPT (OpenAI)', anthropic: 'Claude',
+                       perplexity: 'Perplexity', gemini: 'Gemini', google_aio: 'Google AI Overviews'};
+  // Engine inclusion tiles — rates are numeric-only by construction
+  let tiles = '';
+  for (const eng of (mv.engines || [])) {
+    const inc = (mv.inclusion || {})[eng] || {};
+    const cited = Number(inc.cited_rate);
+    const ment = Number(inc.mentioned_rate);
+    const band = cited >= 0.5 ? 'good' : (ment >= 0.5 ? 'warn' : 'bad');
+    tiles += '<div class="tile ' + band + '">' +
+      '<div class="tile-label">' + escapeHtml(engineNames[eng] || eng) + '</div>' +
+      '<div class="tile-val">' + (Number.isFinite(cited) ? Math.round(cited * 100) + '%' : '—') + '</div>' +
+      '<div class="tile-bar"><div class="tile-fill" style="width:' + pctWidth(cited * 100) + '%"></div></div>' +
+      '<div style="font-size:11.5px;color:var(--muted);margin-top:9px">cited in AI answers · mentioned ' +
+        (Number.isFinite(ment) ? Math.round(ment * 100) + '%' : '—') +
+      '</div>' +
+    '</div>';
+  }
+  // Share-of-voice vs crawled competitors
+  let sovRows = '';
+  for (const r of (mv.share_of_voice || [])) {
+    const sovNum = Number(r.sov);
+    sovRows += '<tr' + (r.is_target ? ' class="target"' : '') + '>' +
+      '<td>' + escapeHtml(r.domain || '') + (r.is_target ? ' (you)' : '') + '</td>' +
+      '<td>' + (Number(r.citations) || 0) + '</td>' +
+      '<td>' + (Number.isFinite(sovNum) ? Math.round(sovNum * 100) + '%' : '—') + '</td>' +
+    '</tr>';
+  }
+  const meta = 'Measured ' + escapeHtml(String(mv.measured_at || '')) + ' · ' +
+    (Number(mv.total_runs) || 0) + ' live answers · ' + (Number(mv.runs_per_query) || 1) +
+    ' runs per query — real engine responses, not estimates. Full transcripts logged.';
+  return '<section><h2>Measured AI visibility</h2>' +
+    '<div class="tile-grid" style="grid-template-columns:repeat(auto-fill,minmax(230px,1fr))">' + tiles + '</div>' +
+    (sovRows ? '<div class="card tight" style="margin-top:14px"><table class="comp-table"><thead><tr>' +
+      '<th>Domain</th><th>Citations</th><th>Share of voice</th></tr></thead><tbody>' +
+      sovRows + '</tbody></table></div>' : '') +
+    '<div style="font-size:12px;color:var(--muted-2);margin-top:10px">' + meta + '</div>' +
+    '</section>';
 }
 
 function renderTopFixes(fixes) {

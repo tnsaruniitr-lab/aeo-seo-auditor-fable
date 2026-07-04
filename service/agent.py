@@ -764,6 +764,26 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
         log.error('%scitation re-grounding failed: %s\n%s',
                   f'[{audit_id[:8]}] ', e, traceback.format_exc())
 
+    # ------------------------------------------------------------------
+    # MEASURED AI VISIBILITY — execute the audit's own test queries
+    # against real answer engines (per available API keys), record who
+    # gets cited/mentioned, compute share of voice vs the crawled
+    # competitors, and log every raw answer to public.ai_answer_runs.
+    # Replaces inference with measurement; no-ops safely without keys.
+    # ------------------------------------------------------------------
+    try:
+        from ai_visibility import measure_visibility
+        audit, vis_stats = measure_visibility(audit)
+        md["ai_visibility"] = vis_stats
+        if vis_stats.get("applied"):
+            log.info('%smeasured AI visibility: engines=%s runs=%d errors=%d',
+                     f'[{audit_id[:8]}] ', ','.join(vis_stats.get("engines", [])),
+                     vis_stats.get("runs_total", 0), vis_stats.get("errors", 0))
+    except Exception as e:
+        md["ai_visibility"] = {"applied": False,
+                               "error": f"{type(e).__name__}: {e}"}
+        log.error('%sai visibility failed: %s', f'[{audit_id[:8]}] ', e)
+
     # Render artifacts using the existing renderers from audit_pipeline.py
     # (they consume the same shape we produce).
     try:

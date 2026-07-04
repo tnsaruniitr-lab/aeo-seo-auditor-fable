@@ -116,7 +116,13 @@ assert_contains "fail/warn findings get top-3 brain citations; LLM picks replace
 
 # ----------------------------------------------------------------------
 echo ""
-echo "[8] py_compile — every service module + script parses"
+echo "[8] Measured AI visibility — engine sweep, SOV, fault tolerance"
+OUT=$(cd "${SERVICE_DIR}" && python3 ai_visibility.py 2>&1)
+assert_contains "queries executed k-times per engine; inclusion + SOV computed; per-call faults tolerated" "$OUT" "VISIBILITY_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[9] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do
     if ! python3 -m py_compile "$f" 2>/dev/null; then
