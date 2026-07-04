@@ -46,7 +46,7 @@ A website auditor that scores a page for SEO/AEO/GEO and **cites the authoritati
 | Ingestion repo | `github.com/tnsaruniitr-lab/sieve-ingest` |
 | Ingestion service | Railway project **sieve-ingest** (its own project — CLI quirk), cron `0 6 * * 1`, `restartPolicyType: NEVER` |
 | Central DB | Railway Postgres service **Postgres-pxlu** (in AEO-SEO-fable). `sieve` + `public` schemas. pgvector 0.8.4 enabled. |
-| Crawler (fetch engine, reused) | local `sieve-crawler/` — has the 12-source org map + sitemap discovery |
+| Crawler (fetch engine, reused) | `github.com/tnsaruniitr-lab/sieve-crawler` — 12-source org map + sitemap/nav discovery + LLM transform. Secrets scrubbed; set env per `.env.example`. See its `SKILL.md` for the crawl/extract structure. |
 | Source data (one-time load) | `~/Downloads/marketo-db-export-20260703.tar.gz` (823 MB), loaded via `scratchpad/sieve-db/load_ruleset.py` |
 
 **Secrets** (never commit; all are Railway env vars): `ANTHROPIC_API_KEY`, `SIEVE_DB_URL`/`DATABASE_URL`, `AUDIT_USERNAME`/`AUDIT_PASSWORD`/`AUDIT_API_KEY`, `AUDIT_WEBHOOK_SECRET`. The auditor login + API key are in Railway vars; ask the owner if you need them.
