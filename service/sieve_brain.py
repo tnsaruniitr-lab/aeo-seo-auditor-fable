@@ -360,8 +360,12 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
     # Authority-first ranking: tier ASC, confidence DESC, match-score DESC, then
     # a gentle preference for a specific source URL, then kind + id (kind breaks
     # the rules/principles id-space collision deterministically).
+    # Bucket confidence (1dp) and match-score (2dp) so that among equally
+    # authoritative, ~equally relevant candidates the MORE SPECIFIC source URL
+    # wins — a citation should link to the precise doc page, not a generic hub,
+    # when the choice is otherwise a wash. Deterministic (id is the final key).
     cites.sort(key=lambda c: (
-        c['tier'], -float(c['confidence_score']), -c['relevance'],
+        c['tier'], -round(float(c['confidence_score']), 1), -round(c['relevance'], 2),
         c.get('url_spec', 2), c.get('kind') or '', str(c['id'] or '')
     ))
     return cites[:max_citations]

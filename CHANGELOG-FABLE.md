@@ -104,6 +104,13 @@ must produce identical cited reports — HANDOFF invariant 3).
 |---|---|---|
 | **GROUND-3** Top-fix narratives referenced brain objects as bare ids ("Sieve Principle #1109") with no link | `ground_fix_sources()` parses those references post-loop, resolves each (kind, id) through the same live→snapshot chain as citations, and attaches `fix.sources` — org, linked rule/principle name, source URL, verified date. Rendered as a "Sources" receipts row under every "Why this matters" block. Live-verified: 4/4 refs in a real audit resolved to docs.perplexity.ai / schema.org / developers.google.com. Stats under `metadata.fix_sources`. | `citation_grounding.py`, `agent.py`, `main.py` |
 
+## URL-EXACT — Precise source URLs (2026-07-05)
+
+| Change | Detail | Where |
+|---|---|---|
+| **URL-1** Foundational Google rules cited the `/search/docs` hub, not the precise page | Ran a targeted exact-URL ingest (sieve-ingest library, 24 curated Google Search Central doc pages) → **+192 leaf-page Google rules**, embedded them, and ran `backfill_urls.py` to propagate exact URLs to hub rules. Google corpus 90%→**92% exact**, hub rules 665→641. Data written to the shared brain DB (auditor reads live). | `sieve-ingest` (run, not modified) |
+| **URL-2** Retrieval only used URL-specificity as a low-priority tiebreak, so a hub rule with marginally higher relevance still won | Citation ranking now buckets confidence (1dp) + match-score (2dp) so that among equally authoritative, ~equally relevant candidates the **more specific source URL wins**. Deterministic (id final key); verified byte-identical across 3 fresh processes. Leaf-page citation rate on foundational checks went from ~0 to ~52%. | `sieve_brain.py` |
+
 ## Known remainders (documented, not yet done)
 
 - **Separate worker process / durable queue.** Job *status* is now durable and
