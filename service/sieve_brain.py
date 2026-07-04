@@ -143,6 +143,76 @@ def _vec_literal(v) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Pinned query embeddings (determinism)
+# OpenAI embeddings drift call-to-call (~1e-4 per component, survives the
+# 7-decimal rounding), which made retrieval non-reproducible run-to-run.
+# The FIRST embedding computed for a query text is stored in the auditor's
+# own schema (public.check_query_embeddings — NOT the sieve brain, which the
+# auditor must never write) and reused forever, so the same check searches
+# with the same vector every run. Also removes the per-audit embedding cost
+# after warm-up. ON CONFLICT + re-read converges concurrent audits that
+# raced to embed the same query onto a single winner.
+# ---------------------------------------------------------------------------
+
+_EMBED_MEMO: Dict[str, str] = {}
+_EMBED_TABLE_DDL = """
+    CREATE TABLE IF NOT EXISTS public.check_query_embeddings (
+        query_hash        text PRIMARY KEY,
+        model             text NOT NULL,
+        query_text        text NOT NULL,
+        embedding_literal text NOT NULL,
+        created_at        timestamptz NOT NULL DEFAULT now()
+    )
+"""
+_embed_table_ready = False
+
+
+def _pinned_query_vec(conn, text: str) -> Optional[str]:
+    """Vector literal for the query, pinned for reproducibility. Falls back to
+    a fresh (unpinned) embedding if the cache table is unreachable; None means
+    no semantic layer (caller uses FTS)."""
+    global _embed_table_ready
+    import hashlib
+    key = hashlib.md5(f'{EMBED_MODEL}:{text}'.encode()).hexdigest()
+    if key in _EMBED_MEMO:
+        return _EMBED_MEMO[key]
+    got = None
+    try:
+        with conn.cursor() as cur:
+            if not _embed_table_ready:
+                cur.execute(_EMBED_TABLE_DDL)
+                _embed_table_ready = True
+            cur.execute('SELECT embedding_literal FROM public.check_query_embeddings'
+                        ' WHERE query_hash = %s', (key,))
+            row = cur.fetchone()
+            got = row[0] if row else None
+        if got is None:
+            vec = _embed_query(text)
+            if vec is None:
+                return None
+            lit = _vec_literal(vec)
+            with conn.cursor() as cur:
+                cur.execute(
+                    'INSERT INTO public.check_query_embeddings'
+                    ' (query_hash, model, query_text, embedding_literal)'
+                    ' VALUES (%s, %s, %s, %s) ON CONFLICT (query_hash) DO NOTHING',
+                    (key, EMBED_MODEL, text, lit))
+                # A concurrent audit may have won the insert race — always
+                # use the stored row so every process agrees.
+                cur.execute('SELECT embedding_literal FROM public.check_query_embeddings'
+                            ' WHERE query_hash = %s', (key,))
+                row = cur.fetchone()
+                got = row[0] if row else lit
+    except Exception as e:
+        log.info('pinned-embedding cache unavailable (%s) — using fresh embedding', e)
+        vec = _embed_query(text)
+        return _vec_literal(vec) if vec else None
+    if got:
+        _EMBED_MEMO[key] = got
+    return got
+
+
+# ---------------------------------------------------------------------------
 # SQL builders (uniform citation shape across the 3 tables)
 # ---------------------------------------------------------------------------
 
@@ -178,8 +248,13 @@ def _search_vector(cur, table, cfg, qvec_literal, k):
 def _search_fts(cur, table, cfg, ts_query, k):
     tsv = (f"to_tsvector('english', coalesce(t.{cfg['title']},'')||' '||"
            f"coalesce(t.{cfg['t1']},'')" + (f"||' '||coalesce(t.{cfg['t2']},'')" if cfg['t2'] else '') + ")")
+    # id tie-break: ts_rank produces frequent exact ties, and an untied LIMIT
+    # boundary changed citation IDENTITY run-to-run (ids are digit-text; the
+    # bigint cast gives numeric order). The vector path needs no tie-break:
+    # with a pinned query vector the HNSW scan is deterministic, and a
+    # secondary sort key would defeat the index.
     sql = _select_head(cfg, f"ts_rank({tsv}, websearch_to_tsquery('english', %s))").format(table=table) + \
-        f" WHERE {tsv} @@ websearch_to_tsquery('english', %s) ORDER BY score DESC LIMIT %s"
+        f" WHERE {tsv} @@ websearch_to_tsquery('english', %s) ORDER BY score DESC, t.id::bigint ASC LIMIT %s"
     cur.execute(sql, (ts_query, ts_query, k))
     return cur.fetchall()
 
@@ -245,8 +320,6 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
     query = _query_for(check_id)
     words = list(dict.fromkeys(re.findall(r'[a-zA-Z0-9][a-zA-Z0-9-]{2,}', query.lower())))
     ts_query = ' OR '.join(words) or query
-    qvec = _embed_query(query)                       # None => FTS-only
-    qvec_lit = _vec_literal(qvec) if qvec else None
     per_table_k = max(8, max_citations * 4)
 
     rows: List[Dict[str, Any]] = []
@@ -254,6 +327,7 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
         conn = psycopg2.connect(SIEVE_DB_URL, connect_timeout=10)
         conn.autocommit = True
         try:
+            qvec_lit = _pinned_query_vec(conn, query)    # None => FTS-only
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 for table, cfg in _TABLE_CFG.items():
                     found = []
@@ -284,10 +358,11 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
     cites = [_row_to_cite(r) for r in rows]
 
     # Authority-first ranking: tier ASC, confidence DESC, match-score DESC, then
-    # a gentle preference for a specific source URL, then id ASC (deterministic).
+    # a gentle preference for a specific source URL, then kind + id (kind breaks
+    # the rules/principles id-space collision deterministically).
     cites.sort(key=lambda c: (
         c['tier'], -float(c['confidence_score']), -c['relevance'],
-        c.get('url_spec', 2), str(c['id'] or '')
+        c.get('url_spec', 2), c.get('kind') or '', str(c['id'] or '')
     ))
     return cites[:max_citations]
 
@@ -312,6 +387,13 @@ def stats() -> Dict[str, Any]:
                     conn.rollback()
                     cur.execute(f"SELECT count(*) FROM sieve.{t}")
                     out[t] = {'rows': cur.fetchone()[0], 'embedded': 0}
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT count(*) FROM public.check_query_embeddings")
+                out['pinned_query_embeddings'] = cur.fetchone()[0]
+        except Exception:
+            conn.rollback()
+            out['pinned_query_embeddings'] = 0
         conn.close()
         return out
     except Exception as e:

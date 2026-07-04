@@ -104,7 +104,13 @@ assert_contains "citations re-fetched from brain by id; paraphrase overwritten; 
 
 # ----------------------------------------------------------------------
 echo ""
-echo "[6] py_compile — every service module + script parses"
+echo "[6] Check-id vocabulary — canonicalization against brain-mappings"
+OUT=$(cd "${SERVICE_DIR}" && python3 check_vocab.py 2>&1)
+assert_contains "variant check_ids renamed; sub-checks/unknowns preserved; collision-safe" "$OUT" "VOCAB_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[7] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do
     if ! python3 -m py_compile "$f" 2>/dev/null; then
