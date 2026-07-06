@@ -865,6 +865,19 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
         log.error('%spersist_audit crashed: %s\n%s',
                   f'[{audit_id[:8]}] ', e, traceback.format_exc())
 
+    # Push the result to AnswerMonk's visibility report (best-effort, no-op
+    # unless ANSWERMONK_BASE_URL + EXTERNAL_AUDITOR_KEY are set). Runs even if
+    # Supabase persistence is unconfigured — the audit dict is complete here
+    # either way, and the receiver upserts by audit_id so re-posts are safe.
+    try:
+        from persistence import post_to_answermonk
+        md["answermonk_sync"] = post_to_answermonk(audit)
+    except Exception as e:
+        md["answermonk_sync"] = {"posted": False,
+                                 "error": f"{type(e).__name__}: {e}"}
+        log.error('%sanswermonk sync crashed: %s',
+                  f'[{audit_id[:8]}] ', e)
+
     if verbose:
         print(f"[agent] complete in {duration}s, "
               f"{md['tool_call_count']} tool calls, "

@@ -24,7 +24,9 @@ Stdlib + httpx (already a dependency).
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -96,6 +98,91 @@ def regenerate_pdf(audit_id: str, out_dir: Optional[Path] = None) -> Optional[Pa
     except Exception as e:
         log.warning('regenerate_pdf failed for %s: %s', audit_id, e)
         return None
+
+
+# ---------------------------------------------------------------------------
+# AnswerMonk sync — push a persisted audit to the visibility-report ingest
+# endpoint (POST {ANSWERMONK_BASE_URL}/api/external-audits). The receiver
+# zod-validates against externalAuditIngestSchema and upserts by audit_id,
+# so re-posting the same audit is always safe.
+# ---------------------------------------------------------------------------
+
+ANSWERMONK_POST_ATTEMPTS = 2
+ANSWERMONK_RETRY_DELAY_S = 1.0
+ANSWERMONK_MAX_FINDINGS = 500  # ingest schema caps findings at 500
+
+
+def build_answermonk_payload(audit: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Map an audit dict onto the externalAuditIngestSchema shape.
+    Returns None when a required field (audit_id / url / domain) is missing —
+    the receiver would reject it with a 400 anyway."""
+    audit_id = audit.get('audit_id')
+    url = audit.get('url')
+    domain = audit.get('domain')
+    if not (audit_id and url and domain):
+        return None
+    payload: Dict[str, Any] = {
+        'audit_id': str(audit_id)[:200],
+        'url': str(url)[:2000],
+        'domain': str(domain)[:255],
+    }
+    brand = (audit.get('classification') or {}).get('company_name')
+    if brand:
+        payload['brand_name'] = str(brand)[:255]
+    if audit.get('date'):
+        payload['date'] = str(audit['date'])[:40]
+    findings = audit.get('findings')
+    if isinstance(findings, list):
+        rows = [f for f in findings if isinstance(f, dict)]
+        if rows:
+            payload['findings'] = rows[:ANSWERMONK_MAX_FINDINGS]
+    for key in ('scoring', 'narrative', 'performance', 'bots_eye_view', 'gates'):
+        val = audit.get(key)
+        if isinstance(val, dict) and val:
+            payload[key] = val
+    return payload
+
+
+def post_to_answermonk(audit: Dict[str, Any]) -> Dict[str, Any]:
+    """POST a persisted audit to AnswerMonk. Best-effort: logs failures,
+    retries once on network errors / 5xx (not on 4xx — those won't change),
+    and never raises into the audit path. No-op unless both
+    ANSWERMONK_BASE_URL and EXTERNAL_AUDITOR_KEY are set."""
+    base = (os.getenv('ANSWERMONK_BASE_URL') or '').rstrip('/')
+    key = os.getenv('EXTERNAL_AUDITOR_KEY')
+    if not (base and key):
+        return {'posted': False,
+                'note': 'ANSWERMONK_BASE_URL / EXTERNAL_AUDITOR_KEY not set'}
+    payload = build_answermonk_payload(audit)
+    if payload is None:
+        log.warning('answermonk sync skipped: audit missing audit_id/url/domain')
+        return {'posted': False, 'error': 'audit missing audit_id/url/domain'}
+    endpoint = f'{base}/api/external-audits'
+    last_err = None
+    try:
+        import httpx
+        for attempt in range(1, ANSWERMONK_POST_ATTEMPTS + 1):
+            try:
+                with httpx.Client(timeout=15.0) as client:
+                    r = client.post(endpoint, json=payload,
+                                    headers={'x-auditor-key': key})
+                if 200 <= r.status_code < 300:
+                    log.info('answermonk sync ok: audit %s -> %s',
+                             payload['audit_id'], endpoint)
+                    return {'posted': True, 'status': r.status_code,
+                            'attempts': attempt}
+                last_err = f'status {r.status_code}: {r.text[:300]}'
+                if 400 <= r.status_code < 500:
+                    break
+            except Exception as e:
+                last_err = f'{type(e).__name__}: {e}'
+            if attempt < ANSWERMONK_POST_ATTEMPTS:
+                time.sleep(ANSWERMONK_RETRY_DELAY_S)
+    except Exception as e:
+        last_err = f'{type(e).__name__}: {e}'
+    log.warning('answermonk sync failed for %s: %s',
+                payload.get('audit_id'), last_err)
+    return {'posted': False, 'error': last_err}
 
 
 # ---------------------------------------------------------------------------

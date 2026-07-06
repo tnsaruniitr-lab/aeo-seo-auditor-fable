@@ -122,7 +122,13 @@ assert_contains "queries executed k-times per engine; inclusion + SOV computed; 
 
 # ----------------------------------------------------------------------
 echo ""
-echo "[9] py_compile — every service module + script parses"
+echo "[9] AnswerMonk sync — POST persisted audit to a mocked ingest endpoint"
+OUT=$(cd "${SERVICE_DIR}" && python3 "${SCRIPT_DIR}/test_answermonk_post.py" 2>&1)
+assert_contains "audit POSTed with key header; 5xx retried once; 4xx/unconfigured/unreachable degrade safely" "$OUT" "ANSWERMONK_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do
     if ! python3 -m py_compile "$f" 2>/dev/null; then
