@@ -35,7 +35,7 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 
 # ----------------------------------------------------------------------
@@ -74,11 +74,12 @@ import secrets
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel, HttpUrl, Field
+from pydantic import BaseModel, ConfigDict, HttpUrl, Field
 from typing import List as _List  # avoid clash with the Optional/Dict already imported
 
 from audit_pipeline import run_audit as run_audit_deterministic
 from safety import check_url_safe
+from site_context import sanitize_site_context
 
 # Agent-mode (full parity with the chat skill) is opt-in via AUDIT_MODE env var.
 # Default is "agent" once the parity layer is deployed; falls back automatically
@@ -139,7 +140,8 @@ except Exception:
     billing = None  # type: ignore
 
 
-def run_audit(url: str, output_dir: str, progress_callback=None):
+def run_audit(url: str, output_dir: str, progress_callback=None,
+              site_context: Optional[Dict[str, Any]] = None):
     """Dispatch to the chosen audit pipeline.
 
     Modes:
@@ -150,6 +152,10 @@ def run_audit(url: str, output_dir: str, progress_callback=None):
     progress_callback (optional): called with a dict {phase, tool, turn,
     tool_count, elapsed_seconds, last_tool_ms} after each tool call when
     running in agent mode. Ignored by the deterministic path.
+
+    site_context (optional): sanitized site-wide crawl signals for the audited
+    page (see site_context.py). Threaded into the agent prompt as measured,
+    narrative-only CONTEXT; never touches scoring.
     """
     mode = AUDIT_MODE
     if mode == 'agent' and not AGENT_AVAILABLE:
@@ -162,7 +168,9 @@ def run_audit(url: str, output_dir: str, progress_callback=None):
         mode = 'agent' if AGENT_AVAILABLE else 'deterministic'
     if mode == 'agent':
         return run_audit_agent(url, output_dir=output_dir, verbose=False,
-                                progress_callback=progress_callback)
+                                progress_callback=progress_callback,
+                                site_context=site_context)
+    # Deterministic path has no narrative to enrich — site_context is ignored.
     return run_audit_deterministic(url, output_dir=output_dir)
 
 
@@ -2083,6 +2091,8 @@ def _run_audit_background(audit_id: str, url: str):
     with JOBS_LOCK:
         JOBS[audit_id]['status'] = 'running'
         JOBS[audit_id]['started_at'] = datetime.now(timezone.utc).isoformat()
+        # Optional site-wide crawl context (API-start only; sanitized at intake)
+        site_context = JOBS[audit_id].get('site_context')
     if monitoring:
         monitoring.audit_started(audit_id, url, AUDIT_MODE)
 
@@ -2096,7 +2106,8 @@ def _run_audit_background(audit_id: str, url: str):
 
     try:
         result = run_audit(url, output_dir=str(OUTPUT_DIR),
-                            progress_callback=_update_progress)
+                            progress_callback=_update_progress,
+                            site_context=site_context)
         elapsed = round(time.time() - started, 1)
 
         # Agent path returns an error envelope (no exception) when it can't
@@ -2458,8 +2469,19 @@ _IDEMPOTENCY_WINDOW_SECONDS = 60
 
 
 class StartAuditRequest(BaseModel):
+    # Accept both the wire spelling AnswerMonk sends (siteContext, matching
+    # webhookUrl's camelCase) and the pythonic site_context.
+    model_config = ConfigDict(populate_by_name=True)
+
     url: str
     webhookUrl: Optional[str] = None
+    # OPTIONAL site-wide crawl context for the audited page (roadmap 1.4):
+    # { orphan?: bool, clickDepth?: int, duplicateOf?: str, inLinks?: int }.
+    # Validated leniently via sanitize_site_context — unknown keys and junk
+    # values are dropped, and an unusable payload degrades to None (identical
+    # to the field being absent). Narrative-only; never feeds scoring.
+    site_context: Optional[Dict[str, Any]] = Field(default=None,
+                                                   alias='siteContext')
 
 
 class StartAuditResponse(BaseModel):
@@ -2596,6 +2618,7 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
             'title': title,
             'fix': fix_hint,
             'checkId': f.get('check_id'),
+            'evidenceTier': f.get('evidence_tier'),  # additive: 'measured' | 'llm-judged' | None (legacy audits)
         })
 
     total = len(failed_or_warn)
@@ -2750,8 +2773,10 @@ async def api_audit_start(req: StartAuditRequest,
                                 detail=f"Quota exceeded: {decision.get('reason')}")
 
     audit_id = str(uuid.uuid4())
-    log.info('[%s] api/start url=%s webhook=%s', audit_id[:8], url,
-             '(yes)' if req.webhookUrl else '(no)')
+    site_context = sanitize_site_context(req.site_context)
+    log.info('[%s] api/start url=%s webhook=%s site_context=%s', audit_id[:8], url,
+             '(yes)' if req.webhookUrl else '(no)',
+             ','.join(sorted(site_context)) if site_context else '(none)')
     with JOBS_LOCK:
         JOBS[audit_id] = {
             'audit_id': audit_id,
@@ -2762,6 +2787,7 @@ async def api_audit_start(req: StartAuditRequest,
             'result': None,
             'error': None,
             'webhook_url': req.webhookUrl,
+            'site_context': site_context,
             'submitted_via': 'api',
             '_submitted_at': time.time(),
         }

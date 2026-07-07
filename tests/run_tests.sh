@@ -128,7 +128,19 @@ assert_contains "audit POSTed with key header; 5xx retried once; 4xx/unconfigure
 
 # ----------------------------------------------------------------------
 echo ""
-echo "[10] py_compile — every service module + script parses"
+echo "[10] Wired deterministic checks (A5/A1/B9/A3/C10/E4/E12) + evidence tiers"
+OUT=$(python3 "${SCRIPT_DIR}/test_new_checks.py" 2>&1)
+assert_contains "noindex/HTTPS/mixed-content/meta-desc/OG/snippet checks + measured|llm-judged tiers; PCR weights unchanged" "$OUT" "NEWCHECKS_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10b] Site context seam — lenient sanitation + measured/narrative-only prompt block + request acceptance"
+OUT=$(cd "${SERVICE_DIR}" && python3 "${SCRIPT_DIR}/test_site_context.py" 2>&1)
+assert_contains "siteContext sanitized leniently; prompt CONTEXT measured + narrative-only; start request accepted with and without it" "$OUT" "SITE_CONTEXT_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do
     if ! python3 -m py_compile "$f" 2>/dev/null; then

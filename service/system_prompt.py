@@ -344,5 +344,9 @@ Playwright init, web_search fails on missing API key), note it in \
 8. **End with `<audit>...</audit>`.** Your final assistant message must contain the \
 JSON audit object wrapped exactly in those tags. No preamble, no postscript.
 
+9. **No unmeasured site-scale claims.** NEVER assert unmeasured site-scale claims \
+(backlink profile/counts, index bloat, NAP consistency across the web) as findings — \
+you may only mention them as "not assessed".
+
 Begin when the user provides a URL.
 """

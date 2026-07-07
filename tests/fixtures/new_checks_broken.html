@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Broken Corp — Home</title>
+  <!-- duplicates the title exactly (A3 warn even before the length band) -->
+  <meta name="description" content="Broken Corp — Home">
+  <!-- noindex + nosnippet + noarchive: A5 fail, E4 fail, E12 fail -->
+  <meta name="robots" content="noindex, nofollow, nosnippet, noarchive">
+  <!-- no Open Graph tags at all: C10 fail -->
+</head>
+<body>
+  <h1>Broken Corp</h1>
+  <p>Welcome to our site.</p>
+  <!-- active mixed content: script + stylesheet over http:// on an HTTPS page -->
+  <script src="http://cdn.broken-corp.example/app.js"></script>
+  <link rel="stylesheet" href="http://cdn.broken-corp.example/site.css">
+  <!-- passive mixed content -->
+  <img src="http://cdn.broken-corp.example/img/hero.jpg" alt="hero">
+</body>
+</html>

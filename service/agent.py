@@ -38,6 +38,7 @@ sys.path.insert(0, str(THIS_DIR))
 
 from tools import TOOLS_SPEC, dispatch_tool, SERVER_TOOL_NAMES
 from system_prompt import SYSTEM_PROMPT
+from site_context import site_context_block, metadata_entry as site_context_metadata
 
 log = logging.getLogger('audit.agent')
 
@@ -185,7 +186,8 @@ def _derive_phase_label(tool_name: str, tool_input: Dict[str, Any],
 
 def run_agent_loop(url: str, verbose: bool = False,
                     log_prefix: str = '',
-                    progress_callback: Optional[Any] = None) -> Dict[str, Any]:
+                    progress_callback: Optional[Any] = None,
+                    site_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Drive the Claude tool-use loop until the agent emits <audit>...</audit>.
 
     Returns:
@@ -218,6 +220,9 @@ def run_agent_loop(url: str, verbose: bool = False,
             "Execute all 15 phases in order. Use the tools as specified. "
             "When finished, your FINAL message must be ONLY a single JSON "
             "object wrapped in <audit>...</audit> tags."
+            # Optional measured site-wide crawl signals (narrative-only —
+            # empty string when absent, keeping the prompt byte-identical).
+            + site_context_block(site_context)
         ),
     }]
 
@@ -622,11 +627,16 @@ def _extract_audit_json(text: str, errors: List[str]):
 
 def run_audit_agent(url: str, output_dir: str = "./audits/",
                      verbose: bool = False,
-                     progress_callback: Optional[Any] = None) -> Dict[str, Any]:
+                     progress_callback: Optional[Any] = None,
+                     site_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Run the agent loop, attach metadata, render artifacts, return result.
 
     Output shape matches the existing `run_audit()` from audit_pipeline.py so
     main.py and the rest of the FastAPI service work without changes.
+
+    site_context (optional, sanitized upstream): measured site-wide crawl
+    signals for this page. Fed to the agent as narrative-only CONTEXT and
+    recorded in metadata.site_context — it never enters scoring.
     """
     audit_id = str(uuid.uuid4())
     started = time.time()
@@ -638,7 +648,8 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
 
     loop_result = run_agent_loop(url, verbose=verbose,
                                   log_prefix=f'[{audit_id[:8]}] ',
-                                  progress_callback=progress_callback)
+                                  progress_callback=progress_callback,
+                                  site_context=site_context)
 
     audit = loop_result.get("audit")
 
@@ -681,6 +692,12 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
     md["agent_errors"] = loop_result.get("errors", [])
     md["cost_usd"] = estimate_cost_usd(loop_result.get("input_tokens") or 0,
                                        loop_result.get("output_tokens") or 0)
+    # Site-wide crawl context this audit ran with (roadmap 1.4). Tagged as
+    # measured evidence, scoped to narrative severity only — additive metadata;
+    # absent context leaves the record shape untouched.
+    _sc_meta = site_context_metadata(site_context)
+    if _sc_meta:
+        md["site_context"] = _sc_meta
 
     # ------------------------------------------------------------------
     # CHECK-ID VOCABULARY — the model emits variant check_ids between runs
