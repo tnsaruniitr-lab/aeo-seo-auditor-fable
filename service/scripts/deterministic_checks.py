@@ -32,6 +32,13 @@ brain-mappings.json):
   E4.  no_nosnippet_noarchive             — nosnippet / max-snippet:0 / data-nosnippet directives
   E12. no_noarchive                       — noarchive directive (meta or header)
 
+E-E-A-T deterministic subset (roadmap 2.4 — measured inputs feeding the
+G-section LLM trust judgment; G1/G2 canonical ids, G7b/G7c sub-checks of G7):
+  G1.  author_byline                      — visible byline pattern / byline markup / schema author
+  G2.  author_schema_credentials          — Article author → Person/Org with sameAs|jobTitle|hasCredential
+  G7b. about_contact_discoverability      — about/contact/impressum links (nav/footer membership recorded)
+  G7c. editorial_policy_link              — editorial/review-policy link or publishingPrinciples schema
+
 Every check result carries evidence_tier='measured' (roadmap 0.1) — the
 verdict is computed by Python from real page bytes, never by the LLM.
 
@@ -1742,6 +1749,412 @@ def check_e12_noarchive(html, headers):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# E-E-A-T deterministic subset (roadmap 2.4). These measure the objective
+# substrate of the G-section trust judgment — presence of bylines, About/
+# Contact discoverability, editorial-policy links, and schema-author linkage.
+# They FEED the LLM's G-section assessment as measured inputs; canonical ids
+# from brain-mappings.json (G1, G2 exact; G7b/G7c sub-checks of G7 following
+# the A2b/A4b/C12b convention — query_brain resolves them to G7).
+# ──────────────────────────────────────────────────────────────────────────
+
+def _iter_jsonld_items(html):
+    """Yield every dict node from all JSON-LD blocks, descending into @graph.
+    Shared walker for the G-section schema checks."""
+    for b in extract_jsonld_blocks(html):
+        try:
+            data = json.loads(b.strip())
+        except json.JSONDecodeError:
+            continue
+        stack = list(data) if isinstance(data, list) else [data]
+        while stack:
+            item = stack.pop()
+            if not isinstance(item, dict):
+                continue
+            yield item
+            graph = item.get('@graph')
+            if isinstance(graph, list):
+                stack.extend(g for g in graph if isinstance(g, dict))
+
+
+def _node_types(node):
+    """'@type' may be a string or a list — normalize to a list of strings."""
+    t = node.get('@type')
+    if isinstance(t, list):
+        return [x for x in t if isinstance(x, str)]
+    return [t] if isinstance(t, str) else []
+
+
+# Visible byline patterns. The bare "By <Name>" form requires TWO capitalized
+# tokens (first + last name) to avoid matching prose like "by using". The
+# explicit verb forms accept a single capitalized name. The verb/label part is
+# case-insensitive via a scoped (?i:...) group; the NAME tokens stay
+# case-SENSITIVE — that capitalization requirement is the false-positive gate.
+_NAME_TOKEN = r"[A-Z][\w.'’-]+"
+_BYLINE_EXPLICIT_RE = re.compile(
+    r'\b(?i:written\s+by|authored\s+by|reviewed\s+by|'
+    r'medically\s+reviewed\s+by|posted\s+by|verfasst\s+von|'
+    r'geschrieben\s+von)[:\s]+('
+    + _NAME_TOKEN + r'(?:\s+' + _NAME_TOKEN + r'){0,3})')
+_BYLINE_BARE_RE = re.compile(
+    r'\b[Bb]y[:\s]+(' + _NAME_TOKEN + r'(?:\s+' + _NAME_TOKEN + r'){1,3})\b')
+_AUTHOR_LABEL_RE = re.compile(
+    r'\b(?i:author|autor)\s*:\s*(' + _NAME_TOKEN
+    + r'(?:\s+' + _NAME_TOKEN + r'){0,3})')
+
+# Byline-intent markup: rel=author, class/id/itemprop author|byline.
+_BYLINE_MARKUP_RE = re.compile(
+    r'''(?:rel\s*=\s*["']?author|itemprop\s*=\s*["']?author|'''
+    r'''(?:class|id)\s*=\s*["'][^"']*\b(?:byline|author)\b)''',
+    re.IGNORECASE)
+
+
+def _schema_author_names(html):
+    """Author names declared anywhere in JSON-LD ('author' property values,
+    string or Person/Organization node(s)). Sorted for determinism."""
+    names = set()
+    for item in _iter_jsonld_items(html):
+        author = item.get('author')
+        if author is None:
+            continue
+        vals = author if isinstance(author, list) else [author]
+        for a in vals:
+            if isinstance(a, str) and a.strip():
+                names.add(a.strip())
+            elif isinstance(a, dict):
+                n = a.get('name')
+                if isinstance(n, str) and n.strip():
+                    names.add(n.strip())
+    return sorted(names)
+
+
+def check_g1_author_byline(html):
+    """G1 — author byline visible (OR declared via schema author).
+
+    Measures the objective substrate of the E-E-A-T authorship judgment:
+    a visible byline pattern in the rendered text / byline-intent markup,
+    and/or an author declared in JSON-LD. pass = visibly bylined;
+    warn = schema-only (add a visible byline); fail = neither.
+    """
+    text = strip_tags(html)
+    visible_hits = []
+    for pat in (_BYLINE_EXPLICIT_RE, _AUTHOR_LABEL_RE, _BYLINE_BARE_RE):
+        for match in pat.finditer(text):
+            visible_hits.append(match.group(1).strip())
+    # de-dupe, keep first-seen order for stable evidence
+    seen = set()
+    visible_hits = [h for h in visible_hits
+                    if not (h in seen or seen.add(h))]
+    markup_hit = bool(_BYLINE_MARKUP_RE.search(html or ''))
+    schema_authors = _schema_author_names(html)
+
+    detail = {
+        'visible_byline_names': visible_hits[:5],
+        'byline_markup_present': markup_hit,
+        'schema_authors': schema_authors[:5],
+    }
+
+    if visible_hits or markup_hit:
+        how = []
+        if visible_hits:
+            how.append(f'visible byline ({visible_hits[0]})')
+        if markup_hit:
+            how.append('byline/author markup (rel/class/itemprop)')
+        if schema_authors:
+            how.append(f'schema author ({schema_authors[0]})')
+        return {
+            'status': 'pass',
+            'evidence': 'Author attribution present: ' + '; '.join(how) + '.',
+            'detail': detail,
+        }
+    if schema_authors:
+        return {
+            'status': 'warn',
+            'evidence': (
+                f'Author declared in schema ({schema_authors[0]}) but no '
+                f'visible byline pattern found on the page — answer engines '
+                f'weight visible attribution; add a byline.'),
+            'detail': detail,
+        }
+    return {
+        'status': 'fail',
+        'evidence': ('No author byline found: no visible byline pattern, no '
+                     'byline markup, and no schema author. E-E-A-T authorship '
+                     'is unverifiable for this page.'),
+        'detail': detail,
+    }
+
+
+_ARTICLE_TYPES_RE = re.compile(r'Article$|^BlogPosting$|^Report$', )
+
+
+def check_g2_schema_author_linkage(html):
+    """G2 — schema-author linkage: Article author → Person/Organization
+    with sameAs (or jobTitle/hasCredential, per the G2 definition).
+
+    pass = an Article-family node's author resolves (inline or via @id) to a
+    Person/Organization carrying sameAs / jobTitle / hasCredential.
+    warn = author present but unlinked (bare string) or lacking those props.
+    fail = Article-family schema present with NO author at all.
+    na   = no Article-family node and no author property anywhere.
+    """
+    items = list(_iter_jsonld_items(html))
+    by_id = {item['@id']: item for item in items
+             if isinstance(item.get('@id'), str)}
+
+    def resolve(author):
+        """Resolve an author value to a node dict where possible."""
+        if isinstance(author, dict):
+            ref = author.get('@id')
+            if ref and len(author) <= 2 and ref in by_id:
+                return by_id[ref]     # {'@id': ...} (+optional @type) reference
+            return author
+        if isinstance(author, str):
+            return by_id.get(author)  # bare '@id' string reference
+        return None
+
+    def credential_props(node):
+        props = []
+        same_as = node.get('sameAs')
+        if (isinstance(same_as, str) and same_as.strip()) or \
+                (isinstance(same_as, list) and any(
+                    isinstance(u, str) and u.strip() for u in same_as)):
+            props.append('sameAs')
+        if isinstance(node.get('jobTitle'), str) and node['jobTitle'].strip():
+            props.append('jobTitle')
+        if node.get('hasCredential'):
+            props.append('hasCredential')
+        return props
+
+    article_nodes = [i for i in items
+                     if any(_ARTICLE_TYPES_RE.search(t)
+                            for t in _node_types(i))]
+    # Author properties on any node (covers WebPage.author etc.)
+    author_bearing = [i for i in items if i.get('author') is not None]
+
+    if not article_nodes and not author_bearing:
+        return {
+            'status': 'na',
+            'evidence': ('No Article-family schema and no author property in '
+                         'any JSON-LD node — schema-author linkage not '
+                         'applicable.'),
+            'detail': {'article_nodes': 0},
+        }
+
+    linked, unlinked = [], []
+    source_nodes = article_nodes if article_nodes else author_bearing
+    articles_missing_author = 0
+    for node in source_nodes:
+        author = node.get('author')
+        if author is None:
+            articles_missing_author += 1
+            continue
+        vals = author if isinstance(author, list) else [author]
+        for a in vals:
+            resolved = resolve(a)
+            if isinstance(resolved, dict):
+                types = _node_types(resolved)
+                is_person_org = any(t in ('Person', 'Organization')
+                                    for t in types)
+                props = credential_props(resolved)
+                name = resolved.get('name') if isinstance(
+                    resolved.get('name'), str) else None
+                entry = {'name': name, 'types': types, 'linked_props': props}
+                if is_person_org and props:
+                    linked.append(entry)
+                else:
+                    unlinked.append(entry)
+            else:
+                unlinked.append({'name': a if isinstance(a, str) else None,
+                                 'types': [], 'linked_props': []})
+
+    detail = {
+        'article_nodes': len(article_nodes),
+        'authors_linked': linked[:5],
+        'authors_unlinked': unlinked[:5],
+        'articles_missing_author': articles_missing_author,
+    }
+
+    if linked:
+        first = linked[0]
+        return {
+            'status': 'pass',
+            'evidence': (
+                f'Schema author linked: {first["name"] or "(unnamed)"} '
+                f'({"/".join(first["types"]) or "untyped"}) carries '
+                f'{", ".join(first["linked_props"])}. '
+                f'{len(linked)} linked author node(s) total.'),
+            'detail': detail,
+        }
+    if unlinked:
+        return {
+            'status': 'warn',
+            'evidence': (
+                f'Author declared in schema but not linked to an identity: '
+                f'{len(unlinked)} author value(s) are bare strings or '
+                f'Person/Organization nodes without sameAs / jobTitle / '
+                f'hasCredential. Add sameAs profile URLs to the author node.'),
+            'detail': detail,
+        }
+    return {
+        'status': 'fail',
+        'evidence': (
+            f'{len(article_nodes)} Article-family schema node(s) present but '
+            f'none declares an author — add author → Person/Organization '
+            f'with sameAs.'),
+        'detail': detail,
+    }
+
+
+# About / Contact / editorial-policy link detection. Matched against BOTH the
+# href and the anchor text (lowercased). Word-ish boundaries keep 'contact'
+# from matching inside unrelated tokens.
+_ABOUT_PAT = re.compile(
+    r'(?:\babout(?:[-_/ ]?us)?\b|\bcompany\b|\bwho[-_ ]we[-_ ]are\b|'
+    r'\bteam\b|\büber[-_ ]?uns\b|\bueber[-_ ]?uns\b)', re.IGNORECASE)
+_CONTACT_PAT = re.compile(
+    r'(?:\bcontact(?:[-_/ ]?us)?\b|\bkontakt\b|\bimpressum\b|\bimprint\b|'
+    r'\bget[-_ ]in[-_ ]touch\b)', re.IGNORECASE)
+_EDITORIAL_PAT = re.compile(
+    r'(?:editorial[-_ ](?:policy|guidelines|standards|process)|'
+    r'review[-_ ](?:policy|process|guidelines)|'
+    r'content[-_ ](?:policy|standards|guidelines|integrity)|'
+    r'corrections?[-_ ]policy|'
+    r'fact[-_ ]?check(?:ing)?(?:[-_ ]policy)?|'
+    r'publishing[-_ ]principles|ethics[-_ ](?:policy|statement))',
+    re.IGNORECASE)
+
+_ANCHOR_RE = re.compile(r'<a\b[^>]*>(.*?)</a\s*>', re.IGNORECASE | re.DOTALL)
+
+
+def _page_anchors(html):
+    """[(href, text, in_nav_or_footer), ...] for every anchor on the page.
+    nav/footer/header membership is judged by position inside those blocks
+    (regex block spans — good enough for discoverability evidence)."""
+    spans = []
+    for tag in ('nav', 'footer', 'header'):
+        for m in re.finditer(rf'<{tag}\b[^>]*>.*?</{tag}\s*>',
+                             html or '', re.IGNORECASE | re.DOTALL):
+            spans.append((m.start(), m.end()))
+    out = []
+    for m in _ANCHOR_RE.finditer(html or ''):
+        tag_open = m.group(0)
+        href_m = re.search(_ATTR_PAT.format(name='href'), tag_open,
+                           re.IGNORECASE)
+        href = ''
+        if href_m:
+            href = html_unescape(
+                next(g for g in href_m.groups() if g is not None).strip())
+        text = re.sub(r'<[^>]+>', ' ', m.group(1))
+        text = re.sub(r'\s+', ' ', html_unescape(text)).strip()
+        in_chrome = any(s <= m.start() < e for s, e in spans)
+        out.append((href, text, in_chrome))
+    return out
+
+
+def check_g7b_about_contact(html):
+    """G7b — About/Contact discoverability: links to about / contact /
+    impressum reachable from the page (nav/footer membership recorded).
+    An identifiable operator is a core E-E-A-T trust signal.
+    """
+    about_links, contact_links = [], []
+    for href, text, in_chrome in _page_anchors(html):
+        hay_href, hay_text = href or '', text or ''
+        entry = {'href': href[:200], 'text': text[:80],
+                 'in_nav_or_footer': in_chrome}
+        if _ABOUT_PAT.search(hay_href) or _ABOUT_PAT.search(hay_text):
+            about_links.append(entry)
+        # 'contact' can legitimately co-exist with about on one link; check both
+        if _CONTACT_PAT.search(hay_href) or _CONTACT_PAT.search(hay_text):
+            contact_links.append(entry)
+
+    detail = {
+        'about_links': about_links[:5],
+        'contact_links': contact_links[:5],
+        'about_in_nav_or_footer': any(l['in_nav_or_footer']
+                                      for l in about_links),
+        'contact_in_nav_or_footer': any(l['in_nav_or_footer']
+                                        for l in contact_links),
+    }
+
+    if about_links and contact_links:
+        return {
+            'status': 'pass',
+            'evidence': (
+                f'About and Contact are discoverable: '
+                f'{len(about_links)} about-link(s) '
+                f'(e.g. {about_links[0]["href"] or about_links[0]["text"]}), '
+                f'{len(contact_links)} contact/impressum link(s).'),
+            'detail': detail,
+        }
+    if about_links or contact_links:
+        missing = 'contact/impressum' if about_links else 'about'
+        found = about_links[0] if about_links else contact_links[0]
+        return {
+            'status': 'warn',
+            'evidence': (
+                f'Only one operator-identity link found '
+                f'({found["href"] or found["text"]}); no {missing} link '
+                f'detected in the page (incl. nav/footer).'),
+            'detail': detail,
+        }
+    return {
+        'status': 'fail',
+        'evidence': ('No About or Contact/Impressum links found anywhere on '
+                     'the page — the operator behind the content is not '
+                     'discoverable, a core E-E-A-T trust gap.'),
+        'detail': detail,
+    }
+
+
+def check_g7c_editorial_policy(html):
+    """G7c — editorial / review-policy link presence (or schema
+    publishingPrinciples). Never fails: absence is a warn — the signal
+    matters most for YMYL/publisher pages, which the LLM judges in context.
+    """
+    policy_links = []
+    for href, text, in_chrome in _page_anchors(html):
+        if _EDITORIAL_PAT.search(href or '') or _EDITORIAL_PAT.search(text or ''):
+            policy_links.append({'href': href[:200], 'text': text[:80],
+                                 'in_nav_or_footer': in_chrome})
+    publishing_principles = None
+    for item in _iter_jsonld_items(html):
+        pp = item.get('publishingPrinciples')
+        if isinstance(pp, str) and pp.strip():
+            publishing_principles = pp.strip()
+            break
+        if isinstance(pp, dict):
+            ref = pp.get('@id') or pp.get('url')
+            if isinstance(ref, str) and ref.strip():
+                publishing_principles = ref.strip()
+                break
+
+    detail = {
+        'policy_links': policy_links[:5],
+        'publishing_principles': publishing_principles,
+    }
+
+    if policy_links or publishing_principles:
+        how = []
+        if policy_links:
+            how.append(f'link ({policy_links[0]["href"] or policy_links[0]["text"]})')
+        if publishing_principles:
+            how.append(f'schema publishingPrinciples ({publishing_principles})')
+        return {
+            'status': 'pass',
+            'evidence': 'Editorial/review-policy signal present: '
+                        + '; '.join(how) + '.',
+            'detail': detail,
+        }
+    return {
+        'status': 'warn',
+        'evidence': ('No editorial/review-policy link or publishingPrinciples '
+                     'schema found. Important for YMYL/publisher pages; '
+                     'optional elsewhere.'),
+        'detail': detail,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Main orchestrator
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -1778,6 +2191,13 @@ def run_all_checks(url):
         # Wired checks (roadmap 0.2) — canonical ids from brain-mappings.json
         ('A3_meta_description', check_a3_meta_description, (html,)),
         ('C10_open_graph_tags', check_c10_open_graph, (html,)),
+        # E-E-A-T deterministic subset (roadmap 2.4) — measured inputs that
+        # feed the G-section trust judgment. G1/G2 canonical; G7b/G7c are
+        # sub-checks of G7 (privacy/terms → operator-identity links).
+        ('G1_author_byline', check_g1_author_byline, (html,)),
+        ('G2_author_schema_credentials', check_g2_schema_author_linkage, (html,)),
+        ('G7b_about_contact_discoverability', check_g7b_about_contact, (html,)),
+        ('G7c_editorial_policy_link', check_g7c_editorial_policy, (html,)),
         ('E4_no_nosnippet_noarchive', check_e4_nosnippet_directives, (html, headers)),
         ('E12_no_noarchive', check_e12_noarchive, (html, headers)),
         ('B9_no_mixed_content', check_b9_mixed_content, (html, final_url)),

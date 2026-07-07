@@ -140,6 +140,12 @@ assert_contains "siteContext sanitized leniently; prompt CONTEXT measured + narr
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10c] Mobile parity + honest CWV labels + deterministic E-E-A-T subset (G1/G2/G7b/G7c)"
+OUT=$(python3 "${SCRIPT_DIR}/test_mobile_eeat.py" 2>&1)
+assert_contains "mobile flag + parity comparator + lab-CWV/INP honesty + byline/about-contact/editorial/schema-author checks; PCR weights unchanged" "$OUT" "MOBILE_EEAT_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do

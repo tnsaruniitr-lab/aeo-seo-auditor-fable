@@ -200,8 +200,9 @@ audit = {
          'status': 'pass'},
         {'check_id': 'E4_no_nosnippet_noarchive', 'section': 'E',
          'status': 'pass', 'evidence_tier': 'measured'},   # pre-set → preserved
-        {'check_id': 'G1_author_byline', 'section': 'G', 'status': 'warn',
-         'evidence_tier': 'BOGUS'},                        # invalid → re-derived
+        # G9 stays LLM-judged (G1 gained a deterministic implementation in 2.4)
+        {'check_id': 'G9_content_freshness_recency', 'section': 'G',
+         'status': 'warn', 'evidence_tier': 'BOGUS'},      # invalid → re-derived
     ],
 }
 finalized = scoring.finalize_scoring(audit)
@@ -212,7 +213,7 @@ check('finalize_scoring stamps evidence_tier on every finding',
 check('deterministic id stamped measured, LLM id stamped llm-judged',
       fnd[0]['evidence_tier'] == 'measured'
       and fnd[1]['evidence_tier'] == 'llm-judged')
-check('invalid tier value re-derived (G1 → llm-judged)',
+check('invalid tier value re-derived (G9 → llm-judged)',
       fnd[3]['evidence_tier'] == 'llm-judged')
 tiers = finalized['scoring'].get('evidence_tiers')
 check("scoring metadata carries tier counts {measured: 2, llm-judged: 2}",

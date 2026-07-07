@@ -1538,14 +1538,22 @@ function renderTwoCol(bev, perf, audit) {
     ['Meta robots', pid.meta_robots || bev.meta_robots || 'none'],
     ['Classification', bev.classification],
   ];
+  // Honest CWV labeling: LCP/CLS come from ONE Playwright lab run — label
+  // them as such, and never render an INP number (INP needs CrUX field data).
+  const hasLabCwv = perf.lcp_ms != null || perf.cls != null;
+  const mobParity = perf.mobile_parity || {};
   const perfRows = [
     ['TTFB', perf.ttfb_ms != null ? perf.ttfb_ms + ' ms' : null],
-    ['LCP', perf.lcp_ms != null ? perf.lcp_ms + ' ms' : null],
-    ['CLS', perf.cls != null ? perf.cls.toFixed ? perf.cls.toFixed(3) : perf.cls : null],
+    ['LCP — lab (single run)', perf.lcp_ms != null ? perf.lcp_ms + ' ms' : null],
+    ['CLS — lab (single run)', perf.cls != null ? perf.cls.toFixed ? perf.cls.toFixed(3) : perf.cls : null],
+    ['INP', hasLabCwv ? 'not measured — requires field data (CrUX)' : null],
     ['Load time', perf.load_time_ms != null ? perf.load_time_ms + ' ms' : null],
     ['Request count', perf.request_count],
     ['SPA framework', (perf.spa_signals || []).join(', ') || 'none detected'],
     ['Console errors', perf.console_errors ? perf.console_errors.length : null],
+    ['Mobile parity', mobParity.status ? mobParity.status +
+      (mobParity.status === 'na' && mobParity.detail && mobParity.detail.reason
+        ? ' (' + mobParity.detail.reason + ')' : '') : null],
   ];
 
   function tableRows(rows) {

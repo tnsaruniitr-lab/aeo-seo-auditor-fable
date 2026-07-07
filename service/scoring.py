@@ -123,7 +123,13 @@ MEASURED_CHECK_BASES = frozenset({
     'D14',   # hreflang_coverage
     'E4',    # no_nosnippet_noarchive
     'E12',   # no_noarchive
+    'G1',    # author_byline (visible pattern / markup / schema author)
+    'G2',    # author_schema_credentials (Article author → Person/Org linkage)
+    'G7b',   # about_contact_discoverability (sub-check of G7)
+    'G7c',   # editorial_policy_link (sub-check of G7)
     'J2',    # brand_name_consistency
+    # tools.render_page_js (runtime deterministic — mobile emulation pass)
+    'A9b',   # mobile_content_parity (desktop vs mobile render diff)
     # check_robots_txt.py (deterministic robots.txt parse per RFC 9309)
     'A10',   # robots_txt_crawling / target_path_not_disallowed
     'A11',   # sitemap_referenced / robots_declares_sitemap
