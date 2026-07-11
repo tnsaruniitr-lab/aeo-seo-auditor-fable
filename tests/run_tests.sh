@@ -146,6 +146,12 @@ assert_contains "mobile flag + parity comparator + lab-CWV/INP honesty + byline/
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10d] Brain freshness: status filter + provenance rank + strict mode + disclosure"
+OUT=$(python3 "${SCRIPT_DIR}/test_brain_freshness.py" 2>&1)
+assert_contains "retired rules unciteable; provenance-ranked URLs; SIEVE_STRICT typed error; report disclosure + evidence_tier column" "$OUT" "BRAIN_FRESHNESS_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do

@@ -1618,18 +1618,23 @@ function renderAllFindings(findings) {
   let rows = '';
   for (const f of sorted.slice(0, 120)) {
     const icon = f.status === 'fail' ? '✗' : f.status === 'warn' ? '⚠' : f.status === 'pass' ? '✓' : '·';
+    const evTier = f.evidence_tier === 'measured'
+      ? '<span class="badge" style="background:#dcfce7;color:#166534">measured</span>'
+      : f.evidence_tier === 'llm-judged'
+        ? '<span class="badge" style="background:#fef9c3;color:#854d0e">llm-judged</span>' : '—';
     rows +=
       '<tr>' +
         '<td><span class="status-icon ' + escapeHtml(f.status || '') + '">' + icon + '</span></td>' +
         '<td><span class="check-id">' + escapeHtml(f.check_id || '') + '</span></td>' +
         '<td>' + (f.severity ? '<span class="sev ' + escapeHtml(String(f.severity).toLowerCase()) + '">' + escapeHtml(f.severity) + '</span>' : '—') + '</td>' +
+        '<td>' + evTier + '</td>' +
         '<td>' + escapeHtml((f.evidence || '').slice(0, 220)) + '</td>' +
         '<td>' + (f.truth_badge ? '<span class="badge truth">' + escapeHtml(f.truth_badge) + '</span>' : '') + '</td>' +
       '</tr>';
   }
   return '<section><details><summary>All findings (' + findings.length + ' checks · click to expand)</summary>' +
     '<table class="findings-table"><thead><tr>' +
-      '<th></th><th>Check</th><th>Severity</th><th>Evidence</th><th>Truth</th>' +
+      '<th></th><th>Check</th><th>Severity</th><th>Basis</th><th>Evidence</th><th>Truth</th>' +
     '</tr></thead><tbody>' + rows + '</tbody></table></details></section>';
 }
 
@@ -1639,6 +1644,10 @@ function renderBrainSources(findings) {
   // are the agent emitting partial/reshaped objects.
   const seen = new Set();
   const byTier = {1:[], 2:[], 3:[], 4:[], 5:[]};
+  // BRAIN-MODE DISCLOSURE: which brain answered, and how fresh it is — counted
+  // over the SAME deduped set the header total uses (a rule cited by N checks
+  // is one source, not N; malformed citations count nowhere).
+  let fromLive = 0, fromSnap = 0, maxVer = '';
   for (const f of findings) {
     for (const c of (f.citations || [])) {
       const name = c.name || c.title;
@@ -1647,6 +1656,8 @@ function renderBrainSources(findings) {
       const dedupKey = (c.id ?? name) + ':' + (c.kind || '?');
       if (seen.has(dedupKey)) continue;
       seen.add(dedupKey);
+      if (c.from === 'snapshot') fromSnap++; else if (c.from) fromLive++;
+      if (c.last_verified && String(c.last_verified) > maxVer) maxVer = String(c.last_verified);
       // Citations the grounding step could NOT verify against the brain keep
       // only LLM-claimed fields — never let them claim an authoritative tier.
       const tier = (c.verbatim === false) ? 5 : (c.tier || 5);
@@ -1657,9 +1668,26 @@ function renderBrainSources(findings) {
   if (!totalCites) return '';
   const tierLabels = {1:'🥇 Tier 1 — Authoritative', 2:'🥈 Tier 2 — Reputable',
                        3:'🥉 Tier 3 — Industry', 4:'📎 Tier 4 — Specialized', 5:'Other'};
-  let html = '<section><h2>Sources cited (' + totalCites + ' from Sieve brain)</h2>';
+  const mode = (fromLive === 0 && fromSnap === 0)
+    ? 'from Sieve brain'   // legacy audit predating mode tagging — claim nothing
+    : fromSnap === 0
+      ? 'live Sieve brain' + (maxVer ? ' · verified through ' + escapeHtml(maxVer) : '')
+      : fromLive === 0
+        ? 'SNAPSHOT ruleset (2026-04-21) — live brain unavailable'
+        : 'MIXED: ' + fromLive + ' live / ' + fromSnap + ' snapshot-fallback';
+  const snapBanner = fromSnap > 0
+    ? '<div style="background:#fef2f2;border:1px solid #fecaca;color:#991b1b;' +
+      'border-radius:8px;padding:10px 14px;margin:0 0 12px 0;font-size:13px">' +
+      '⚠ ' + fromSnap + ' source(s) were grounded from the bundled snapshot ' +
+      'ruleset (April 2026) — the live brain was unreachable or did not hold ' +
+      'them — treat their verified-dates as absent.</div>'
+    : '';
+  let html = '<section><h2>Sources cited (' + totalCites + ' · ' + mode + ')</h2>' + snapBanner;
   for (const t of [1,2,3,4,5]) {
     if (!byTier[t] || !byTier[t].length) continue;
+    // URL-less citations sort last within their tier: a receipt you can click
+    // beats a name you have to trust.
+    byTier[t].sort((a,b) => (a.source_url ? 0 : 1) - (b.source_url ? 0 : 1));
     html += '<div class="tier t' + t + '"><h3>' + tierLabels[t] + '</h3>';
     for (const c of byTier[t].slice(0, 12)) {
       const kindLabels = {rule:'Rule', ap:'AP', anti_pattern:'AP', principle:'Principle'};
@@ -1681,6 +1709,10 @@ function renderBrainSources(findings) {
         ? ' <code style="font-size:11px">[Sieve ' + kind + ' #' + escapeHtml(String(c.id)) + ']</code>'
         : '';
       const safeUrl = c.source_url ? safeHref(c.source_url) : '';
+      const noUrl = !c.source_url
+        ? ' <span class="cite-unver" title="no source URL on this rule">no link</span>' : '';
+      const provNote = c.url_provenance === 'neighbor-inferred'
+        ? ' <span class="cite-unver" title="URL adopted from a similar rule, not the extraction page">inferred link</span>' : '';
       // The rule's own reasoning, verbatim from the brain: when it applies →
       // what to do. Suppressed for unverified citations — their text is
       // LLM-claimed, not brain-backed.
@@ -1697,7 +1729,7 @@ function renderBrainSources(findings) {
         (safeUrl ? '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' : '') +
         '<span class="nm">' + escapeHtml(name) + '</span>' +
         (safeUrl ? '</a>' : '') +
-        conf + risk + idTag + verified + unverified + reasoning +
+        conf + risk + idTag + verified + unverified + noUrl + provNote + reasoning +
         '</div>';
     }
     html += '</div>';
@@ -2622,6 +2654,9 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
 
         issues.append({
             'severity': f.get('severity'),
+            'status': f.get('status'),  # additive: 'fail' | 'warn' — without it the
+                                        # consumer must guess and warns get dressed
+                                        # as fails in AnswerMonk's external_audits
             'category': _SECTION_LABELS.get(section_letter, section_letter or 'General'),
             'title': title,
             'fix': fix_hint,
