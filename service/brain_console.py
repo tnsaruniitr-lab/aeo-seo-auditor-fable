@@ -66,8 +66,12 @@ def brain_overview():
         with conn.cursor() as cur:
             for t in _TABLES:
                 try:
+                    # 'citeable' mirrors the retrieval filter exactly (legacy
+                    # statuses like 'candidate' are citeable; only the retire
+                    # lifecycle removes rows from circulation).
                     cur.execute(f"SELECT count(*), count(embedding), "
-                                f"count(*) FILTER (WHERE coalesce(status,'active')='active') "
+                                f"count(*) FILTER (WHERE coalesce(status,'active') "
+                                f"NOT IN ('retired','superseded','rejected')) "
                                 f"FROM sieve.{t}")
                     n, emb, act = cur.fetchone()
                     out['tables'][t] = {'rows': n, 'embedded': emb, 'active': act}
@@ -465,7 +469,8 @@ background:var(--card);width:36px;height:36px;cursor:pointer;color:var(--ink)}
     <select id="q-kind"><option value="rules">rules</option>
       <option value="principles">principles</option><option value="anti_patterns">anti-patterns</option></select>
     <select id="q-domain"><option value="">all domains</option></select>
-    <select id="q-status"><option value="">any status</option><option>active</option><option>retired</option></select>
+    <select id="q-status"><option value="">any status</option><option>active</option>
+      <option>candidate</option><option>retired</option></select>
     <button class="btn ghost" id="qGo">Search</button>
   </div>
   <div id="rules"></div>
@@ -491,7 +496,7 @@ async function loadOverview(){
   try{const o=await j('/api/brain/overview');
     const t=o.tables||{};const cards=[];
     const fmt=n=>n==null?'—':Number(n).toLocaleString();
-    cards.push({k:'Rules',v:fmt(t.rules?.rows),n:fmt(t.rules?.active)+' active · '+fmt(t.rules?.embedded)+' embedded'});
+    cards.push({k:'Rules',v:fmt(t.rules?.rows),n:fmt(t.rules?.active)+' citeable · '+fmt(t.rules?.embedded)+' embedded'});
     cards.push({k:'Principles',v:fmt(t.principles?.rows),n:'distilled guidance'});
     cards.push({k:'Anti-patterns',v:fmt(t.anti_patterns?.rows),n:'what not to do'});
     cards.push({k:'Verified through',v:esc(o.verified_through||'—'),n:(o.stale_days??'?')+' day(s) old'});
