@@ -477,6 +477,13 @@ def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(_basic)):
     return True
 
 
+# Sieve Brain Console (/brain + /api/brain/*): full ruleset visibility + source
+# management without the CLI. Every route in the router is auth-gated here —
+# the router itself defines none, so nothing ships open by accident.
+import brain_console  # noqa: E402
+app.include_router(brain_console.router, dependencies=[Depends(require_auth)])
+
+
 def require_admin(request: Request,
                   credentials: Optional[HTTPBasicCredentials] = Depends(_basic)):
     """Auth for destructive admin ops (delete / suppress). Passes when EITHER

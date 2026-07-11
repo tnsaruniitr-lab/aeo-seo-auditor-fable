@@ -152,6 +152,12 @@ assert_contains "retired rules unciteable; provenance-ranked URLs; SIEVE_STRICT 
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10e] Brain Console: routes + central auth gate + probe validation + page markers"
+OUT=$(python3 "${SCRIPT_DIR}/test_brain_console.py" 2>&1)
+assert_contains "console routes registered, auth centralized at include, SourceSpec validation, probe spec errors, HTML markers" "$OUT" "BRAIN_CONSOLE_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do
