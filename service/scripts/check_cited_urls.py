@@ -51,20 +51,49 @@ def classify(code: int | None, err: str | None) -> str:
     return 'error'
 
 
+# Tier-1/2 hosts checked before the long tail: with a --limit smaller than the
+# corpus, budget must go to the URLs that actually surface in reports.
+_TIER_ORDER = """
+    CASE WHEN source_url ~ 'developers\\.google\\.com|schema\\.org|web\\.dev|bing\\.com|indexnow\\.org|mozilla\\.org|w3\\.org|perplexity\\.ai|openai\\.com'
+         THEN 0
+         WHEN source_url ~ 'semrush\\.com|ahrefs\\.com|moz\\.com|backlinko\\.com|searchengineland\\.com'
+         THEN 1
+         ELSE 2 END
+"""
+
+
 def main() -> int:
+    if not DB_URL:
+        print('SIEVE_DB_URL (or DATABASE_URL) must be set — see module docstring.')
+        return 2
     limit = 500
     if '--limit' in sys.argv:
-        limit = int(sys.argv[sys.argv.index('--limit') + 1])
+        try:
+            limit = int(sys.argv[sys.argv.index('--limit') + 1])
+        except (IndexError, ValueError):
+            print('usage: check_cited_urls.py [--limit N]')
+            return 2
     conn = psycopg2.connect(DB_URL)
     conn.autocommit = True
     cur = conn.cursor()
     cur.execute(SCHEMA)
-    # Citeable URLs, most-authoritative first (they surface most in reports).
-    cur.execute("""
-        SELECT DISTINCT source_url FROM sieve.rules
-        WHERE source_url IS NOT NULL AND source_url <> ''
-          AND coalesce(status,'active') = 'active'
-        ORDER BY source_url LIMIT %s
+    # Citeable URLs across ALL three brain tables (each renders as a customer-
+    # facing link), most-authoritative first.
+    cur.execute(f"""
+        SELECT source_url FROM (
+            SELECT DISTINCT source_url FROM sieve.rules
+            WHERE source_url IS NOT NULL AND source_url <> ''
+              AND coalesce(status,'active') = 'active'
+            UNION
+            SELECT DISTINCT source_url FROM sieve.principles
+            WHERE source_url IS NOT NULL AND source_url <> ''
+              AND coalesce(status,'active') = 'active'
+            UNION
+            SELECT DISTINCT source_url FROM sieve.anti_patterns
+            WHERE source_url IS NOT NULL AND source_url <> ''
+              AND coalesce(status,'active') = 'active'
+        ) u
+        ORDER BY {_TIER_ORDER}, source_url LIMIT %s
     """, (limit,))
     urls = [r[0] for r in cur.fetchall()]
     print(f'checking {len(urls)} distinct cited URLs...', flush=True)

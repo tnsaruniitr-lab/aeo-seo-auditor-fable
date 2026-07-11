@@ -164,25 +164,33 @@ def _fetch_live_rows(wanted: Dict[str, List[str]]) -> Dict[Tuple[str, str], Dict
         conn = psycopg2.connect(sieve_brain.SIEVE_DB_URL, connect_timeout=10)
         conn.autocommit = True
         try:
+            cols_by_table = sieve_brain._optional_cols(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 for kind, ids in wanted.items():
                     if not ids:
                         continue
                     cfg = _KIND_CFG[kind]
+                    cols = cols_by_table.get(cfg['table'], set())
                     t2 = f"t.{cfg['t2']}" if cfg['t2'] else "''"
                     conf = f"t.{cfg['conf']}" if cfg['conf'] else "NULL"
                     risk = f"t.{cfg['risk']}" if cfg['risk'] else "NULL"
+                    prov = "t.url_provenance" if 'url_provenance' in cols else "NULL"
+                    # Retired/superseded guidance is unciteable on this path too:
+                    # a by-id fetch that resurrects a retired rule as 'verified'
+                    # would undo the retrieval-side status filter.
+                    status_f = sieve_brain._status_filter(cols)
                     cur.execute(
                         f"""
                         SELECT t.id, t.{cfg['title']} AS title, t.{cfg['t1']} AS text1,
                                {t2} AS text2, t.domain_tag, {conf} AS conf,
                                {risk} AS risk, t.source_org,
                                COALESCE(NULLIF(t.source_url,''), d.source_url) AS source_url,
-                               COALESCE(t.last_verified::text, t.created_at) AS created_at
+                               COALESCE(t.last_verified::text, t.created_at) AS created_at,
+                               {prov} AS url_provenance
                         FROM sieve.{cfg['table']} t
                         LEFT JOIN sieve.documents d
                           ON d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')
-                        WHERE t.id = ANY(%s)
+                        WHERE t.id = ANY(%s){status_f}
                         """,
                         (ids,),
                     )
@@ -193,6 +201,9 @@ def _fetch_live_rows(wanted: Dict[str, List[str]]) -> Dict[Tuple[str, str], Dict
         finally:
             conn.close()
     except Exception as e:
+        if sieve_brain.SIEVE_STRICT:
+            raise sieve_brain.SieveLiveError(
+                f're-grounding requires the live brain (SIEVE_STRICT): {e}')
         # Keep whatever was already fetched — snapshot covers the rest.
         log.warning('live re-grounding fetch failed (%s) — using snapshot', e)
         return out
@@ -227,6 +238,9 @@ def _live_row_fields(kind: str, r: Dict[str, Any]) -> Dict[str, Any]:
         'then_action': _cap(r.get('text2')),
         'domain_tag': r.get('domain_tag'),
         'last_verified': str(r.get('created_at'))[:10] if r.get('created_at') else None,
+        # Overwrites the retrieval-time value so a re-grounded source_url never
+        # carries a stale provenance label from a URL it replaced.
+        'url_provenance': r.get('url_provenance'),
         'from': 'sieve-live',
     }
     if kind == 'ap':
@@ -282,6 +296,7 @@ def _snapshot_fields(kind: str, rid: str) -> Optional[Dict[str, Any]]:
         'if_condition': _cap(row.get(cfg['snap_t1'])),
         'then_action': _cap(row.get(cfg['snap_t2']) if cfg['snap_t2'] else ''),
         'domain_tag': row.get('domain_tag'),
+        'url_provenance': None,  # snapshot rows carry no provenance — clear any stale label
         'from': 'snapshot',
     }
     if kind == 'ap':

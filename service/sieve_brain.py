@@ -234,25 +234,22 @@ def _conf_expr(cfg) -> str:
 
 
 # Columns that may not exist yet on a given deployment (added by sieve-ingest
-# migrations). Probed once per process; SQL is built to match reality so a
-# missing column can never silently knock a whole table out of retrieval.
-_OPTIONAL_COLS: Optional[Dict[str, set]] = None
-
-
+# migrations). Probed PER CONNECTION (one ~1ms information_schema lookup per
+# audit query) — a process-lifetime cache would keep a migration that lands
+# mid-process (e.g. Monday's url_provenance) invisible until redeploy, and a
+# dropped column would poison BOTH the vector and FTS paths identically,
+# silently removing whole tables from retrieval.
 def _optional_cols(conn) -> Dict[str, set]:
-    global _OPTIONAL_COLS
-    if _OPTIONAL_COLS is None:
-        out: Dict[str, set] = {}
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT table_name, column_name FROM information_schema.columns
-                WHERE table_schema='sieve'
-                  AND column_name IN ('url_provenance', 'status')
-            """)
-            for t, c in cur.fetchall():
-                out.setdefault(t, set()).add(c)
-        _OPTIONAL_COLS = out
-    return _OPTIONAL_COLS
+    out: Dict[str, set] = {}
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT table_name, column_name FROM information_schema.columns
+            WHERE table_schema='sieve'
+              AND column_name IN ('url_provenance', 'status')
+        """)
+        for t, c in cur.fetchall():
+            out.setdefault(t, set()).add(c)
+    return out
 
 
 def _select_head(cfg, score_sql: str, cols: Optional[set] = None) -> str:
@@ -361,7 +358,9 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
                    industry: Optional[str] = None,
                    max_citations: int = 3) -> Optional[List[Dict[str, Any]]]:
     """Return citation dicts for a check from the live brain, or None so the
-    caller falls back to the snapshot path. Never raises."""
+    caller falls back to the snapshot path. Never raises — EXCEPT under
+    SIEVE_STRICT, where a live-brain failure raises SieveLiveError so the
+    audit fails loudly instead of silently citing the April snapshot."""
     if not live_enabled():
         return None
     try:

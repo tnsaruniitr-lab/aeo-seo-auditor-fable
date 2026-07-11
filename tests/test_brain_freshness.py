@@ -58,7 +58,7 @@ def test_renderer_discloses_brain_mode():
     assert "verified through" in src
     assert "SNAPSHOT ruleset (2026-04-21)" in src
     assert "MIXED: ' + fromLive + ' live" in src
-    assert "fell back to the bundled snapshot ruleset" in src
+    assert "grounded from the bundled snapshot" in src
     # evidence_tier is a findings-table column now.
     assert "llm-judged'" in src and '<th>Basis</th>' in src
     # URL-less demotion + neighbor-inferred honesty note.

@@ -388,6 +388,11 @@ def query_brain(check_id: str, page_type: str = "homepage",
                 "source": "sieve-live",
             }
     except Exception as _live_err:  # noqa: BLE001 — never let live path break query_brain
+        # ...EXCEPT in strict mode: SIEVE_STRICT means the operator chose
+        # 'fail the audit' over 'silently cite the April snapshot'.
+        import sieve_brain as _sb
+        if isinstance(_live_err, _sb.SieveLiveError):
+            raise
         log.debug('live brain unavailable, using snapshot: %s', _live_err)
 
     try:

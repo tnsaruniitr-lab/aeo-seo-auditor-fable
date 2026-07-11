@@ -68,6 +68,9 @@ def attach_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, A
                 cites = [c for c in (res.get('citations') or [])
                          if isinstance(c, dict)][:MAX_CITATIONS]
             except Exception as e:  # noqa: BLE001 — one bad check must not stop the pass
+                from sieve_brain import SieveLiveError
+                if isinstance(e, SieveLiveError):
+                    raise  # strict mode: fail the audit, don't degrade
                 log.warning('citation attach failed for %s: %s', cid, e)
                 stats['errors'] += 1
                 continue
@@ -81,6 +84,9 @@ def attach_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, A
             stats['checks_cited'] += 1
             stats['citations_attached'] += len(cites)
     except Exception as e:  # noqa: BLE001
+        from sieve_brain import SieveLiveError
+        if isinstance(e, SieveLiveError):
+            raise  # strict mode: propagate to the agent → audit fails loudly
         log.error('citation attachment failed: %s', e)
         stats['applied'] = False
         stats['error'] = f'{type(e).__name__}: {e}'

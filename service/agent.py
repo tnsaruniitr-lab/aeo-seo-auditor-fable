@@ -78,6 +78,21 @@ MAX_AUDIT_COST_USD = float(os.getenv('MAX_AUDIT_COST_USD', '2.50'))
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 529})
 MAX_STREAM_RETRIES = int(os.getenv('MAX_STREAM_RETRIES', '4'))
 
+# AUDIT_TEMPERATURE (e.g. 0) pins classification variance — OPT-IN only:
+# temperature changes the classification DISTRIBUTION, so it must be validated
+# against back-to-back ground-truth audits before riding to prod as a default.
+# Parsed ONCE at import and fail-safe: a malformed value must degrade to
+# 'unset' with a loud log, never break every stream attempt with a ValueError
+# misattributed to the API.
+_TEMP_KW: dict = {}
+try:
+    _t = os.getenv('AUDIT_TEMPERATURE')
+    if _t not in (None, ''):
+        _TEMP_KW = {'temperature': float(_t)}
+except ValueError:
+    logging.getLogger('audit.agent').error(
+        'AUDIT_TEMPERATURE=%r is not a number — ignoring it', os.getenv('AUDIT_TEMPERATURE'))
+
 
 def estimate_cost_usd(input_tokens: int, output_tokens: int) -> float:
     """Rough per-audit cost estimate in USD (list price, no cache discount)."""
@@ -286,19 +301,13 @@ def run_agent_loop(url: str, verbose: bool = False,
             try:
                 _clear_cache_breakpoints(messages)
                 _mark_cache_breakpoint(messages)
-                # AUDIT_TEMPERATURE (e.g. 0) pins classification variance —
-                # OPT-IN only: temperature changes the classification
-                # DISTRIBUTION, so it must be validated against back-to-back
-                # ground-truth audits before riding to prod as a default.
-                _temp = os.getenv('AUDIT_TEMPERATURE')
-                _kw = {'temperature': float(_temp)} if _temp not in (None, '') else {}
                 with client.messages.stream(
                     model=MODEL,
                     max_tokens=MAX_TOKENS_PER_TURN,
                     system=_system_blocks(),
                     tools=TOOLS_SPEC,
                     messages=messages,
-                    **_kw,
+                    **_TEMP_KW,
                 ) as stream:
                     response = stream.get_final_message()
                 break
@@ -744,6 +753,9 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
                  attach_stats.get("citations_attached", 0),
                  attach_stats.get("llm_lists_replaced", 0))
     except Exception as e:
+        from sieve_brain import SieveLiveError
+        if isinstance(e, SieveLiveError):
+            raise  # SIEVE_STRICT: fail the audit rather than ship snapshot citations
         md["citation_attachment"] = {"applied": False,
                                      "error": f"{type(e).__name__}: {e}"}
         log.error('%scitation attachment failed: %s', f'[{audit_id[:8]}] ', e)
@@ -783,6 +795,9 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
                      ground_stats["regrounded_live"], ground_stats["regrounded_snapshot"],
                      ground_stats["unresolved"])
     except Exception as e:
+        from sieve_brain import SieveLiveError
+        if isinstance(e, SieveLiveError):
+            raise  # SIEVE_STRICT: fail the audit rather than ship snapshot citations
         md["citation_grounding"] = {"applied": False,
                                     "error": f"{type(e).__name__}: {e}"}
         log.error('%scitation re-grounding failed: %s\n%s',

@@ -1644,6 +1644,10 @@ function renderBrainSources(findings) {
   // are the agent emitting partial/reshaped objects.
   const seen = new Set();
   const byTier = {1:[], 2:[], 3:[], 4:[], 5:[]};
+  // BRAIN-MODE DISCLOSURE: which brain answered, and how fresh it is — counted
+  // over the SAME deduped set the header total uses (a rule cited by N checks
+  // is one source, not N; malformed citations count nowhere).
+  let fromLive = 0, fromSnap = 0, maxVer = '';
   for (const f of findings) {
     for (const c of (f.citations || [])) {
       const name = c.name || c.title;
@@ -1652,6 +1656,8 @@ function renderBrainSources(findings) {
       const dedupKey = (c.id ?? name) + ':' + (c.kind || '?');
       if (seen.has(dedupKey)) continue;
       seen.add(dedupKey);
+      if (c.from === 'snapshot') fromSnap++; else if (c.from) fromLive++;
+      if (c.last_verified && String(c.last_verified) > maxVer) maxVer = String(c.last_verified);
       // Citations the grounding step could NOT verify against the brain keep
       // only LLM-claimed fields — never let them claim an authoritative tier.
       const tier = (c.verbatim === false) ? 5 : (c.tier || 5);
@@ -1662,24 +1668,19 @@ function renderBrainSources(findings) {
   if (!totalCites) return '';
   const tierLabels = {1:'🥇 Tier 1 — Authoritative', 2:'🥈 Tier 2 — Reputable',
                        3:'🥉 Tier 3 — Industry', 4:'📎 Tier 4 — Specialized', 5:'Other'};
-  // BRAIN-MODE DISCLOSURE: which brain answered, and how fresh it is. A reader
-  // must be able to tell a live-DB audit from a snapshot-fallback audit.
-  let fromLive = 0, fromSnap = 0, maxVer = '';
-  for (const f of findings) for (const c of (f.citations || [])) {
-    if (c.from === 'snapshot') fromSnap++; else if (c.from) fromLive++;
-    if (c.last_verified && String(c.last_verified) > maxVer) maxVer = String(c.last_verified);
-  }
-  const mode = fromSnap === 0
-    ? 'live Sieve brain' + (maxVer ? ' · verified through ' + escapeHtml(maxVer) : '')
-    : fromLive === 0
-      ? 'SNAPSHOT ruleset (2026-04-21) — live brain unavailable'
-      : 'MIXED: ' + fromLive + ' live / ' + fromSnap + ' snapshot-fallback';
+  const mode = (fromLive === 0 && fromSnap === 0)
+    ? 'from Sieve brain'   // legacy audit predating mode tagging — claim nothing
+    : fromSnap === 0
+      ? 'live Sieve brain' + (maxVer ? ' · verified through ' + escapeHtml(maxVer) : '')
+      : fromLive === 0
+        ? 'SNAPSHOT ruleset (2026-04-21) — live brain unavailable'
+        : 'MIXED: ' + fromLive + ' live / ' + fromSnap + ' snapshot-fallback';
   const snapBanner = fromSnap > 0
     ? '<div style="background:#fef2f2;border:1px solid #fecaca;color:#991b1b;' +
       'border-radius:8px;padding:10px 14px;margin:0 0 12px 0;font-size:13px">' +
-      '⚠ ' + fromSnap + ' citation(s) fell back to the bundled snapshot ruleset ' +
-      '(April 2026) because the live brain was unreachable — treat their ' +
-      'verified-dates as absent.</div>'
+      '⚠ ' + fromSnap + ' source(s) were grounded from the bundled snapshot ' +
+      'ruleset (April 2026) — the live brain was unreachable or did not hold ' +
+      'them — treat their verified-dates as absent.</div>'
     : '';
   let html = '<section><h2>Sources cited (' + totalCites + ' · ' + mode + ')</h2>' + snapBanner;
   for (const t of [1,2,3,4,5]) {
@@ -2653,6 +2654,9 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
 
         issues.append({
             'severity': f.get('severity'),
+            'status': f.get('status'),  # additive: 'fail' | 'warn' — without it the
+                                        # consumer must guess and warns get dressed
+                                        # as fails in AnswerMonk's external_audits
             'category': _SECTION_LABELS.get(section_letter, section_letter or 'General'),
             'title': title,
             'fix': fix_hint,
