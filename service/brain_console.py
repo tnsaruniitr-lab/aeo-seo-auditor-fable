@@ -34,9 +34,10 @@ log = logging.getLogger('audit.brain_console')
 router = APIRouter()
 
 _UA = {'User-Agent': 'sieve-brain-console/1.0 (+preflight)'}
-_TABLES = {'rules': ('name', 'if_condition', 'then_logic'),
-           'principles': ('title', 'statement', 'explanation'),
-           'anti_patterns': ('title', 'description', None)}
+# per-kind columns: (title, body1, body2, confidence_col, risk_col)
+_TABLES = {'rules': ('name', 'if_condition', 'then_logic', 'confidence_score', None),
+           'principles': ('title', 'statement', 'explanation', 'confidence_score', None),
+           'anti_patterns': ('title', 'description', None, None, 'risk_level')}
 _ID_RE = re.compile(r'^[a-z0-9][a-z0-9-]{1,48}$')
 
 
@@ -133,12 +134,43 @@ def brain_sources():
         conn.close()
 
 
+@router.get('/api/brain/segments')
+def brain_segments():
+    """The library map: every way to slice the corpus, with counts — domains,
+    source orgs (tiered), statuses, types. Each segment is a clickable entry
+    point into the filtered browser."""
+    import sieve_brain
+    out: Dict[str, Any] = {'kinds': [], 'domains': [], 'orgs': [], 'statuses': []}
+    conn = _conn()
+    try:
+        with conn.cursor() as cur:
+            for t in _TABLES:
+                cur.execute(f"SELECT count(*) FROM sieve.{t}")
+                out['kinds'].append({'kind': t, 'count': cur.fetchone()[0]})
+            cur.execute("SELECT coalesce(domain_tag,'(untagged)'), count(*) "
+                        "FROM sieve.rules GROUP BY 1 ORDER BY 2 DESC")
+            out['domains'] = [{'tag': t, 'count': n} for t, n in cur.fetchall()]
+            cur.execute("SELECT coalesce(source_org,'(unknown)'), count(*), "
+                        "count(*) FILTER (WHERE source_url IS NOT NULL AND source_url<>''), "
+                        "max(last_verified)::date::text "
+                        "FROM sieve.rules GROUP BY 1 ORDER BY 2 DESC LIMIT 24")
+            out['orgs'] = [{'org': o, 'count': n, 'with_url': wu, 'verified': v,
+                            'tier': sieve_brain.tier_of(o)}
+                           for o, n, wu, v in cur.fetchall()]
+            cur.execute("SELECT coalesce(status,'active'), count(*) FROM sieve.rules "
+                        "GROUP BY 1 ORDER BY 2 DESC")
+            out['statuses'] = [{'status': s, 'count': n} for s, n in cur.fetchall()]
+        return out
+    finally:
+        conn.close()
+
+
 @router.get('/api/brain/rules')
 def brain_rules(q: str = '', kind: str = 'rules', org: str = '', domain: str = '',
                 status_f: str = '', offset: int = 0):
     if kind not in _TABLES:
         raise HTTPException(400, f'kind must be one of {list(_TABLES)}')
-    title, t1, t2 = _TABLES[kind]
+    title, t1, t2, confcol, riskcol = _TABLES[kind]
     offset = max(0, min(offset, 100000))
     where, params = ['TRUE'], []
     if q:
@@ -156,9 +188,15 @@ def brain_rules(q: str = '', kind: str = 'rules', org: str = '', domain: str = '
     if status_f:
         where.append("coalesce(status,'active') = %s"); params.append(status_f)
     t2sel = t2 or "''"
+    conf = confcol or "NULL"          # anti_patterns has no confidence column
+    risk = riskcol or "NULL"
     conn = _conn()
     try:
         with conn.cursor() as cur:
+            # optional deep-dive columns (arrive via ingest migrations)
+            import sieve_brain
+            have = sieve_brain._optional_cols(conn).get(kind, set())
+            prov = 'url_provenance' if 'url_provenance' in have else 'NULL'
             cur.execute(f"SELECT count(*) FROM sieve.{kind} WHERE {' AND '.join(where)}",
                         params)
             total = cur.fetchone()[0]
@@ -166,13 +204,16 @@ def brain_rules(q: str = '', kind: str = 'rules', org: str = '', domain: str = '
                 SELECT id, {title} AS title, {t1} AS body1, {t2sel} AS body2,
                        domain_tag, source_org, source_url,
                        coalesce(status,'active'), last_verified::date::text,
-                       confidence_score
+                       {conf} AS confidence, {risk} AS risk,
+                       {prov} AS url_provenance, document_id,
+                       extracted_at::date::text, created_at::text
                 FROM sieve.{kind} WHERE {' AND '.join(where)}
                 ORDER BY last_verified DESC NULLS LAST, id DESC
                 LIMIT 25 OFFSET %s
             """, params + [offset])
             cols = ['id', 'title', 'body1', 'body2', 'domain_tag', 'source_org',
-                    'source_url', 'status', 'last_verified', 'confidence']
+                    'source_url', 'status', 'last_verified', 'confidence', 'risk',
+                    'url_provenance', 'document_id', 'extracted_at', 'created_at']
             return {'total': total, 'offset': offset,
                     'items': [dict(zip(cols, r)) for r in cur.fetchall()]}
     finally:
@@ -426,6 +467,14 @@ a{color:var(--brand-ink);text-decoration:none}a:hover{text-decoration:underline}
 background:var(--card);width:36px;height:36px;cursor:pointer;color:var(--ink)}
 .section{display:none}.section.on{display:block}
 .load{color:var(--mut);padding:20px;text-align:center}
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);
+background:var(--card);color:var(--ink);border-radius:10px;padding:8px 13px;cursor:pointer;
+font:inherit;font-size:13px;box-shadow:var(--shadow)}
+.chip:hover{border-color:var(--brand)}.chip b{color:var(--brand-ink)}
+.rrow{cursor:pointer}.rrow:hover td{background:color-mix(in srgb,var(--brand) 4%,transparent)}
+.detail-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+gap:12px;padding:6px 4px 10px;font-size:13px}
 </style></head><body>
 <button id="themeBtn" title="theme">◐</button>
 <div class="wrap">
@@ -433,12 +482,17 @@ background:var(--card);width:36px;height:36px;cursor:pointer;color:var(--ink)}
 <div class="sub">The living ruleset library: what we know, where it came from, how fresh it is — and where new sources enter.</div>
 <div class="cards" id="ov"></div>
 <div class="tabs">
-  <button class="tab on" data-s="sources">Sources</button>
+  <button class="tab on" data-s="map">Library</button>
+  <button class="tab" data-s="sources">Sources</button>
   <button class="tab" data-s="add">Add a source</button>
   <button class="tab" data-s="browse">Browse rules</button>
   <button class="tab" data-s="activity">Activity</button>
 </div>
-<div class="section on" id="s-sources"><div class="load">loading sources…</div></div>
+<div class="section on" id="s-map">
+  <div class="sub">Every segment is clickable — drill into the filtered rules behind any number.</div>
+  <div id="segMap" class="load">loading library map…</div>
+</div>
+<div class="section" id="s-sources"><div class="load">loading sources…</div></div>
 <div class="section" id="s-add">
   <h2>Register a new source</h2>
   <div class="sub">Probe first — the console shows exactly what a deep crawl would process before anything is registered or any token is spent.</div>
@@ -469,6 +523,7 @@ background:var(--card);width:36px;height:36px;cursor:pointer;color:var(--ink)}
     <select id="q-kind"><option value="rules">rules</option>
       <option value="principles">principles</option><option value="anti_patterns">anti-patterns</option></select>
     <select id="q-domain"><option value="">all domains</option></select>
+    <select id="q-org"><option value="">all sources</option></select>
     <select id="q-status"><option value="">any status</option><option>active</option>
       <option>candidate</option><option>retired</option></select>
     <button class="btn ghost" id="qGo">Search</button>
@@ -569,27 +624,84 @@ $('#btnAdd').onclick=async()=>{
     $('#btnAdd').disabled=true;loadSources();
   }catch(e){$('#probeOut').innerHTML='<div class="probe bad">'+esc(e.message)+'</div>'}};
 
-let qOffset=0;
+async function loadSegments(){
+  try{const s=await j('/api/brain/segments');
+    const kindLabel={rules:'Rules — testable if/then directives',
+      principles:'Principles — the "why" behind them',
+      anti_patterns:'Anti-patterns — what not to do'};
+    const chip=(label,count,extra,click)=>'<button class="chip" onclick="'+click+'">'+
+      '<span>'+label+'</span><b>'+Number(count).toLocaleString()+'</b>'+(extra||'')+'</button>';
+    let h='<h2>By type</h2><div class="chips">';
+    for(const k of s.kinds)h+=chip(esc(kindLabel[k.kind]||k.kind),k.count,'',
+      "goBrowse({kind:'"+esc(k.kind)+"'})");
+    h+='</div><h2>By domain</h2><div class="chips">';
+    for(const d of s.domains)h+=chip(esc(d.tag),d.count,'',
+      "goBrowse({domain:'"+esc(d.tag)+"'})");
+    h+='</div><h2>By source (authority-tiered)</h2><div class="chips">';
+    for(const o of s.orgs)h+=chip(esc(o.org),o.count,
+      ' <span class="badge b-mut">T'+o.tier+'</span>'+
+      (o.verified?' <span class="rule-if">'+esc(o.verified)+'</span>':''),
+      "goBrowse({org:'"+esc(o.org).replace(/'/g,"\\'")+"'})");
+    h+='</div><h2>By lifecycle status</h2><div class="chips">';
+    for(const st of s.statuses)h+=chip(esc(st.status),st.count,'',
+      "goBrowse({status:'"+esc(st.status)+"'})");
+    h+='</div>';
+    $('#segMap').innerHTML=h;
+    const osel=$('#q-org');
+    s.orgs.forEach(o=>{const op=document.createElement('option');
+      op.value=o.org;op.textContent=o.org+' ('+o.count+')';osel.appendChild(op)});
+  }catch(e){$('#segMap').innerHTML='<div class="load">'+esc(e.message)+'</div>'}}
+window.goBrowse=f=>{
+  if(f.kind)$('#q-kind').value=f.kind;
+  if(f.domain)$('#q-domain').value=f.domain==='(untagged)'?'':f.domain;
+  if(f.org)$('#q-org').value=f.org==='(unknown)'?'':f.org;
+  if(f.status)$('#q-status').value=f.status;
+  document.querySelector('.tab[data-s="browse"]').click();
+  loadRules(false)};
+
+let qOffset=0,qItems=[];
+function detailRow(r){
+  const kv=(k,v)=>v?'<div><span class="rule-if">'+k+'</span><br>'+v+'</div>':'';
+  return '<div class="detail-grid">'+
+    kv('IF (condition)',esc(r.body1||'—'))+
+    kv('THEN (action)',esc(r.body2||''))+
+    kv('Source',esc(r.source_org||'—')+(r.source_url
+      ?' — <a target="_blank" rel="noopener" href="'+esc(r.source_url)+'">'+esc(r.source_url)+'</a>':''))+
+    kv('Link provenance',esc(r.url_provenance||'legacy import'))+
+    kv('Domain',esc(r.domain_tag||'—'))+
+    kv('Confidence',esc(r.confidence||''))+kv('Risk',esc(r.risk||''))+
+    kv('Status',esc(r.status))+
+    kv('Verified',esc(r.last_verified||'never'))+
+    kv('Extracted',esc(r.extracted_at||'—'))+
+    kv('Ids',(r.id!=null?'#'+esc(r.id):'')+(r.document_id?' · doc '+esc(r.document_id):''))+
+    '</div>';}
+window.toggleDetail=i=>{
+  const el=document.getElementById('det-'+i);
+  if(el.style.display==='none'){el.style.display='';el.innerHTML='<td colspan="4">'+detailRow(qItems[i])+'</td>'}
+  else el.style.display='none'};
 async function loadRules(more){
-  if(!more)qOffset=0;
+  if(!more){qOffset=0;qItems=[]}
   const p=new URLSearchParams({q:$('#q').value.trim(),kind:$('#q-kind').value,
-    domain:$('#q-domain').value,status_f:$('#q-status').value,offset:qOffset});
+    domain:$('#q-domain').value,org:$('#q-org').value,
+    status_f:$('#q-status').value,offset:qOffset});
   try{const d=await j('/api/brain/rules?'+p);
     let h=more?$('#rules').dataset.rows||'':'';
     for(const r of d.items){
-      h+='<tr><td><b>'+esc(r.title)+'</b>'+
-        '<div class="rule-if">IF '+esc((r.body1||'').slice(0,180))+'</div>'+
-        (r.body2?'<div>THEN '+esc(r.body2.slice(0,180))+'</div>':'')+'</td>'+
+      const i=qItems.length;qItems.push(r);
+      h+='<tr class="rrow" onclick="toggleDetail('+i+')"><td><b>'+esc(r.title)+'</b>'+
+        '<div class="rule-if">IF '+esc((r.body1||'').slice(0,160))+'</div>'+
+        (r.body2?'<div>THEN '+esc(r.body2.slice(0,160))+'</div>':'')+'</td>'+
         '<td>'+esc(r.domain_tag||'—')+'</td>'+
-        '<td>'+esc(r.source_org||'—')+(r.source_url?'<br><a target="_blank" rel="noopener" href="'+
+        '<td>'+esc(r.source_org||'—')+(r.source_url?'<br><a target="_blank" rel="noopener" onclick="event.stopPropagation()" href="'+
           esc(r.source_url)+'">source ↗</a>':'')+'</td>'+
         '<td>'+(r.status==='active'?'<span class="badge b-ok">active</span>'
           :'<span class="badge b-mut">'+esc(r.status)+'</span>')+
-        (r.last_verified?'<br><span class="rule-if">'+esc(r.last_verified)+'</span>':'')+'</td></tr>';
+        (r.last_verified?'<br><span class="rule-if">'+esc(r.last_verified)+'</span>':'')+'</td></tr>'+
+        '<tr id="det-'+i+'" style="display:none"></tr>';
     }
     $('#rules').dataset.rows=h;
     $('#rules').innerHTML='<div class="sub">'+Number(d.total).toLocaleString()+
-      ' matching</div><table><thead><tr><th>Rule</th><th>Domain</th><th>Source</th>'+
+      ' matching — click a row for the deep dive</div><table><thead><tr><th>Rule</th><th>Domain</th><th>Source</th>'+
       '<th>Status</th></tr></thead><tbody>'+h+'</tbody></table>';
     qOffset=d.offset+25;
     $('#qMore').style.display=qOffset<d.total?'':'none';
@@ -614,7 +726,7 @@ async function loadActivity(){
     el.innerHTML=h+'</tbody></table>';
   }catch(e){el.innerHTML='<div class="load">'+esc(e.message)+'</div>'}}
 
-loadOverview();loadSources();loadRules(false);loadActivity();
+loadOverview();loadSegments();loadSources();loadRules(false);loadActivity();
 </script></body></html>"""
 
 

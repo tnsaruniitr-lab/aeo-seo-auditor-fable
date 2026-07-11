@@ -13,6 +13,7 @@ import brain_console  # noqa: E402
 def test_router_has_all_routes():
     paths = {getattr(r, 'path', None) for r in brain_console.router.routes}
     for p in ('/brain', '/api/brain/overview', '/api/brain/sources',
+              '/api/brain/segments',
               '/api/brain/rules', '/api/brain/changes',
               '/api/brain/sources/probe', '/api/brain/sources/{source_id}/toggle'):
         assert p in paths, p
@@ -61,7 +62,8 @@ def test_probe_rejects_incomplete_specs():
 def test_page_markers():
     h = brain_console.BRAIN_HTML
     for marker in ('Sieve Brain Console', 'Deep crawl suggested', 'Add a source',
-                   'Browse rules', 'Activity', 'data-s="sources"'):
+                   'Browse rules', 'Activity', 'data-s="sources"',
+                   'data-s="map"', 'goBrowse', 'toggleDetail', 'By source (authority-tiered)'):
         assert marker in h, marker
     # every dynamic insertion path uses the esc() helper
     assert 'const esc=' in h
