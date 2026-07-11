@@ -286,12 +286,19 @@ def run_agent_loop(url: str, verbose: bool = False,
             try:
                 _clear_cache_breakpoints(messages)
                 _mark_cache_breakpoint(messages)
+                # AUDIT_TEMPERATURE (e.g. 0) pins classification variance —
+                # OPT-IN only: temperature changes the classification
+                # DISTRIBUTION, so it must be validated against back-to-back
+                # ground-truth audits before riding to prod as a default.
+                _temp = os.getenv('AUDIT_TEMPERATURE')
+                _kw = {'temperature': float(_temp)} if _temp not in (None, '') else {}
                 with client.messages.stream(
                     model=MODEL,
                     max_tokens=MAX_TOKENS_PER_TURN,
                     system=_system_blocks(),
                     tools=TOOLS_SPEC,
                     messages=messages,
+                    **_kw,
                 ) as stream:
                     response = stream.get_final_message()
                 break

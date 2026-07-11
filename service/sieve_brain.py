@@ -29,6 +29,15 @@ log = logging.getLogger('audit.sieve')
 SIEVE_LIVE = os.getenv('SIEVE_LIVE', '') in ('1', 'true', 'True')
 SIEVE_DB_URL = os.getenv('SIEVE_DB_URL') or os.getenv('DATABASE_URL')
 EMBED_MODEL = os.getenv('SIEVE_EMBED_MODEL', 'text-embedding-3-small')
+# SIEVE_STRICT=1: a live-brain failure FAILS the audit instead of silently
+# degrading to the repo snapshot. Default off — a transient Postgres hiccup
+# must not break AnswerMonk's audits — but the option exists once freshness
+# monitoring has proven the DB stable.
+SIEVE_STRICT = os.getenv('SIEVE_STRICT', '') in ('1', 'true', 'True')
+
+
+class SieveLiveError(RuntimeError):
+    """Live sieve DB was required (SIEVE_STRICT) but unavailable."""
 
 TIER_ICONS = {1: '🥇', 2: '🥈', 3: '🥉', 4: '📄', 5: '📝'}
 
@@ -224,13 +233,38 @@ def _conf_expr(cfg) -> str:
             "WHEN 'low' THEN '0.65' ELSE '0.8' END")
 
 
-def _select_head(cfg, score_sql: str) -> str:
+# Columns that may not exist yet on a given deployment (added by sieve-ingest
+# migrations). Probed once per process; SQL is built to match reality so a
+# missing column can never silently knock a whole table out of retrieval.
+_OPTIONAL_COLS: Optional[Dict[str, set]] = None
+
+
+def _optional_cols(conn) -> Dict[str, set]:
+    global _OPTIONAL_COLS
+    if _OPTIONAL_COLS is None:
+        out: Dict[str, set] = {}
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name, column_name FROM information_schema.columns
+                WHERE table_schema='sieve'
+                  AND column_name IN ('url_provenance', 'status')
+            """)
+            for t, c in cur.fetchall():
+                out.setdefault(t, set()).add(c)
+        _OPTIONAL_COLS = out
+    return _OPTIONAL_COLS
+
+
+def _select_head(cfg, score_sql: str, cols: Optional[set] = None) -> str:
     t2 = f"t.{cfg['t2']}" if cfg['t2'] else "''"
+    cols = cols or set()
+    prov = "t.url_provenance" if 'url_provenance' in cols else "NULL"
     return f"""
         SELECT t.id, t.{cfg['title']} AS title, t.{cfg['t1']} AS text1, {t2} AS text2,
                t.domain_tag, {_conf_expr(cfg)} AS conf, t.source_org,
                COALESCE(NULLIF(t.source_url,''), d.source_url) AS source_url,
                COALESCE(t.last_verified::text, t.created_at) AS created_at,
+               {prov} AS url_provenance,
                {score_sql} AS score
         FROM sieve.{{table}} t
         LEFT JOIN sieve.documents d
@@ -238,14 +272,23 @@ def _select_head(cfg, score_sql: str) -> str:
     """
 
 
-def _search_vector(cur, table, cfg, qvec_literal, k):
-    sql = _select_head(cfg, '1 - (t.embedding <=> %s::vector)').format(table=table) + \
-        " WHERE t.embedding IS NOT NULL ORDER BY t.embedding <=> %s::vector LIMIT %s"
+def _status_filter(cols: Optional[set]) -> str:
+    """Retired/superseded/rejected guidance must be unciteable. NULL and legacy
+    statuses stay retrievable (never-delete corpus)."""
+    if cols and 'status' in cols:
+        return " AND coalesce(t.status,'active') NOT IN ('retired','superseded','rejected')"
+    return ""
+
+
+def _search_vector(cur, table, cfg, qvec_literal, k, cols=None):
+    sql = _select_head(cfg, '1 - (t.embedding <=> %s::vector)', cols).format(table=table) + \
+        " WHERE t.embedding IS NOT NULL" + _status_filter(cols) + \
+        " ORDER BY t.embedding <=> %s::vector LIMIT %s"
     cur.execute(sql, (qvec_literal, qvec_literal, k))
     return cur.fetchall()
 
 
-def _search_fts(cur, table, cfg, ts_query, k):
+def _search_fts(cur, table, cfg, ts_query, k, cols=None):
     tsv = (f"to_tsvector('english', coalesce(t.{cfg['title']},'')||' '||"
            f"coalesce(t.{cfg['t1']},'')" + (f"||' '||coalesce(t.{cfg['t2']},'')" if cfg['t2'] else '') + ")")
     # id tie-break: ts_rank produces frequent exact ties, and an untied LIMIT
@@ -253,8 +296,9 @@ def _search_fts(cur, table, cfg, ts_query, k):
     # bigint cast gives numeric order). The vector path needs no tie-break:
     # with a pinned query vector the HNSW scan is deterministic, and a
     # secondary sort key would defeat the index.
-    sql = _select_head(cfg, f"ts_rank({tsv}, websearch_to_tsquery('english', %s))").format(table=table) + \
-        f" WHERE {tsv} @@ websearch_to_tsquery('english', %s) ORDER BY score DESC, t.id::bigint ASC LIMIT %s"
+    sql = _select_head(cfg, f"ts_rank({tsv}, websearch_to_tsquery('english', %s))", cols).format(table=table) + \
+        f" WHERE {tsv} @@ websearch_to_tsquery('english', %s)" + _status_filter(cols) + \
+        " ORDER BY score DESC, t.id::bigint ASC LIMIT %s"
     cur.execute(sql, (ts_query, ts_query, k))
     return cur.fetchall()
 
@@ -279,8 +323,17 @@ def _row_to_cite(r) -> Dict[str, Any]:
         'last_verified': str(r.get('created_at'))[:10] if r.get('created_at') else None,
         'relevance': round(float(r.get('score') or 0.0), 4),
         'url_spec': _url_spec(r.get('source_url')),
+        'url_provenance': r.get('url_provenance'),
         'from': 'sieve-live',
     }
+
+
+def _prov_rank(c: Dict[str, Any]) -> int:
+    """extracted (0) beats unknown/legacy (1) beats neighbor-inferred (2):
+    a URL the rule was actually extracted from is honest provenance; a
+    similarity-adopted neighbor URL is a hint, not a receipt."""
+    p = c.get('url_provenance')
+    return 0 if p == 'extracted' else (2 if p == 'neighbor-inferred' else 1)
 
 
 # Known generic hubs (not exact pages) — a citation should prefer a real page over these.
@@ -327,20 +380,22 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
         conn = psycopg2.connect(SIEVE_DB_URL, connect_timeout=10)
         conn.autocommit = True
         try:
+            cols_by_table = _optional_cols(conn)
             qvec_lit = _pinned_query_vec(conn, query)    # None => FTS-only
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 for table, cfg in _TABLE_CFG.items():
+                    cols = cols_by_table.get(table, set())
                     found = []
                     try:
                         if qvec_lit:
-                            found = _search_vector(cur, table, cfg, qvec_lit, per_table_k)
+                            found = _search_vector(cur, table, cfg, qvec_lit, per_table_k, cols)
                         else:
-                            found = _search_fts(cur, table, cfg, ts_query, per_table_k)
+                            found = _search_fts(cur, table, cfg, ts_query, per_table_k, cols)
                     except Exception as te:
                         # e.g. no embedding column yet -> fall back to FTS for this table
                         log.info('vector search on %s failed (%s), trying FTS', table, te)
                         try:
-                            found = _search_fts(cur, table, cfg, ts_query, per_table_k)
+                            found = _search_fts(cur, table, cfg, ts_query, per_table_k, cols)
                         except Exception:
                             found = []
                     for r in found:
@@ -349,6 +404,8 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
         finally:
             conn.close()
     except Exception as e:
+        if SIEVE_STRICT:
+            raise SieveLiveError(f'live brain required (SIEVE_STRICT) but failed: {e}')
         log.warning('live brain query failed (%s) — falling back to snapshot', e)
         return None
 
@@ -366,7 +423,7 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
     # when the choice is otherwise a wash. Deterministic (id is the final key).
     cites.sort(key=lambda c: (
         c['tier'], -round(float(c['confidence_score']), 1), -round(c['relevance'], 2),
-        c.get('url_spec', 2), c.get('kind') or '', str(c['id'] or '')
+        c.get('url_spec', 2), _prov_rank(c), c.get('kind') or '', str(c['id'] or '')
     ))
     return cites[:max_citations]
 
@@ -398,6 +455,32 @@ def stats() -> Dict[str, Any]:
         except Exception:
             conn.rollback()
             out['pinned_query_embeddings'] = 0
+        # Freshness: THE number that says whether the brain is being fed.
+        # stale_days > the ingest cadence (7d) means the weekly loop is broken —
+        # this is the dependency-free watchdog for the whole freshness chain.
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT max(last_verified)::date::text,
+                           EXTRACT(day FROM now() - max(last_verified))::int
+                    FROM sieve.rules
+                """)
+                verified_through, stale_days = cur.fetchone()
+                out['verified_through'] = verified_through
+                out['stale_days'] = stale_days
+                out['stale'] = bool(stale_days is not None and stale_days > 14)
+        except Exception:
+            conn.rollback()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT run_id, started_at::date::text, status "
+                            "FROM sieve.ingest_runs ORDER BY run_id DESC LIMIT 1")
+                row = cur.fetchone()
+                if row:
+                    out['last_ingest_run'] = {'run_id': row[0], 'date': row[1],
+                                              'status': row[2]}
+        except Exception:
+            conn.rollback()  # ingest control tables not present on this DB
         conn.close()
         return out
     except Exception as e:
