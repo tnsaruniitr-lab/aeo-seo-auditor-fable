@@ -405,6 +405,21 @@ def _search_fts(cur, table, cfg, ts_query, k, cols=None):
     return cur.fetchall()
 
 
+def _prov_method(raw) -> Optional[str]:
+    """Extract the url_provenance 'method' (exact / exact-upgrade / doc-join /
+    neighbor / observed-crawl). NULL = legacy row whose URL came with the
+    original extraction — treated as trustworthy, only 'neighbor' (a
+    similarity-adopted guess) is demoted."""
+    if not raw:
+        return None
+    try:
+        import json as _json
+        d = _json.loads(raw) if isinstance(raw, str) else raw
+        return d.get('method') if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
 def _row_to_cite(r) -> Dict[str, Any]:
     org = r.get('source_org')
     t = tier_of(org)
@@ -412,11 +427,13 @@ def _row_to_cite(r) -> Dict[str, Any]:
         conf = float(r.get('conf') or 0.0)
     except (TypeError, ValueError):
         conf = 0.0
+    prov = _prov_method(r.get('url_provenance'))
     return {
         'id': r.get('id'), 'kind': r.get('kindtag', 'rule'),
         'tier': t, 'tier_icon': TIER_ICONS.get(t, '📝'),
         'source_org': canon_org(org) or org, 'source_org_raw': org,
         'source_url': r.get('source_url'),
+        'url_provenance_method': prov,
         'name': r.get('title'),
         'confidence_score': str(round(conf, 2)),
         'if_condition': (r.get('text1') or '')[:500],
@@ -463,6 +480,44 @@ def _url_spec(u: Optional[str]) -> int:
 # Retrieval
 # ---------------------------------------------------------------------------
 
+def _search_all_tables(conn, query_text: str, per_table_k: int) -> List[Dict[str, Any]]:
+    """Vector-first (pinned embedding), FTS-fallback search across the three
+    brain tables on an OPEN connection. Returns raw rows tagged with kindtag
+    and _layer (the per-layer relevance floor depends on it). Passes each
+    table's optional-column set through so the trust filter APPLIES — a bare
+    cols=None would silently disable it and let rejected rows be cited."""
+    from psycopg2.extras import RealDictCursor
+    words = list(dict.fromkeys(re.findall(r'[a-zA-Z0-9][a-zA-Z0-9-]{2,}', query_text.lower())))
+    ts_query = ' OR '.join(words) or query_text
+    rows: List[Dict[str, Any]] = []
+    cols_by_table = _optional_cols(conn)
+    qvec_lit = _pinned_query_vec(conn, query_text)    # None => FTS-only
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        for table, cfg in _TABLE_CFG.items():
+            cols = cols_by_table.get(table, set())
+            found = []
+            layer = 'vector'
+            try:
+                if qvec_lit:
+                    found = _search_vector(cur, table, cfg, qvec_lit, per_table_k, cols)
+                else:
+                    layer = 'fts'
+                    found = _search_fts(cur, table, cfg, ts_query, per_table_k, cols)
+            except Exception as te:
+                # e.g. no embedding column yet -> fall back to FTS for this table
+                log.info('vector search on %s failed (%s), trying FTS', table, te)
+                try:
+                    layer = 'fts'
+                    found = _search_fts(cur, table, cfg, ts_query, per_table_k, cols)
+                except Exception:
+                    found = []
+            for r in found:
+                r['kindtag'] = cfg['kind']
+                r['_layer'] = layer
+            rows += found
+    return rows
+
+
 def live_citations(check_id: str, page_type: Optional[str] = None,
                    industry: Optional[str] = None,
                    max_citations: int = 3,
@@ -481,7 +536,6 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
         return None
     try:
         import psycopg2
-        from psycopg2.extras import RealDictCursor
     except Exception:
         return None
 
@@ -557,6 +611,82 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
     # emitting confident-but-irrelevant tier-1 citations.
     ranked = _rank_and_floor(cites, max_citations)
     return ranked or None
+
+# ---------------------------------------------------------------------------
+# Programmatic retrieval (POST /api/brain/retrieve — AnswerMonk NORMS layer)
+# ---------------------------------------------------------------------------
+
+def _fetch_by_ids(conn, kind: str, ids: List[str]) -> List[Dict[str, Any]]:
+    """Exact-id fetch (curated mappings path). Same trust gate + citation
+    shape as search; relevance is 1.0 by definition (caller asked for them)."""
+    from psycopg2.extras import RealDictCursor
+    table = next((t for t, c in _TABLE_CFG.items() if c['kind'] == kind), None)
+    if not table or not ids:
+        return []
+    cfg = _TABLE_CFG[table]
+    cols = _optional_cols(conn).get(table, set())
+    sql = _select_head(cfg, '1.0', cols).format(table=table) + \
+        " WHERE t.id = ANY(%s)" + _trust_filter(cols)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(sql, ([str(i) for i in ids],))
+        rows = cur.fetchall()
+    for r in rows:
+        r['kindtag'] = kind
+        r['_layer'] = 'ids'
+    return rows
+
+
+def retrieve_batch(queries: List[Dict[str, Any]], min_tier: int = 3,
+                   max_citations: int = 3) -> Dict[str, Any]:
+    """Batch retrieval for server-to-server consumers (AnswerMonk).
+
+    queries: [{key, q?|check_id?|rule_ids?}] — one result list per key.
+      q        : free-text search (vector-first, FTS fallback)
+      check_id : auditor-style id, expanded via _query_for
+      rule_ids : exact rule-id fetch (curated-mapping path)
+    min_tier: NORM-slot gate — only citations from orgs at tier <= min_tier
+      are returned (tier 5 = unattributed/observed can never be a norm).
+    Never raises; on any failure returns {'live': False, 'results': {}}.
+    """
+    if not live_enabled():
+        return {'live': False, 'results': {}, 'reason': 'live brain disabled'}
+    try:
+        import psycopg2
+    except Exception:
+        return {'live': False, 'results': {}, 'reason': 'psycopg2 unavailable'}
+
+    per_table_k = max(8, max_citations * 4)
+    results: Dict[str, List[Dict[str, Any]]] = {}
+    try:
+        conn = psycopg2.connect(SIEVE_DB_URL, connect_timeout=10)
+        conn.autocommit = True
+        try:
+            for spec in queries:
+                key = str(spec.get('key') or '')
+                if not key:
+                    continue
+                try:
+                    if spec.get('rule_ids'):
+                        rows = _fetch_by_ids(conn, 'rule', list(spec['rule_ids']))
+                    else:
+                        text = spec.get('q') or (
+                            _query_for(spec['check_id']) if spec.get('check_id') else '')
+                        if not text:
+                            results[key] = []
+                            continue
+                        rows = _search_all_tables(conn, text, per_table_k)
+                    cites = [c for c in (_row_to_cite(r) for r in rows)
+                             if c['tier'] <= min_tier]
+                    results[key] = _rank_and_floor(cites, max_citations)
+                except Exception as qe:
+                    log.warning('brain retrieve failed for key %s: %s', key, qe)
+                    results[key] = []
+        finally:
+            conn.close()
+    except Exception as e:
+        log.warning('brain retrieve batch failed: %s', e)
+        return {'live': False, 'results': {}, 'reason': str(e)[:200]}
+    return {'live': True, 'results': results}
 
 
 def stats() -> Dict[str, Any]:
