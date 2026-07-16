@@ -198,18 +198,22 @@ def _fetch_live_rows(wanted: Dict[str, List[str]]) -> Dict[Tuple[str, str], Dict
                     # Retired/superseded guidance is unciteable on this path too:
                     # a by-id fetch that resurrects a retired rule as 'verified'
                     # would undo the retrieval-side status filter.
-                    status_f = sieve_brain._status_filter(cols)
+                    status_f = sieve_brain._trust_filter(cols)
+                    # S4: prefer the document_id FK join; legacy regex only if absent.
+                    doc_join = ("d.id = t.document_id" if 'document_id' in cols
+                                else "d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')")
                     cur.execute(
                         f"""
                         SELECT t.id, t.{cfg['title']} AS title, t.{cfg['t1']} AS text1,
                                {t2} AS text2, t.domain_tag, {conf} AS conf,
                                {risk} AS risk, t.source_org,
                                COALESCE(NULLIF(t.source_url,''), d.source_url) AS source_url,
-                               COALESCE(t.last_verified::text, t.created_at) AS created_at,
+                               t.last_verified::text AS last_verified,
+                               t.created_at AS created_at,
                                {prov} AS url_provenance
                         FROM sieve.{cfg['table']} t
                         LEFT JOIN sieve.documents d
-                          ON d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')
+                          ON {doc_join}
                         WHERE t.id = ANY(%s){status_f}
                         """,
                         (ids,),
@@ -257,7 +261,10 @@ def _live_row_fields(kind: str, r: Dict[str, Any]) -> Dict[str, Any]:
         'if_condition': _cap(r.get('text1')),
         'then_action': _cap(r.get('text2')),
         'domain_tag': r.get('domain_tag'),
-        'last_verified': str(r.get('created_at'))[:10] if r.get('created_at') else None,
+        # D3 — honest freshness on the DELIVERED report: last_verified only when
+        # genuinely re-verified; created_at rides as an 'added' date, never as verified.
+        'last_verified': str(r.get('last_verified'))[:10] if r.get('last_verified') else None,
+        'added': str(r.get('created_at'))[:10] if r.get('created_at') else None,
         # Overwrites the retrieval-time value so a re-grounded source_url never
         # carries a stale provenance label from a URL it replaced.
         'url_provenance': r.get('url_provenance'),

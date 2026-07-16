@@ -298,7 +298,8 @@ def _optional_cols(conn) -> Dict[str, set]:
         cur.execute("""
             SELECT table_name, column_name FROM information_schema.columns
             WHERE table_schema='sieve'
-              AND column_name IN ('url_provenance', 'status')
+              AND column_name IN ('url_provenance', 'status', 'contested',
+                                  'superseded_by', 'document_id')
         """)
         for t, c in cur.fetchall():
             out.setdefault(t, set()).add(c)
@@ -309,25 +310,52 @@ def _select_head(cfg, score_sql: str, cols: Optional[set] = None) -> str:
     t2 = f"t.{cfg['t2']}" if cfg['t2'] else "''"
     cols = cols or set()
     prov = "t.url_provenance" if 'url_provenance' in cols else "NULL"
+    # S4: join documents on the real document_id FK when the column exists;
+    # fall back to the legacy source_refs_json regex only on an older DB.
+    if 'document_id' in cols:
+        doc_join = "d.id = t.document_id"
+    else:
+        doc_join = "d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')"
+    # D2: last_verified and created_at are DISTINCT columns. A never-re-verified
+    # rule (last_verified NULL) must NOT borrow created_at and display as
+    # 'verified' — that fabricates freshness. created_at rides through only as an
+    # honest 'added' date.
     return f"""
         SELECT t.id, t.{cfg['title']} AS title, t.{cfg['t1']} AS text1, {t2} AS text2,
                t.domain_tag, {_conf_expr(cfg)} AS conf, t.source_org,
                COALESCE(NULLIF(t.source_url,''), d.source_url) AS source_url,
-               COALESCE(t.last_verified::text, t.created_at) AS created_at,
+               t.last_verified::text AS last_verified,
+               t.created_at AS created_at,
                {prov} AS url_provenance,
                {score_sql} AS score
         FROM sieve.{{table}} t
         LEFT JOIN sieve.documents d
-          ON d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')
+          ON {doc_join}
     """
 
 
-def _status_filter(cols: Optional[set]) -> str:
-    """Retired/superseded/rejected guidance must be unciteable. NULL and legacy
-    statuses stay retrievable (never-delete corpus)."""
-    if cols and 'status' in cols:
-        return " AND coalesce(t.status,'active') NOT IN ('retired','superseded','rejected')"
-    return ""
+def _trust_filter(cols: Optional[set]) -> str:
+    """Only TRUSTED, non-dead, uncontested guidance is citeable. The live sieve
+    taxonomy is active/candidate/deprecated/rejected (the old 'retired'/'superseded'
+    string statuses are gone — supersession is now the superseded_by FK). Each
+    clause is guarded by _optional_cols so this degrades cleanly on an older DB.
+    Excludes: deprecated+rejected (kept retired/superseded for back-compat),
+    contested='t' rows, and any row with superseded_by set."""
+    if not cols:
+        return ""
+    clauses = []
+    if 'status' in cols:
+        clauses.append(
+            "coalesce(t.status,'active') NOT IN ('deprecated','rejected','retired','superseded')")
+    if 'contested' in cols:
+        clauses.append("coalesce(t.contested,'f') <> 't'")
+    if 'superseded_by' in cols:
+        clauses.append("t.superseded_by IS NULL")
+    return (" AND " + " AND ".join(clauses)) if clauses else ""
+
+
+# Back-compat alias — some call sites / tests reference the old name.
+_status_filter = _trust_filter
 
 
 def _corpus_model(conn) -> Optional[str]:
@@ -389,7 +417,10 @@ def _row_to_cite(r) -> Dict[str, Any]:
         'if_condition': (r.get('text1') or '')[:500],
         'then_action': (r.get('text2') or '')[:500],
         'domain_tag': r.get('domain_tag'),
-        'last_verified': str(r.get('created_at'))[:10] if r.get('created_at') else None,
+        # D2 — honest freshness: last_verified is emitted ONLY when the rule was
+        # genuinely re-verified; a NULL stays None (never borrows created_at).
+        'last_verified': str(r.get('last_verified'))[:10] if r.get('last_verified') else None,
+        'added': str(r.get('created_at'))[:10] if r.get('created_at') else None,
         'relevance': round(float(r.get('score') or 0.0), 4),
         'url_spec': _url_spec(r.get('source_url')),
         'url_provenance': r.get('url_provenance'),

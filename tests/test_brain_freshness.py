@@ -12,19 +12,35 @@ import sieve_brain  # noqa: E402
 
 
 def test_status_filter_sql():
-    # With a status column, retired/superseded/rejected are excluded; without
-    # one, no filter is emitted (legacy DBs keep working).
-    f = sieve_brain._status_filter({'status'})
-    assert "NOT IN ('retired','superseded','rejected')" in f
+    # Trust filter (formerly _status_filter): the live taxonomy is
+    # active/candidate/deprecated/rejected — deprecated+rejected are excluded, and
+    # contested/superseded rows drop when those columns exist. Each clause is
+    # guarded so an older DB (status only) still works.
+    f = sieve_brain._trust_filter({'status'})
+    assert "NOT IN ('deprecated','rejected'" in f
     assert "coalesce(t.status,'active')" in f
-    assert sieve_brain._status_filter(set()) == ''
+    assert 'contested' not in f and 'superseded_by' not in f  # not probed => not applied
+    # With the new columns present, contested + superseded_by clauses appear.
+    f2 = sieve_brain._trust_filter({'status', 'contested', 'superseded_by'})
+    assert "coalesce(t.contested,'f') <> 't'" in f2
+    assert "t.superseded_by IS NULL" in f2
+    # Empty / None => no filter (legacy DBs keep working); back-compat alias holds.
+    assert sieve_brain._trust_filter(set()) == ''
     assert sieve_brain._status_filter(None) == ''
-    # The filter lands in both search paths' SQL.
+    # Honest dates: last_verified and created_at are SEPARATE columns (no COALESCE
+    # laundering created_at into a fabricated verified date).
     cfg = sieve_brain._TABLE_CFG['rules']
     head = sieve_brain._select_head(cfg, '1.0', {'status', 'url_provenance'})
+    assert 't.last_verified::text AS last_verified' in head
+    assert 't.created_at AS created_at' in head
+    assert 'COALESCE(t.last_verified' not in head
     assert 't.url_provenance' in head
+    # S4: document_id FK join when the column is present; legacy regex otherwise.
+    head_fk = sieve_brain._select_head(cfg, '1.0', {'document_id'})
+    assert 'd.id = t.document_id' in head_fk
     head_bare = sieve_brain._select_head(cfg, '1.0', set())
     assert 'NULL AS url_provenance' in head_bare
+    assert 'substring(t.source_refs_json' in head_bare  # legacy fallback
 
 
 def test_provenance_rank_ordering():
