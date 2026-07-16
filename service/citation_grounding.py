@@ -183,6 +183,7 @@ def _fetch_live_rows(wanted: Dict[str, List[str]]) -> Dict[Tuple[str, str], Dict
                         LEFT JOIN sieve.documents d
                           ON d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')
                         WHERE t.id = ANY(%s)
+                          AND coalesce(t.status::text,'active') NOT IN ('rejected','deprecated')
                         """,
                         (ids,),
                     )

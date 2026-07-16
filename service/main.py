@@ -2964,6 +2964,64 @@ def unsuppress(domain: str, _: bool = Depends(require_admin)):
 
 
 # ----------------------------------------------------------------------
+# BRAIN RETRIEVAL — server-to-server NORMS layer for AnswerMonk.
+# One brain client: consumers never touch the DB; this endpoint rides the
+# hardened sieve_brain stack (vector-first + FTS fallback, status gate,
+# authority tiering, url_provenance-aware ranking). Batched: one call per
+# audit/roadmap build, results are cached by the caller in its cards.
+# ----------------------------------------------------------------------
+
+class BrainQuery(BaseModel):
+    key: str = Field(..., max_length=120)
+    q: Optional[str] = Field(None, max_length=400)          # free-text search
+    check_id: Optional[str] = Field(None, max_length=120)   # auditor-style id
+    rule_ids: Optional[_List[str]] = None                   # exact-id fetch
+
+
+class BrainRetrieveRequest(BaseModel):
+    queries: _List[BrainQuery] = Field(..., max_length=40)
+    min_tier: int = Field(3, ge=1, le=5)      # NORM slot: tier<=3 = canonical orgs only
+    max_citations: int = Field(3, ge=1, le=8)
+
+
+@app.post('/api/brain/retrieve')
+def api_brain_retrieve(req: BrainRetrieveRequest,
+                       _: bool = Depends(require_api_key)):
+    """Batch norm retrieval from the live Sieve brain.
+
+    Per query: q (free-text) | check_id (expanded like the audit agent's own
+    queries) | rule_ids (curated-mapping exact fetch). Only status
+    active/candidate rows are served; the NORM gate (min_tier, default 3)
+    means unattributed/observed knowledge can never be returned as a norm.
+    Response citations carry source_org, source_url, url_provenance_method,
+    confidence_score, last_verified — render org+URL verbatim; the brain's
+    name stays out of client copy.
+    """
+    try:
+        import sieve_brain
+        specs = []
+        for q in req.queries:
+            if not (q.q or q.check_id or q.rule_ids):
+                continue
+            specs.append({'key': q.key, 'q': q.q, 'check_id': q.check_id,
+                          'rule_ids': q.rule_ids})
+        if not specs:
+            raise HTTPException(status_code=422,
+                                detail='each query needs q, check_id, or rule_ids')
+        out = sieve_brain.retrieve_batch(specs, min_tier=req.min_tier,
+                                         max_citations=req.max_citations)
+        out['requested'] = len(specs)
+        return out
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Never 500 the caller's roadmap build — degrade like every other
+        # brain path: caller falls back to its vendored snapshot mappings.
+        log.warning('brain retrieve endpoint failed: %s', e)
+        return {'live': False, 'results': {}, 'reason': str(e)[:200]}
+
+
+# ----------------------------------------------------------------------
 # CATCH-ALL SLUG ROUTE — audits.growthmonk.ai/{domain}
 # MUST be the LAST route registered so it never shadows explicit routes.
 # Serves the homepage HTML; the page JS reads the path and fetches that
