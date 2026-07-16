@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "note": "Mode-C deterministic bindings. For a MEASURED check (status comes from the deterministic scripts, not the LLM), bind a curated rule VERBATIM when the predicate holds. Each id was verified on-topic against the snapshot corpus. Seed set — expand to every MEASURED_CHECK_BASES entry; unmapped bases simply get no deterministic binding (never a wrong one).",
+  "bindings": {
+    "A1":  [{ "kind": "rule", "id": 1489, "when": { "status": ["fail", "warn"] } }],
+    "A3":  [{ "kind": "rule", "id": 8192, "when": { "status": ["fail", "warn"] } }],
+    "B9":  [{ "kind": "rule", "id": 1388, "when": { "status": ["fail", "warn"] } }],
+    "D9":  [{ "kind": "rule", "id": 1496, "when": { "status": ["fail", "warn"] } }],
+    "G1":  [{ "kind": "rule", "id": 1544, "when": { "status": ["fail", "warn"] } }]
+  }
+}

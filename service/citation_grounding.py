@@ -117,6 +117,26 @@ def _plausible(claimed: set, auth: Dict[str, Any]) -> bool:
         (len(inter) / max(1, min(len(claimed), len(fetched)))) >= 0.34
 
 
+def _auth_tokens(auth: Dict[str, Any]) -> set:
+    return _text_tokens(auth.get('name'), auth.get('title'), auth.get('if_condition'),
+                        auth.get('then_action'), auth.get('statement'),
+                        auth.get('description'), auth.get('explanation'))
+
+
+def _supports_fix(claimed: set, auth: Dict[str, Any]) -> bool:
+    """Stricter gate for MINTING a fix source from a prose-scraped id: a real
+    source_url stamped on a fix is a customer-facing receipt, so we require
+    genuine topical support and REFUSE on no evidence (unlike _plausible, which
+    is permissive on empty). Closes the ground_fix_sources hole where any
+    hallucinated 'Sieve Rule #1668' resolved to a real Google URL."""
+    fetched = _auth_tokens(auth)
+    if not claimed or not fetched:
+        return False
+    inter = claimed & fetched
+    ratio = len(inter) / min(len(claimed), len(fetched))
+    return len(inter) >= 3 and ratio >= 0.25
+
+
 def _norm_kind(kind: Any) -> Optional[str]:
     if not isinstance(kind, str):
         return None
@@ -483,11 +503,20 @@ def ground_fix_sources(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
         for f, refs in zip(fixes, per_fix_refs):
             if not isinstance(f, dict) or not refs:
                 continue
+            claimed = _text_tokens(f.get('title'), f.get('why'),
+                                   f.get('before'), f.get('after'))
             sources = []
             for kind, rid in refs:
                 auth = live_rows.get((kind, rid)) or _snapshot_fields(kind, rid)
                 if auth is None:
                     stats['unresolved'] += 1
+                    continue
+                # A prose-scraped id resolves to SOME row; only stamp its
+                # authoritative source_url if that row actually supports the
+                # fix. An off-topic / hallucinated id is dropped, not minted.
+                if not _supports_fix(claimed, auth):
+                    stats['unresolved'] += 1
+                    stats['rejected_offtopic'] = stats.get('rejected_offtopic', 0) + 1
                     continue
                 stats['resolved'] += 1
                 sources.append({
@@ -621,12 +650,18 @@ def _selftest() -> None:
         _, s3 = reground_citations(dict(shape))
         assert s3['applied'] is True and s3['citations_total'] == 0, (shape, s3)
 
-    # Fix-source resolution: WHY-paragraph references become linked sources.
+    # Fix-source resolution: a WHY paragraph that actually DESCRIBES the rule's
+    # content mints a linked source; a fix that merely NAME-DROPS the id (or
+    # cites an off-topic id) does NOT — closing the mint-a-source hole.
     _SNAPSHOT_CACHE = stub_index
     audit3 = {'narrative': {'top_5_fixes': [
-        {'title': 'Fix org schema',
-         'why': 'Per Sieve Rule #1668 (confidence 0.98) this is required; '
-                'see also principle id:999 which does not exist.'},
+        # supported: the fix text shares the rule's actual vocabulary
+        {'title': 'Add Organization schema name and url',
+         'why': 'Your Organization schema must include the name and url '
+                'properties; add the logo too. Per Sieve Rule #1668.'},
+        # off-topic name-drop: rule 1668 is about org schema, not page speed
+        {'title': 'Improve page speed',
+         'why': 'Compress images to cut load time. Per Sieve Rule #1668.'},
         {'why': 'no brain references in this one'},
         'junk-not-a-dict',
     ]}}
@@ -634,9 +669,11 @@ def _selftest() -> None:
     f0 = audit3['narrative']['top_5_fixes'][0]
     assert [(x['kind'], x['id']) for x in f0.get('sources', [])] == [('rule', '1668')], f0
     assert f0['sources'][0]['source_url'] == 'https://schema.org/Organization', f0
-    assert 'sources' not in audit3['narrative']['top_5_fixes'][1]
-    assert s4 == {'applied': True, 'fixes_scanned': 2, 'refs_found': 2,
-                  'resolved': 1, 'unresolved': 1}, s4
+    f1 = audit3['narrative']['top_5_fixes'][1]
+    assert 'sources' not in f1, ('off-topic name-drop must NOT mint a source', f1)
+    assert 'sources' not in audit3['narrative']['top_5_fixes'][2]
+    assert s4['resolved'] == 1 and s4['unresolved'] == 1, s4
+    assert s4['rejected_offtopic'] == 1, ('the off-topic ref must be rejected, not stamped', s4)
     # Parser tolerates the real-world phrasings seen in production audits.
     assert _parse_refs('Schema.org Principle #1250 and anti-pattern id: 42 and Rule id=25694') == \
         [('principle', '1250'), ('ap', '42'), ('rule', '25694')], \

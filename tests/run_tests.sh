@@ -176,6 +176,14 @@ assert_contains "principles reachable, empty-mapping checks covered, AP confiden
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10h] Sieve binding Phase 3: deterministic rule_eval (mode C) + binding_gate verifier (mode B)"
+OUT=$(cd "${SERVICE_DIR}" && python3 rule_eval.py 2>&1)
+assert_contains "measured checks bound to a verbatim rule; unresolved/non-measured never mis-bound" "$OUT" "RULE_EVAL_OK"
+OUT=$(cd "${SERVICE_DIR}" && python3 binding_gate.py 2>&1)
+assert_contains "binding gate: existence + candidacy + support; hallucinated/off-topic ids rejected not stamped" "$OUT" "BINDING_GATE_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do

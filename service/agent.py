@@ -845,6 +845,25 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
         log.error('%scheck_id normalization failed: %s', f'[{audit_id[:8]}] ', e)
 
     # ------------------------------------------------------------------
+    # DETERMINISTIC RULE BINDING (mode C) — for MEASURED checks (status came
+    # from the deterministic scripts, not the LLM) bind a curated rule VERBATIM
+    # when its predicate holds. binding_verified=True by construction; these
+    # bindings can carry scoring weight (Phase 4). Runs after check_id
+    # canonicalization so the base letter is stable; unmapped bases get no
+    # binding, never a wrong one.
+    # ------------------------------------------------------------------
+    try:
+        from rule_eval import evaluate_measured_bindings
+        audit, rule_eval_stats = evaluate_measured_bindings(audit)
+        md["rule_binding"] = rule_eval_stats
+        log.info('%sdeterministic rule bindings: %d bound of %d measured findings',
+                 f'[{audit_id[:8]}] ', rule_eval_stats.get("bound", 0),
+                 rule_eval_stats.get("measured_findings", 0))
+    except Exception as e:
+        md["rule_binding"] = {"applied": False, "error": f"{type(e).__name__}: {e}"}
+        log.error('%sdeterministic rule binding failed: %s', f'[{audit_id[:8]}] ', e)
+
+    # ------------------------------------------------------------------
     # DETERMINISTIC CITATIONS — Phase 13 is a runtime responsibility now:
     # every fail/warn finding gets the top-3 query_brain citations,
     # replacing whatever subset the model chose (it cited only ~17% of
@@ -911,6 +930,46 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
                                     "error": f"{type(e).__name__}: {e}"}
         log.error('%scitation re-grounding failed: %s\n%s',
                   f'[{audit_id[:8]}] ', e, traceback.format_exc())
+
+    # ------------------------------------------------------------------
+    # BINDING VERIFICATION (mode B) — any LLM-authored bound_rule must survive
+    # three code tests: the id exists, it is a MEMBER of the candidate pool
+    # retrieval returns for this finding (kills hallucinated/prose-scraped ids),
+    # and the finding's evidence topically supports the rule. Never drops a
+    # finding; an unverified binding is flagged and excluded from scoring
+    # weight. Deterministic (mode-C) bindings pass through pre-verified. No-op
+    # until the model emits bound_rule (system_prompt Phase 13).
+    # ------------------------------------------------------------------
+    try:
+        from binding_gate import verify_bindings
+        from rule_eval import _default_resolver
+        _resolve = _default_resolver()
+
+        def _candidates_for(f):
+            try:
+                from tools import query_brain
+                cls = audit.get("classification") or {}
+                res = query_brain(f.get("check_id"), cls.get("page_type") or "homepage",
+                                  cls.get("industry") or "other", 8,
+                                  evidence=f.get("evidence") if isinstance(f.get("evidence"), str) else None)
+                out = set()
+                for c in (res or {}).get("citations", []):
+                    if isinstance(c, dict) and c.get("id") is not None:
+                        out.add((c.get("kind"), str(c.get("id"))))
+                return out
+            except Exception:
+                return set()
+
+        audit, gate_stats = verify_bindings(audit, _resolve, _candidates_for)
+        md["binding_verification"] = gate_stats
+        if gate_stats.get("bindings"):
+            log.info('%sbinding gate: %d verified, %d not-found, %d not-candidate, %d unsupported',
+                     f'[{audit_id[:8]}] ', gate_stats.get("verified", 0),
+                     gate_stats.get("not_found", 0), gate_stats.get("not_candidate", 0),
+                     gate_stats.get("unsupported", 0))
+    except Exception as e:
+        md["binding_verification"] = {"applied": False, "error": f"{type(e).__name__}: {e}"}
+        log.error('%sbinding verification failed: %s', f'[{audit_id[:8]}] ', e)
 
     # ------------------------------------------------------------------
     # FIX-SOURCE RESOLUTION — the top-fix WHY paragraphs reference brain

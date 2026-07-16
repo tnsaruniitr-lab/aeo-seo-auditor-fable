@@ -215,6 +215,16 @@ you need the underlying rule to judge a borderline case, or to write a fix's \
 WHY paragraph (e.g., "per Google's hreflang documentation"). Just never \
 transcribe the returned objects into the output.
 
+**Optional rule binding.** When you consulted a specific Sieve rule via \
+`query_brain` and it genuinely justifies your verdict for a check, you may \
+record that ONE rule on the finding as \
+`bound_rule: {"kind": "rule"|"principle"|"ap", "id": <id>}` — choose ONLY an \
+id you actually saw in a `query_brain` result for THIS check. The runtime \
+verifies every binding (the id exists, it was retrievable for this check, and \
+your evidence supports it) and flags any it cannot confirm, so never guess an \
+id. Omit `bound_rule` (or set it null) when unsure — measured checks are \
+bound automatically and citations are still attached by the runtime.
+
 **Phase 14a: Persist.** Persistence is automatic — the runtime saves the \
 audit to the database after you emit the final JSON. Do not call any tool \
 for this. Just make sure the final JSON is complete and well-formed.
