@@ -192,8 +192,16 @@ def _mark_cache_breakpoint(messages: List[Dict[str, Any]]) -> None:
             "cache_control": {"type": "ephemeral"},
         }]
         return
-    if isinstance(content, list) and content:
-        for blk in reversed(content):
+    # Walk messages newest-first: a pause_turn assistant message can consist
+    # entirely of server-tool blocks (no cacheable type) — fall back to the
+    # newest cacheable block in an earlier message rather than marking nothing
+    # (all older markers were just cleared, so returning empty-handed would
+    # re-bill the whole conversation at full price).
+    for m in reversed(messages):
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        for blk in reversed(c):
             if isinstance(blk, dict) and blk.get("type") in _CACHEABLE_BLOCK_TYPES:
                 blk["cache_control"] = {"type": "ephemeral"}
                 return

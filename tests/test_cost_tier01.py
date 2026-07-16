@@ -97,11 +97,22 @@ agent._mark_cache_breakpoint(msgs2)
 assert "cache_control" not in msg2["content"][1], "thinking block must not be marked"
 assert msg2["content"][0].get("cache_control") == {"type": "ephemeral"}
 
-# 3c. All-non-cacheable content: nothing marked, no crash.
+# 3c. All-non-cacheable content and no earlier message: nothing marked, no crash.
 msg3 = {"role": "assistant", "content": [{"type": "thinking", "thinking": "x",
                                           "signature": "s"}]}
 agent._mark_cache_breakpoint([msg3])
 assert "cache_control" not in msg3["content"][0]
+
+# 3c2. Last message all-server-blocks: marker falls back to the NEWEST
+#      cacheable block in an EARLIER message (otherwise the just-cleared
+#      conversation would have no breakpoint at all).
+prev = {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t",
+                                     "content": "ok"}]}
+tail = {"role": "assistant", "content": [{"type": "server_tool_use", "id": "s1",
+                                          "name": "web_search", "input": {}}]}
+agent._mark_cache_breakpoint([prev, tail])
+assert prev["content"][0].get("cache_control") == {"type": "ephemeral"}
+assert "cache_control" not in tail["content"][0]
 
 # 3d. String content still upgrades to a marked text block (unchanged path).
 msg4 = {"role": "user", "content": "plain"}
@@ -112,6 +123,17 @@ assert msg4["content"][0]["cache_control"] == {"type": "ephemeral"}
 agent._clear_cache_breakpoints(msgs)
 assert not any(isinstance(b, dict) and b.get("cache_control")
                for m in msgs for b in (m["content"] if isinstance(m["content"], list) else []))
+
+
+# 3f. Revert tripwire: the fix only works if the LOOP's append site dictifies
+#     the response content and the ceiling stays on the uncached estimator —
+#     assert against the actual loop source, not just the helpers.
+import inspect
+loop_src = inspect.getsource(agent.run_agent_loop)
+assert "_dictify_content(response.content)" in loop_src, \
+    "run_agent_loop must append dictified assistant content (pause_turn cache fix)"
+assert "estimate_cost_usd(input_tokens_total, output_tokens_total)" in loop_src, \
+    "abort ceiling must stay on the uncached estimator (frozen guardrail)"
 
 
 # ---------------------------------------------------------------------------
@@ -147,9 +169,10 @@ import ai_visibility as av
 summary = av._usage_summary({
     'anthropic': {'input_tokens': 1_000_000, 'output_tokens': 100_000,
                   'web_searches': 10},
-    'openai': {'input_tokens': 1_000_000, 'output_tokens': 100_000},
+    'openai': {'input_tokens': 1_000_000, 'output_tokens': 100_000,
+               'web_searches': 8},
 })
-exp = round(3.0 + 1.5 + 0.10 + 0.15 + 0.06, 4)
+exp = round(3.0 + 1.5 + 0.10 + 0.15 + 0.06 + 0.08, 4)
 assert summary['est_cost_usd'] == exp, (summary, exp)
 assert summary['per_engine']['anthropic']['web_searches'] == 10
 

@@ -72,10 +72,13 @@ def _engine_openai(query: str) -> Dict[str, Any]:
                             if u:
                                 urls.append(u)
                 _u = getattr(r, 'usage', None)
+                _searches = sum(1 for item in (getattr(r, 'output', None) or [])
+                                if getattr(item, 'type', '') == 'web_search_call')
                 return {'answer': getattr(r, 'output_text', '') or '',
                         'cited_urls': urls,
                         'usage': {'input_tokens': getattr(_u, 'input_tokens', 0) or 0,
-                                  'output_tokens': getattr(_u, 'output_tokens', 0) or 0}}
+                                  'output_tokens': getattr(_u, 'output_tokens', 0) or 0,
+                                  'web_searches': _searches}}
             except Exception as e:  # noqa: BLE001 — try the older tool name once
                 last_err = e
         raise last_err
@@ -238,6 +241,8 @@ _VIS_ANTH_OUT = float(os.getenv('PRICE_OUTPUT_PER_MTOK', '15.0'))
 _VIS_SEARCH = float(os.getenv('PRICE_PER_WEB_SEARCH', '0.01'))
 _VIS_OAI_IN = float(os.getenv('AI_VIS_OPENAI_PRICE_IN', '0.15'))
 _VIS_OAI_OUT = float(os.getenv('AI_VIS_OPENAI_PRICE_OUT', '0.60'))
+# OpenAI bills web_search tool calls per invocation, separately from tokens.
+_VIS_OAI_SEARCH = float(os.getenv('AI_VIS_OPENAI_PRICE_SEARCH', '0.01'))
 
 
 def _usage_summary(usage_totals: Dict[str, Dict[str, int]]) -> Dict[str, Any]:
@@ -252,6 +257,7 @@ def _usage_summary(usage_totals: Dict[str, Dict[str, int]]) -> Dict[str, Any]:
             cost += tot.get('web_searches', 0) * _VIS_SEARCH
         elif eng == 'openai':
             cost += i / 1e6 * _VIS_OAI_IN + o / 1e6 * _VIS_OAI_OUT
+            cost += tot.get('web_searches', 0) * _VIS_OAI_SEARCH
     return {'per_engine': usage_totals, 'est_cost_usd': round(cost, 4)}
 
 
