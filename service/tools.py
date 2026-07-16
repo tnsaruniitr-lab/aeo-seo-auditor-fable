@@ -356,7 +356,8 @@ def _get_brain():
 
 
 def query_brain(check_id: str, page_type: str = "homepage",
-                industry: str = "other", max_citations: int = 3) -> Dict[str, Any]:
+                industry: str = "other", max_citations: int = 3,
+                evidence: str = None) -> Dict[str, Any]:
     """Query the Sieve brain for citations relevant to a given check_id.
 
     Returns top-N rules + anti-patterns ranked by tier ASC, confidence DESC.
@@ -379,7 +380,8 @@ def query_brain(check_id: str, page_type: str = "homepage",
     # through to the snapshot ranker below. The static path is never touched.
     try:
         import sieve_brain
-        live = sieve_brain.live_citations(check_id, page_type, industry, max_citations)
+        live = sieve_brain.live_citations(check_id, page_type, industry, max_citations,
+                                          evidence=evidence)
         if live:
             return {
                 "check_id": check_id,

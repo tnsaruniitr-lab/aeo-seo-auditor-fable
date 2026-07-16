@@ -164,6 +164,12 @@ assert_contains "console routes registered, auth centralized at include, SourceS
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10f] Sieve binding Phase 1: evidence query + cosine floor + relevance-first sort + embed pinning"
+OUT=$(python3 "${SCRIPT_DIR}/test_sieve_binding.py" 2>&1)
+assert_contains "evidence query, off-topic floor, relevance beats authority across bands, DB cosine floor, embed guard" "$OUT" "SIEVE_BINDING_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do

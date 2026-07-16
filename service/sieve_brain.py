@@ -35,6 +35,20 @@ EMBED_MODEL = os.getenv('SIEVE_EMBED_MODEL', 'text-embedding-3-small')
 # monitoring has proven the DB stable.
 SIEVE_STRICT = os.getenv('SIEVE_STRICT', '') in ('1', 'true', 'True')
 
+# Phase 1 — retrieval floor. A citation must be RELEVANT, not merely
+# authoritative. Below the cosine floor a vector hit is noise; below the
+# ts_rank floor an FTS hit is noise. Env-tunable so a labelled sweep can
+# calibrate without a code change. When nothing clears the floor,
+# live_citations returns None and the caller falls to the snapshot path —
+# "we found nothing relevant" is now representable.
+SIEVE_MIN_RELEVANCE = float(os.getenv('SIEVE_MIN_RELEVANCE', '0.28'))   # cosine similarity
+SIEVE_MIN_TS_RANK = float(os.getenv('SIEVE_MIN_TS_RANK', '0.0'))        # ts_rank (@@ already gates)
+# Relevance is PRIMARY, authority a bounded tiebreak WITHIN a band: a tier-1
+# row far away can no longer outrank a tier-2 row that is on-topic. Rows whose
+# relevance falls in the same band are ordered by tier; rows in a better band
+# always win regardless of tier.
+RELEVANCE_BAND = float(os.getenv('SIEVE_RELEVANCE_BAND', '0.10'))
+
 
 class SieveLiveError(RuntimeError):
     """Live sieve DB was required (SIEVE_STRICT) but unavailable."""
@@ -120,13 +134,52 @@ _SECTION_HINT = {
 }
 
 
-def _query_for(check_id: str) -> str:
-    """Turn 'D6_required_fields' into 'required fields' + a section-topic hint."""
+def _query_for(check_id: str, evidence: Optional[str] = None) -> str:
+    """Build the retrieval query for a check.
+
+    The check-name body + section hint anchors the topic; the finding's OWN
+    evidence (what the auditor actually observed on THIS page) leads the query
+    so two findings on the same check with different problems retrieve
+    different rules. Evidence is normalized (lowercased, whitespace-collapsed,
+    truncated) so identical observations pin to the same embedding.
+    """
     clean = check_id.split(':', 1)[-1]
     m = re.match(r'^([A-Z])\d', clean)
     hint = _SECTION_HINT.get(m.group(1), '') if m else ''
     body = re.sub(r'^[A-Z]\d+[a-z]?_', '', clean).replace('_', ' ').strip()
-    return (body + ' ' + hint).strip() or clean
+    base = (body + ' ' + hint).strip() or clean
+    if evidence:
+        ev = re.sub(r'\s+', ' ', str(evidence)).strip().lower()[:200]
+        if ev:
+            return (ev + ' ' + base).strip()
+    return base
+
+
+def _relevance_floor_for(layer: Optional[str]) -> float:
+    """Per-layer noise floor: cosine vs ts_rank live on different scales."""
+    return SIEVE_MIN_TS_RANK if layer == 'fts' else SIEVE_MIN_RELEVANCE
+
+
+def _rank_and_floor(cites: List[Dict[str, Any]], max_citations: int) -> List[Dict[str, Any]]:
+    """Drop off-topic citations, then rank RELEVANCE-first with authority as a
+    bounded tiebreak within a relevance band. Pure + deterministic (id is the
+    final key) so it is unit-testable without a DB."""
+    kept = [c for c in cites
+            if float(c.get('relevance') or 0.0) >= _relevance_floor_for(c.get('retrieval_layer'))]
+
+    def sortkey(c: Dict[str, Any]):
+        rel = float(c.get('relevance') or 0.0)
+        # More-relevant band sorts first (negative so ASC puts best band first).
+        band = -int(rel / RELEVANCE_BAND) if RELEVANCE_BAND > 0 else 0
+        try:
+            conf = float(c.get('confidence_score') or 0.0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        return (band, c.get('tier', 5), -round(conf, 1), -round(rel, 4),
+                c.get('url_spec', 2), _prov_rank(c), c.get('kind') or '', str(c.get('id') or ''))
+
+    kept.sort(key=sortkey)
+    return kept[:max_citations]
 
 
 # ---------------------------------------------------------------------------
@@ -277,11 +330,30 @@ def _status_filter(cols: Optional[set]) -> str:
     return ""
 
 
-def _search_vector(cur, table, cfg, qvec_literal, k, cols=None):
+def _corpus_model(conn) -> Optional[str]:
+    """The embedding model the corpus was actually embedded with, recorded by
+    embed_brain into sieve.embedding_meta. None if unrecorded (older corpus) —
+    in which case we cannot detect a space mismatch and proceed as today."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT model FROM sieve.embedding_meta "
+                        "WHERE table_name = 'rules' ORDER BY embedded_at DESC LIMIT 1")
+            row = cur.fetchone()
+            return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _search_vector(cur, table, cfg, qvec_literal, k, cols=None, min_rel=None):
+    """Cosine search WITH a similarity floor: rows further than the floor are
+    excluded in-DB before LIMIT, so the top-k is drawn only from relevant rows
+    (never the nearest-of-the-irrelevant)."""
+    floor = SIEVE_MIN_RELEVANCE if min_rel is None else min_rel
     sql = _select_head(cfg, '1 - (t.embedding <=> %s::vector)', cols).format(table=table) + \
         " WHERE t.embedding IS NOT NULL" + _status_filter(cols) + \
+        " AND (1 - (t.embedding <=> %s::vector)) >= %s" + \
         " ORDER BY t.embedding <=> %s::vector LIMIT %s"
-    cur.execute(sql, (qvec_literal, qvec_literal, k))
+    cur.execute(sql, (qvec_literal, qvec_literal, floor, qvec_literal, k))
     return cur.fetchall()
 
 
@@ -321,6 +393,7 @@ def _row_to_cite(r) -> Dict[str, Any]:
         'relevance': round(float(r.get('score') or 0.0), 4),
         'url_spec': _url_spec(r.get('source_url')),
         'url_provenance': r.get('url_provenance'),
+        'retrieval_layer': r.get('_layer', 'vector'),
         'from': 'sieve-live',
     }
 
@@ -356,11 +429,18 @@ def _url_spec(u: Optional[str]) -> int:
 
 def live_citations(check_id: str, page_type: Optional[str] = None,
                    industry: Optional[str] = None,
-                   max_citations: int = 3) -> Optional[List[Dict[str, Any]]]:
+                   max_citations: int = 3,
+                   evidence: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
     """Return citation dicts for a check from the live brain, or None so the
     caller falls back to the snapshot path. Never raises — EXCEPT under
     SIEVE_STRICT, where a live-brain failure raises SieveLiveError so the
-    audit fails loudly instead of silently citing the April snapshot."""
+    audit fails loudly instead of silently citing the April snapshot.
+
+    Retrieval is EVIDENCE-based (the finding's observation leads the query),
+    RELEVANCE-floored (off-topic hits are dropped, not the nearest-of-noise),
+    and ranked relevance-first with authority a bounded tiebreak. If the
+    corpus embedding model differs from SIEVE_EMBED_MODEL the vector layer is
+    refused (falls to FTS) rather than cosine-comparing incompatible spaces."""
     if not live_enabled():
         return None
     try:
@@ -369,36 +449,55 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
     except Exception:
         return None
 
-    query = _query_for(check_id)
+    query = _query_for(check_id, evidence)
     words = list(dict.fromkeys(re.findall(r'[a-zA-Z0-9][a-zA-Z0-9-]{2,}', query.lower())))
     ts_query = ' OR '.join(words) or query
     per_table_k = max(8, max_citations * 4)
 
     rows: List[Dict[str, Any]] = []
+    degraded: Optional[str] = None
     try:
         conn = psycopg2.connect(SIEVE_DB_URL, connect_timeout=10)
         conn.autocommit = True
         try:
             cols_by_table = _optional_cols(conn)
-            qvec_lit = _pinned_query_vec(conn, query)    # None => FTS-only
+            # Embedding-space guard: a same-dimension model swap (e.g. ada-002
+            # vs 3-small, both 1536-d) yields a VALID `<=>` across incompatible
+            # spaces — no error, wrong neighbours cited as authoritative. Refuse
+            # the vector layer on a recorded mismatch.
+            corpus_model = _corpus_model(conn)
+            if corpus_model and corpus_model != EMBED_MODEL:
+                if SIEVE_STRICT:
+                    raise SieveLiveError(
+                        f'embedding-space mismatch: corpus={corpus_model} runtime={EMBED_MODEL}')
+                log.warning('embedding model mismatch (corpus=%s runtime=%s) — using FTS',
+                            corpus_model, EMBED_MODEL)
+                degraded = 'embed_model_mismatch'
+                qvec_lit = None
+            else:
+                qvec_lit = _pinned_query_vec(conn, query)    # None => FTS-only
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 for table, cfg in _TABLE_CFG.items():
                     cols = cols_by_table.get(table, set())
                     found = []
+                    layer = 'vector'
                     try:
                         if qvec_lit:
                             found = _search_vector(cur, table, cfg, qvec_lit, per_table_k, cols)
                         else:
+                            layer = 'fts'
                             found = _search_fts(cur, table, cfg, ts_query, per_table_k, cols)
                     except Exception as te:
                         # e.g. no embedding column yet -> fall back to FTS for this table
                         log.info('vector search on %s failed (%s), trying FTS', table, te)
                         try:
+                            layer = 'fts'
                             found = _search_fts(cur, table, cfg, ts_query, per_table_k, cols)
                         except Exception:
                             found = []
                     for r in found:
                         r['kindtag'] = cfg['kind']
+                        r['_layer'] = layer
                     rows += found
         finally:
             conn.close()
@@ -412,19 +511,16 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
         return None
 
     cites = [_row_to_cite(r) for r in rows]
+    if degraded:
+        for c in cites:
+            c['retrieval_degraded'] = degraded
 
-    # Authority-first ranking: tier ASC, confidence DESC, match-score DESC, then
-    # a gentle preference for a specific source URL, then kind + id (kind breaks
-    # the rules/principles id-space collision deterministically).
-    # Bucket confidence (1dp) and match-score (2dp) so that among equally
-    # authoritative, ~equally relevant candidates the MORE SPECIFIC source URL
-    # wins — a citation should link to the precise doc page, not a generic hub,
-    # when the choice is otherwise a wash. Deterministic (id is the final key).
-    cites.sort(key=lambda c: (
-        c['tier'], -round(float(c['confidence_score']), 1), -round(c['relevance'], 2),
-        c.get('url_spec', 2), _prov_rank(c), c.get('kind') or '', str(c['id'] or '')
-    ))
-    return cites[:max_citations]
+    # RELEVANCE-first, floored ranking (Phase 1). Off-topic hits are dropped;
+    # authority only reorders WITHIN a relevance band. If nothing clears the
+    # floor, return None so the caller falls to the snapshot path rather than
+    # emitting confident-but-irrelevant tier-1 citations.
+    ranked = _rank_and_floor(cites, max_citations)
+    return ranked or None
 
 
 def stats() -> Dict[str, Any]:

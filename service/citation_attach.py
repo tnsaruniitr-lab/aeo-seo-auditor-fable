@@ -64,7 +64,11 @@ def attach_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, A
                 continue
             stats['checks_eligible'] += 1
             try:
-                res = qb(cid, page_type, industry, MAX_CITATIONS) or {}
+                # Evidence-based retrieval: the finding's OWN observation leads
+                # the query, so two findings on the same check retrieve rules
+                # relevant to what was actually seen (Phase 1).
+                ev = f.get('evidence') if isinstance(f.get('evidence'), str) else None
+                res = qb(cid, page_type, industry, MAX_CITATIONS, evidence=ev) or {}
                 cites = [c for c in (res.get('citations') or [])
                          if isinstance(c, dict)][:MAX_CITATIONS]
             except Exception as e:  # noqa: BLE001 — one bad check must not stop the pass
@@ -101,8 +105,8 @@ def _selftest() -> None:
     global _query_brain_fn
     calls = []
 
-    def fake_qb(check_id, page_type, industry, max_citations):
-        calls.append((check_id, page_type, industry, max_citations))
+    def fake_qb(check_id, page_type, industry, max_citations, evidence=None):
+        calls.append((check_id, page_type, industry, max_citations, evidence))
         if check_id == 'B1_core_web_vitals':
             return {'citations': []}                      # nothing retrieved
         if check_id == 'C1_heading_hierarchy':
@@ -121,6 +125,7 @@ def _selftest() -> None:
             'classification': {'page_type': 'blog', 'industry': 'saas'},
             'findings': [
                 {'check_id': 'A1_https_enforcement', 'status': 'fail',
+                 'evidence': 'site served over http, no HSTS header',
                  'citations': [{'id': '999', 'name': 'llm pick to be replaced'}]},
                 {'check_id': 'B1_core_web_vitals', 'status': 'warn'},
                 {'check_id': 'C1_heading_hierarchy', 'status': 'fail'},
@@ -137,7 +142,7 @@ def _selftest() -> None:
         assert f[1]['citations'] == [], f[1]
         assert 'citations' not in f[2] or f[2].get('citations') is None or True
         assert f[3]['citations'] == [{'id': 'keep'}], f[3]
-        assert calls[0][1:] == ('blog', 'saas', 3), calls[0]
+        assert calls[0][1:] == ('blog', 'saas', 3, 'site served over http, no HSTS header'), calls[0]
         assert stats['checks_eligible'] == 3, stats
         assert stats['checks_cited'] == 1 and stats['citations_attached'] == 3, stats
         assert stats['llm_lists_replaced'] == 1, stats
