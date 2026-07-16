@@ -140,6 +140,12 @@ assert_contains "siteContext sanitized leniently; prompt CONTEXT measured + narr
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10b2] Cost tier-0/1: true-cost shadow accounting + pause_turn cache-breakpoint fix + Phase-13 runtime citations + skip_visibility seam"
+OUT=$(cd "${SERVICE_DIR}" && python3 "${SCRIPT_DIR}/test_cost_tier01.py" 2>&1)
+assert_contains "cache fix marks dictified blocks + never non-cacheable types; ceiling metric frozen; Phase 13 mandate gone; skipVisibility accepted" "$OUT" "COST_TIER01_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[10c] Mobile parity + honest CWV labels + deterministic E-E-A-T subset (G1/G2/G7b/G7c)"
 OUT=$(python3 "${SCRIPT_DIR}/test_mobile_eeat.py" 2>&1)
 assert_contains "mobile flag + parity comparator + lab-CWV/INP honesty + byline/about-contact/editorial/schema-author checks; PCR weights unchanged" "$OUT" "MOBILE_EEAT_OK"

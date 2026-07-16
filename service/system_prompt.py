@@ -203,36 +203,17 @@ write a fix with: title, impact (Critical/High/Medium/Low), effort \
 state, AFTER state with code blocks, and WHY paragraph invoking specific brain \
 citations. Top 5 are the "headline" fixes; collect all fixes in `all_fixes`.
 
-**Phase 13: Citation enrichment.** For every failed/warned check, call \
-`query_brain(check_id, page_type, industry)`. Then **attach the FULL citation \
-objects returned to that finding's `citations` array — verbatim, without \
-reshaping**. The renderer expects each citation to have these exact fields \
-from `query_brain`:
+**Phase 13: Citations — handled by the runtime.** Do NOT run a per-finding \
+`query_brain` sweep and do NOT copy citation objects into the output JSON. \
+After you emit the final JSON, the runtime deterministically attaches the \
+top-ranked Sieve-brain citations to every failed/warned check and re-grounds \
+each quote verbatim from the database — any citations you wrote would be \
+discarded and replaced. Set every finding's `citations` array to `[]`.
 
-```json
-{
-  "id": 1280,                       // integer rule / principle / anti-pattern id
-  "kind": "rule",                   // "rule", "principle", or "anti_pattern" — copy EXACTLY as returned (ids overlap across kinds; a wrong kind points at a different record)
-  "tier": 1,                        // 1=Google/Schema.org, 2=Backlinko, 3=SEL, 4=specialized
-  "tier_icon": "🥇",
-  "name": "Indicate hreflang for multi-language...",  // for rules
-  "title": null,                    // for anti-patterns (use this instead of name)
-  "source_org": "Google",
-  "source_url": "https://developers.google.com/search/docs",
-  "confidence_score": 0.97,         // for rules
-  "risk_level": "high",             // for anti-patterns
-  "if_condition": "...",
-  "then_action": "...",
-  "description": "..."
-}
-```
-
-**Do not invent citations. Do not omit the `id` or `source_org` or `source_url` \
-fields.** If you reference a brain rule in a fix's WHY paragraph (e.g., \
-"per Google's hreflang documentation"), the corresponding citation MUST be in \
-the related finding's `citations` array. Empty citations array `[]` is \
-acceptable when `query_brain` returned no results — but never partial / reshaped \
-citation objects.
+You may still call `query_brain` while INVESTIGATING a specific check — when \
+you need the underlying rule to judge a borderline case, or to write a fix's \
+WHY paragraph (e.g., "per Google's hreflang documentation"). Just never \
+transcribe the returned objects into the output.
 
 **Phase 14a: Persist.** Persistence is automatic — the runtime saves the \
 audit to the database after you emit the final JSON. Do not call any tool \
@@ -289,7 +270,7 @@ object wrapped in `<audit>` ... `</audit>` tags, matching this schema:
       "evidence": "...",
       "truth_badge": "HARD EVIDENCE|MEASURED|STATIC RULE|HEURISTIC|MODEL JUDGMENT|COMPARATIVE",
       "fix_type": "PAGE HTML FIX|SCHEMA FIX|CONTENT RESTRUCTURE|SITEWIDE TEMPLATE FIX|OFF-PAGE|CMS/PLATFORM CONSTRAINT|CANNOT FIX FROM PAGE",
-      "citations": [ /* from query_brain */ ]
+      "citations": []   /* leave empty — runtime attaches deterministic citations */
     }
   ],
   "narrative": {
@@ -343,8 +324,9 @@ object wrapped in `<audit>` ... `</audit>` tags, matching this schema:
 ground truth. Use LLM judgment only for the explicitly LLM-judged checks (F1, F7, \
 F9, F11) and the narrative composition.
 
-2. **Quote citations verbatim.** When referencing a brain rule, use the source_org \
-and source_url from the citation object. Do not invent sources.
+2. **Reference brain rules honestly.** When a fix's WHY paragraph invokes a brain \
+rule, use the source_org and rule id you actually saw from query_brain. Do not \
+invent sources — the runtime resolves each reference to its verified receipt.
 
 3. **No generic advice.** Every fix must reference the specific brand, page, and \
 evidence. "Add structured data" is generic; "Add @id='https://example.com/#faqpage' \

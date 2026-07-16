@@ -141,7 +141,8 @@ except Exception:
 
 
 def run_audit(url: str, output_dir: str, progress_callback=None,
-              site_context: Optional[Dict[str, Any]] = None):
+              site_context: Optional[Dict[str, Any]] = None,
+              skip_visibility: bool = False):
     """Dispatch to the chosen audit pipeline.
 
     Modes:
@@ -169,8 +170,10 @@ def run_audit(url: str, output_dir: str, progress_callback=None,
     if mode == 'agent':
         return run_audit_agent(url, output_dir=output_dir, verbose=False,
                                 progress_callback=progress_callback,
-                                site_context=site_context)
-    # Deterministic path has no narrative to enrich — site_context is ignored.
+                                site_context=site_context,
+                                skip_visibility=skip_visibility)
+    # Deterministic path has no narrative to enrich — site_context is ignored
+    # (and it runs no visibility sweep, so skip_visibility is moot).
     return run_audit_deterministic(url, output_dir=output_dir)
 
 
@@ -2140,6 +2143,9 @@ def _run_audit_background(audit_id: str, url: str):
         JOBS[audit_id]['started_at'] = datetime.now(timezone.utc).isoformat()
         # Optional site-wide crawl context (API-start only; sanitized at intake)
         site_context = JOBS[audit_id].get('site_context')
+        # API-start callers may opt out of the visibility sweep (they measure
+        # it themselves); homepage submissions never set this → False.
+        skip_visibility = bool(JOBS[audit_id].get('skip_visibility'))
     if monitoring:
         monitoring.audit_started(audit_id, url, AUDIT_MODE)
 
@@ -2154,7 +2160,8 @@ def _run_audit_background(audit_id: str, url: str):
     try:
         result = run_audit(url, output_dir=str(OUTPUT_DIR),
                             progress_callback=_update_progress,
-                            site_context=site_context)
+                            site_context=site_context,
+                            skip_visibility=skip_visibility)
         elapsed = round(time.time() - started, 1)
 
         # Agent path returns an error envelope (no exception) when it can't
@@ -2529,6 +2536,10 @@ class StartAuditRequest(BaseModel):
     # to the field being absent). Narrative-only; never feeds scoring.
     site_context: Optional[Dict[str, Any]] = Field(default=None,
                                                    alias='siteContext')
+    # Callers that measure AI visibility themselves (AnswerMonk probes the
+    # same engines in its scoring phase) set this to skip the auditor's
+    # post-loop visibility sweep — identical audit otherwise, ~30% cheaper.
+    skip_visibility: bool = Field(default=False, alias='skipVisibility')
 
 
 class StartAuditResponse(BaseModel):
@@ -2838,6 +2849,7 @@ async def api_audit_start(req: StartAuditRequest,
             'error': None,
             'webhook_url': req.webhookUrl,
             'site_context': site_context,
+            'skip_visibility': bool(req.skip_visibility),
             'submitted_via': 'api',
             '_submitted_at': time.time(),
         }
