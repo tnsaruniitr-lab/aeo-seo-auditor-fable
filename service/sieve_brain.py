@@ -335,20 +335,25 @@ def _select_head(cfg, score_sql: str, cols: Optional[set] = None) -> str:
 
 
 def _trust_filter(cols: Optional[set]) -> str:
-    """Only TRUSTED, non-dead, uncontested guidance is citeable. The live sieve
-    taxonomy is active/candidate/deprecated/rejected (the old 'retired'/'superseded'
-    string statuses are gone — supersession is now the superseded_by FK). Each
-    clause is guarded by _optional_cols so this degrades cleanly on an older DB.
-    Excludes: deprecated+rejected (kept retired/superseded for back-compat),
-    contested='t' rows, and any row with superseded_by set."""
+    """Exclude only genuinely DEAD guidance — deprecated/rejected status and
+    superseded rows. Live taxonomy: active/candidate/deprecated/rejected (the old
+    'retired'/'superseded' strings are gone — supersession is the superseded_by
+    FK). Each clause is guarded by _optional_cols so this degrades on an older DB.
+
+    NOTE: we do NOT drop contested='t' rows. 'Contested' means a rule has a
+    conflicting counterpart (conflict_pair_id), NOT that it is wrong — and
+    blanket-excluding all contested rows discards ONE SIDE of every conflict,
+    including authoritative tier-1 guidance (measured: 1,403 rules incl. Google,
+    Schema.org, Backlinko, Ahrefs). Conflict resolution belongs in sieve-ingest
+    enrichment (pick the winner per pair, mark the loser superseded); until then,
+    keeping a contested-but-authoritative rule beats silently dropping it. When
+    the loser is marked superseded_by, THIS filter already excludes it."""
     if not cols:
         return ""
     clauses = []
     if 'status' in cols:
         clauses.append(
             "coalesce(t.status,'active') NOT IN ('deprecated','rejected','retired','superseded')")
-    if 'contested' in cols:
-        clauses.append("coalesce(t.contested,'f') <> 't'")
     if 'superseded_by' in cols:
         clauses.append("t.superseded_by IS NULL")
     return (" AND " + " AND ".join(clauses)) if clauses else ""

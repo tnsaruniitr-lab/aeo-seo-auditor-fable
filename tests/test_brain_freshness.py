@@ -19,10 +19,12 @@ def test_status_filter_sql():
     f = sieve_brain._trust_filter({'status'})
     assert "NOT IN ('deprecated','rejected'" in f
     assert "coalesce(t.status,'active')" in f
-    assert 'contested' not in f and 'superseded_by' not in f  # not probed => not applied
-    # With the new columns present, contested + superseded_by clauses appear.
+    assert 'superseded_by' not in f  # not probed => not applied
+    # superseded_by clause appears when present; contested is NOT dropped
+    # (dropping it discards one authoritative side of every conflict — 1,403
+    # tier-1/2 rules; conflict resolution belongs in enrichment).
     f2 = sieve_brain._trust_filter({'status', 'contested', 'superseded_by'})
-    assert "coalesce(t.contested,'f') <> 't'" in f2
+    assert "coalesce(t.contested,'f')" not in f2, "contested must NOT be filtered out"
     assert "t.superseded_by IS NULL" in f2
     # Empty / None => no filter (legacy DBs keep working); back-compat alias holds.
     assert sieve_brain._trust_filter(set()) == ''
