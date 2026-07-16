@@ -2715,6 +2715,7 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
             'evidenceTier': f.get('evidence_tier'),  # additive: 'measured' | 'llm-judged' | None (legacy audits)
             'citations': citations,                  # Phase 5: sourced receipts (was dropped here)
             'boundRule': _slim_bound_rule(f.get('bound_rule')),  # the verified rule this verdict binds to
+            'observed': f.get('observed'),           # D25/D27: the 'on YOUR page' proof half
         })
 
     total = len(failed_or_warn)

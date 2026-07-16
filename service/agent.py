@@ -303,6 +303,10 @@ def run_agent_loop(url: str, verbose: bool = False,
 
     tool_call_log: List[Dict[str, Any]] = []
     errors: List[str] = []
+    # Retain the FULL deterministic-scripts output (with each check's structured
+    # `detail`) so the post-loop chain can join the OBSERVED half of the proof
+    # onto the LLM's findings. The LLM only sees a slimmed copy.
+    det_scripts_output: Optional[Dict[str, Any]] = None
     input_tokens_total = 0
     output_tokens_total = 0
     cache_read_total = 0
@@ -505,6 +509,12 @@ def run_agent_loop(url: str, verbose: bool = False,
                           traceback.format_exc())
             elapsed_ms = int((time.time() - t0) * 1000)
 
+            # Capture the full deterministic output before it is slimmed for the
+            # model — this is the source of the OBSERVED proof (per-check detail).
+            if name == 'run_deterministic_scripts' and isinstance(result, dict) \
+                    and 'error' not in result:
+                det_scripts_output = result
+
             # Keep context tractable. Prefer structure-aware shrinking (drop
             # known-bulky, low-signal keys) over a blind byte-slice, which
             # would hand the model syntactically broken JSON of its own
@@ -602,6 +612,7 @@ def run_agent_loop(url: str, verbose: bool = False,
 
     return {
         "audit": audit,
+        "scripts_output": det_scripts_output,
         "raw_final_text": raw_final_text[:5000],
         "tool_calls": tool_call_log,
         "turns": turns,
@@ -843,6 +854,42 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
         md["check_id_normalization"] = {"applied": False,
                                         "error": f"{type(e).__name__}: {e}"}
         log.error('%scheck_id normalization failed: %s', f'[{audit_id[:8]}] ', e)
+
+    # ------------------------------------------------------------------
+    # OBSERVED PROOF (D25, agent path) — the LLM emits findings without the
+    # structured detail the deterministic scripts measured. Join it back by
+    # check_id so every finding carries observed{customer_url, measured_value,
+    # detail} — the 'on YOUR page, X=Y' half of the proof, alongside the
+    # authoritative citation. Additive; runs after check_ids are canonical.
+    # ------------------------------------------------------------------
+    try:
+        scripts_output = loop_result.get("scripts_output") or {}
+        all_checks = scripts_output.get("all_checks", {}) if isinstance(scripts_output, dict) else {}
+        by_clean = {str(k).split(":", 1)[-1]: v for k, v in all_checks.items()
+                    if isinstance(v, dict)}
+        joined = 0
+        for f in (audit.get("findings") or []):
+            if not isinstance(f, dict) or f.get("observed"):
+                continue
+            cd = by_clean.get(str(f.get("check_id")), {})
+            detail = cd.get("detail") if isinstance(cd.get("detail"), dict) else None
+            url = None
+            if detail:
+                url = detail.get("url") or detail.get("page_url") or detail.get("final_url")
+            url = url or scripts_output.get("final_url") or scripts_output.get("url")
+            if url or detail:
+                f["observed"] = {
+                    "customer_url": url,
+                    "measured_value": f.get("evidence") or None,
+                    "detail": detail,
+                    "method": f.get("evidence_tier", "measured"),
+                }
+                joined += 1
+        md["observed_join"] = {"applied": True, "joined": joined,
+                               "findings": len(audit.get("findings") or [])}
+    except Exception as e:
+        md["observed_join"] = {"applied": False, "error": f"{type(e).__name__}: {e}"}
+        log.error('%sobserved join failed: %s', f'[{audit_id[:8]}] ', e)
 
     # ------------------------------------------------------------------
     # DETERMINISTIC RULE BINDING (mode C) — for MEASURED checks (status came
