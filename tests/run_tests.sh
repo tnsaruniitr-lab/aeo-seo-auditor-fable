@@ -170,6 +170,12 @@ assert_contains "evidence query, off-topic floor, relevance beats authority acro
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10g] Sieve binding Phase 2: BM25 snapshot retrieval over all 3 kinds + neutral AP confidence + freshness"
+OUT=$(python3 "${SCRIPT_DIR}/test_sieve_snapshot.py" 2>&1)
+assert_contains "principles reachable, empty-mapping checks covered, AP confidence neutral not risk-derived, snapshot freshness stamped" "$OUT" "SIEVE_SNAPSHOT_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do

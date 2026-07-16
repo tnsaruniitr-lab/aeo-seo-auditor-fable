@@ -406,11 +406,28 @@ def query_brain(check_id: str, page_type: str = "homepage",
     resolved_id = _resolve_check_id(check_id, brain.check_to_rules)
 
     try:
-        citations = select_citations(
+        # Curated mapping first (highest-precision, hand-authored), then TOP UP
+        # with evidence-based BM25 search over all three kinds so the ~9.9k-row
+        # library and every principle are reachable — and the ~20 checks with an
+        # empty mapping (A2_title_tag, B1_ttfb, ...) no longer ship sourceless.
+        curated = select_citations(
             brain=brain, check_id=resolved_id,
             page_type=page_type, industry=industry,
             max_citations=max_citations,
         )
+        searched = []
+        if len(curated) < max_citations and hasattr(brain, "search"):
+            try:
+                import sieve_brain
+                query = sieve_brain._query_for(check_id, evidence)
+            except Exception:
+                query = check_id.replace("_", " ")
+            try:
+                searched = brain.search(query, max_citations * 3)
+            except Exception as se:  # noqa: BLE001 — search must never break query_brain
+                log.debug("snapshot search failed: %s", se)
+
+        citations = _merge_citations(curated, searched, max_citations)
         # Trim verbose fields
         for c in citations:
             for k in ("if_condition", "then_action", "description"):
@@ -420,9 +437,29 @@ def query_brain(check_id: str, page_type: str = "homepage",
             "check_id": check_id,
             "resolved_to": resolved_id if resolved_id != check_id else None,
             "citations": citations,
+            "source": "snapshot",
+            "snapshot_date": getattr(brain, "snapshot_date", None),
         }
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}", "citations": []}
+
+
+def _merge_citations(primary, secondary, max_citations):
+    """Curated ids first, then de-duped search results, capped at N. Preserves
+    the exact curated ordering for mapped checks (back-compat) while letting
+    search fill the remainder for thin/empty mappings."""
+    out, seen = [], set()
+    for c in list(primary) + list(secondary):
+        if not isinstance(c, dict):
+            continue
+        key = (c.get("kind"), c.get("id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+        if len(out) >= max_citations:
+            break
+    return out
 
 
 def _resolve_check_id(check_id: str, mappings: Dict[str, Any]) -> str:

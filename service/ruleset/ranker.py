@@ -41,8 +41,11 @@ VERSION
 from __future__ import annotations
 
 import json
+import math
 import os
-from dataclasses import dataclass
+import re
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
@@ -122,6 +125,8 @@ class BrainIndex:
     playbooks_by_id: Dict[int, dict]
     principles_by_id: Dict[int, dict]
     check_to_rules: Dict[str, dict]  # from brain-mappings.json
+    snapshot_date: Optional[str] = None   # brain-mappings 'last_curated'
+    _bm25_index: Optional[dict] = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_export_dir(cls, export_dir: str) -> 'BrainIndex':
@@ -134,20 +139,25 @@ class BrainIndex:
                 arr = json.load(f)
             return {entry['id']: entry for entry in arr if 'id' in entry}
 
+        snap_date = None
         def _load_mappings() -> Dict[str, dict]:
+            nonlocal snap_date
             path = os.path.join(export_dir, 'brain-mappings.json')
             if not os.path.exists(path):
                 return {}
             with open(path) as f:
                 data = json.load(f)
+            snap_date = data.get('last_curated')
             return data.get('mappings', {})
 
+        mappings = _load_mappings()
         return cls(
             rules_by_id=_load_array('rules-snapshot.json'),
             aps_by_id=_load_array('anti-patterns-snapshot.json'),
             playbooks_by_id=_load_array('playbooks-snapshot.json'),
             principles_by_id=_load_array('principles-snapshot.json'),
-            check_to_rules=_load_mappings(),
+            check_to_rules=mappings,
+            snapshot_date=snap_date,
         )
 
     def stats(self) -> Dict:
@@ -155,9 +165,137 @@ class BrainIndex:
             'rules': len(self.rules_by_id),
             'anti_patterns': len(self.aps_by_id),
             'playbooks': len(self.playbooks_by_id),
+            # principles are LOADED but were historically unreachable; search()
+            # (Phase 2) now retrieves them, so this count reflects real coverage.
             'principles': len(self.principles_by_id),
             'mapped_checks': len(self.check_to_rules),
         }
+
+    # ------------------------------------------------------------------
+    # Phase 2 — index-backed snapshot retrieval (BM25 over ALL three kinds).
+    # The old snapshot path could only ever cite the 141 hand-mapped ids and
+    # never a single principle. search() indexes rules + anti_patterns +
+    # principles and retrieves on the finding's EVIDENCE, so the ~9.9k-row
+    # library and every principle become reachable offline, with the same
+    # relevance-floored, relevance-first policy as the live path.
+    # ------------------------------------------------------------------
+    def _bm25(self) -> dict:
+        if self._bm25_index is None:
+            self.__dict__['_bm25_index'] = _build_bm25(self)
+        return self._bm25_index
+
+    def search(self, query: str, max_citations: int = 3,
+               kinds: Optional[tuple] = None,
+               min_score: Optional[float] = None) -> List[dict]:
+        return _bm25_search(self, query, max_citations, kinds, min_score)
+
+
+# BM25 (Okapi) over the snapshot corpus — stdlib only, built once, memoized.
+_BM25_K1 = 1.5
+_BM25_B = 0.75
+SNAPSHOT_MIN_SCORE = float(os.getenv('SIEVE_SNAPSHOT_MIN_SCORE', '2.0'))
+_NEUTRAL_AP_CONF = 0.75   # anti-patterns have no measured confidence; do NOT
+                          # fabricate one from risk_level (which inflated APs
+                          # past real high-confidence rules). risk_level is
+                          # carried as its own field for downstream weighting.
+_STOP = frozenset(
+    'the a an and or of to in for on with is are be as at by from this that it its into '
+    'over under about not no your you can should must if then when where which who what how'.split())
+_SEARCH_FIELDS = {
+    'rule':      ('name', 'if_condition', 'then_action'),
+    'ap':        ('title', 'description'),
+    'principle': ('title', 'statement', 'explanation'),
+}
+
+
+def _tok(text: Optional[str]) -> List[str]:
+    return [w for w in re.findall(r'[a-z0-9]+', (text or '').lower())
+            if len(w) >= 3 and w not in _STOP]
+
+
+def _doc_text(kind: str, row: dict) -> str:
+    return ' '.join(str(row.get(f) or '') for f in _SEARCH_FIELDS[kind])
+
+
+def _build_bm25(brain: 'BrainIndex') -> dict:
+    docs = []  # (kind, id, row)
+    for rid, r in brain.rules_by_id.items():
+        docs.append(('rule', rid, r))
+    for aid, a in brain.aps_by_id.items():
+        docs.append(('ap', aid, a))
+    for pid, p in brain.principles_by_id.items():
+        docs.append(('principle', pid, p))
+    tfs, doclen, df = [], [], Counter()
+    inv = defaultdict(list)
+    for i, (kind, _id, row) in enumerate(docs):
+        tf = Counter(_tok(_doc_text(kind, row)))
+        tfs.append(tf)
+        doclen.append(sum(tf.values()))
+        for t in tf:
+            df[t] += 1
+    N = len(docs)
+    avgdl = (sum(doclen) / N) if N else 0.0
+    idf = {t: math.log(1 + (N - d + 0.5) / (d + 0.5)) for t, d in df.items()}
+    for i, tf in enumerate(tfs):
+        for t, f in tf.items():
+            inv[t].append((i, f))
+    return {'docs': docs, 'idf': idf, 'inv': inv, 'doclen': doclen, 'avgdl': avgdl, 'N': N}
+
+
+def _bm25_search(brain: 'BrainIndex', query: str, max_citations: int,
+                 kinds: Optional[tuple], min_score: Optional[float]) -> List[dict]:
+    idx = brain._bm25()
+    floor = SNAPSHOT_MIN_SCORE if min_score is None else min_score
+    scores: Dict[int, float] = defaultdict(float)
+    for t in set(_tok(query)):
+        idf = idx['idf'].get(t)
+        if not idf or not idx['avgdl']:
+            continue
+        for i, f in idx['inv'].get(t, ()):
+            dl = idx['doclen'][i]
+            denom = f + _BM25_K1 * (1 - _BM25_B + _BM25_B * dl / idx['avgdl'])
+            if denom:
+                scores[i] += idf * (f * (_BM25_K1 + 1)) / denom
+    hits = []
+    for i, s in scores.items():
+        if s < floor:
+            continue
+        kind, _id, row = idx['docs'][i]
+        if kinds and kind not in kinds:
+            continue
+        hits.append(_snapshot_cite(kind, row, s, brain.snapshot_date))
+    # Relevance-first, tier a bounded tiebreak within an integer BM25 band.
+    hits.sort(key=lambda c: (
+        -int(c['relevance']), c['tier'], -_confidence_float(c),
+        c.get('kind') or '', c.get('id', 0)))
+    return hits[:max_citations]
+
+
+def _snapshot_cite(kind: str, row: dict, score: float, snapshot_date: Optional[str]) -> dict:
+    org = row.get('source_org')
+    tier = get_tier_rank(org)
+    cite = {
+        'id': row.get('id'), 'kind': kind,
+        'tier': tier, 'tier_icon': TIER_ICONS[tier],
+        'source_org': org, 'source_url': row.get('source_url'),
+        'name': row.get('name') or row.get('title'),
+        'if_condition': (row.get('if_condition') or row.get('statement')
+                         or row.get('description') or '')[:500],
+        'then_action': (row.get('then_action') or row.get('explanation') or '')[:500],
+        'domain_tag': row.get('domain_tag'),
+        'relevance': round(score, 4),
+        'retrieval_layer': 'bm25',
+        'from': 'snapshot', 'snapshot_date': snapshot_date,
+        'freshness': 'snapshot', 'last_verified': None,
+    }
+    if kind == 'ap':
+        cite['risk_level'] = row.get('risk_level')
+        cite['guidance_kind'] = 'avoid'
+        cite['confidence_score'] = str(_NEUTRAL_AP_CONF)
+    else:
+        cite['confidence_score'] = str(_confidence_float(row))
+        cite['guidance_kind'] = 'apply'
+    return cite
 
 
 # ----------------------------------------------------------------------
@@ -204,6 +342,8 @@ def select_citations(
 
     candidates: List[dict] = []
 
+    _snap = brain.snapshot_date
+
     # Collect rule candidates
     for rid in rule_ids:
         rule = brain.rules_by_id.get(rid)
@@ -214,6 +354,9 @@ def select_citations(
             'kind': 'rule',
             'tier': get_tier_rank(rule.get('source_org')),
             'tier_icon': TIER_ICONS[get_tier_rank(rule.get('source_org'))],
+            'guidance_kind': 'apply',
+            'from': 'snapshot', 'snapshot_date': _snap,
+            'freshness': 'snapshot', 'last_verified': None,
         })
 
     # Collect anti-pattern candidates
@@ -221,15 +364,20 @@ def select_citations(
         ap = brain.aps_by_id.get(apid)
         if not ap:
             continue
-        # APs use 'risk_level' instead of 'confidence_score' — translate
-        risk = ap.get('risk_level', 'medium')
-        ap_confidence = {'high': 0.95, 'medium': 0.80, 'low': 0.65}.get(risk, 0.75)
+        # APs have no measured confidence. DO NOT fabricate one from risk_level
+        # (that inflated high-risk APs above real high-confidence rules and
+        # collapsed two orthogonal axes into the sort key). Use a neutral
+        # constant for ranking; carry risk_level as its own field.
         candidates.append({
             **ap,
             'kind': 'ap',
             'tier': get_tier_rank(ap.get('source_org')),
             'tier_icon': TIER_ICONS[get_tier_rank(ap.get('source_org'))],
-            'confidence_score': str(ap_confidence),  # synthesized for sort
+            'risk_level': ap.get('risk_level', 'medium'),
+            'guidance_kind': 'avoid',
+            'confidence_score': str(_NEUTRAL_AP_CONF),   # neutral, not risk-derived
+            'from': 'snapshot', 'snapshot_date': _snap,
+            'freshness': 'snapshot', 'last_verified': None,
         })
 
     # Filter by page_type if rules carry tags (gracefully degrade if untagged)
