@@ -252,6 +252,28 @@ def classify_page_from_scripts(scripts_output: Dict, url: str) -> Dict:
 # STEP 3: ATTACH CITATIONS TO FAILED CHECKS
 # ----------------------------------------------------------------------
 
+def _observed_of(check_data: Dict, scripts_output: Dict) -> Dict:
+    """The OBSERVED half of a finding's proof: what the deterministic scripts
+    actually saw on the CUSTOMER'S page. Built from the per-check structured
+    `detail` (previously dropped at assembly) + the audited URL, so a finding
+    can say 'on <your-url>, we measured <X>' alongside the authoritative rule.
+    Additive; never raises."""
+    detail = check_data.get('detail')
+    detail = detail if isinstance(detail, dict) else None
+    url = None
+    if detail:
+        url = detail.get('url') or detail.get('page_url') or detail.get('final_url')
+    url = url or scripts_output.get('final_url') or scripts_output.get('url')
+    return {
+        'customer_url': url,
+        # human-readable measured summary; the raw structured observation rides
+        # in `detail` so nothing the scripts computed is lost.
+        'measured_value': check_data.get('evidence', '') or None,
+        'detail': detail,
+        'method': check_data.get('evidence_tier', 'measured'),
+    }
+
+
 def enrich_findings_with_citations(
     scripts_output: Dict,
     brain: BrainIndex,
@@ -261,7 +283,7 @@ def enrich_findings_with_citations(
     """Walk all_checks; for each failed/warned check, attach top 3 citations.
 
     Returns a list of finding dicts, each with:
-        {check_id, status, severity, evidence, citations: [...]}
+        {check_id, status, severity, evidence, observed{...}, citations: [...]}
     """
     findings = []
     all_checks = scripts_output.get('all_checks', {})
@@ -288,6 +310,11 @@ def enrich_findings_with_citations(
             'status': status,
             'severity': check_data.get('severity', 'medium'),
             'evidence': check_data.get('evidence', ''),
+            # Everything in all_checks came from the deterministic script
+            # suite — measured, never LLM-judged (evidence tiers, roadmap 0.1).
+            'evidence_tier': check_data.get('evidence_tier', 'measured'),
+            # D25: the OBSERVED half of the proof — no longer dropped.
+            'observed': _observed_of(check_data, scripts_output),
             'citations': citations,
         })
 
@@ -550,6 +577,8 @@ def compute_section_scores(scripts_output: Dict) -> Dict:
         findings.append({
             'check_id': clean,
             'status': (check or {}).get('status', 'na'),
+            # all_checks verdicts are script-computed → measured tier.
+            'evidence_tier': (check or {}).get('evidence_tier', 'measured'),
         })
 
     # Provide the Bot's-Eye-View context so scoring's transport gate can fire.
@@ -652,11 +681,18 @@ def render_markdown_report(audit: Dict) -> str:
     md.append("")
 
     md.append("## Per-Section Findings (Layer 2)\n")
-    md.append("| Status | Check ID | Severity | Evidence |")
-    md.append("|---|---|---|---|")
+    md.append("| Status | Check ID | Severity | Evidence Tier | Evidence |")
+    md.append("|---|---|---|---|---|")
     for f in findings[:50]:
         icon = {'fail': '✗', 'warn': '⚠'}.get(f['status'], '?')
-        md.append(f"| {icon} | {f['check_id']} | {f['severity']} | {f['evidence'][:140]} |")
+        # Evidence-tier badge (roadmap 0.1): [measured] = deterministic Python
+        # verdict from page bytes; [llm-judged] = LLM classification.
+        tier = f.get('evidence_tier')
+        if tier not in ('measured', 'llm-judged'):
+            from scoring import evidence_tier_for
+            tier = evidence_tier_for(f.get('check_id'))
+        md.append(f"| {icon} | {f['check_id']} | {f['severity']} | "
+                  f"[{tier}] | {f['evidence'][:140]} |")
     md.append("")
 
     md.append("## Brain Intelligence Applied\n")

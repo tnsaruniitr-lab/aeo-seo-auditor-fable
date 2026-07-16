@@ -38,6 +38,7 @@ sys.path.insert(0, str(THIS_DIR))
 
 from tools import TOOLS_SPEC, dispatch_tool, SERVER_TOOL_NAMES
 from system_prompt import SYSTEM_PROMPT
+from site_context import site_context_block, metadata_entry as site_context_metadata
 
 log = logging.getLogger('audit.agent')
 
@@ -68,8 +69,14 @@ TOTAL_BUDGET_SECONDS = 900
 # billing without bound. Sonnet 4.6 list price (USD per 1M tokens).
 PRICE_INPUT_PER_MTOK = float(os.getenv('PRICE_INPUT_PER_MTOK', '3.0'))
 PRICE_OUTPUT_PER_MTOK = float(os.getenv('PRICE_OUTPUT_PER_MTOK', '15.0'))
-# Cached-read tokens are ~10% of input price; we don't separate them in the
-# usage rollup here, so this estimate is a conservative upper bound.
+PRICE_CACHE_READ_PER_MTOK = float(os.getenv('PRICE_CACHE_READ_PER_MTOK', '0.30'))
+PRICE_CACHE_WRITE_PER_MTOK = float(os.getenv('PRICE_CACHE_WRITE_PER_MTOK', '3.75'))
+PRICE_PER_WEB_SEARCH = float(os.getenv('PRICE_PER_WEB_SEARCH', '0.01'))
+# NOTE: usage.input_tokens is only the UNCACHED remainder — with the moving
+# cache breakpoint most real input billing flows through cache_read/-creation.
+# The $2.50 ceiling deliberately stays on the uncached metric until the
+# true-spend distribution is measured in prod (see metadata.cost_usd_true);
+# recalibrating both together would silently change abort behavior.
 MAX_AUDIT_COST_USD = float(os.getenv('MAX_AUDIT_COST_USD', '2.50'))
 
 # Transient API failures that are worth retrying rather than scrapping a
@@ -77,12 +84,46 @@ MAX_AUDIT_COST_USD = float(os.getenv('MAX_AUDIT_COST_USD', '2.50'))
 RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 529})
 MAX_STREAM_RETRIES = int(os.getenv('MAX_STREAM_RETRIES', '4'))
 
+# AUDIT_TEMPERATURE (e.g. 0) pins classification variance — OPT-IN only:
+# temperature changes the classification DISTRIBUTION, so it must be validated
+# against back-to-back ground-truth audits before riding to prod as a default.
+# Parsed ONCE at import and fail-safe: a malformed value must degrade to
+# 'unset' with a loud log, never break every stream attempt with a ValueError
+# misattributed to the API.
+_TEMP_KW: dict = {}
+try:
+    _t = os.getenv('AUDIT_TEMPERATURE')
+    if _t not in (None, ''):
+        _TEMP_KW = {'temperature': float(_t)}
+except ValueError:
+    logging.getLogger('audit.agent').error(
+        'AUDIT_TEMPERATURE=%r is not a number — ignoring it', os.getenv('AUDIT_TEMPERATURE'))
+
 
 def estimate_cost_usd(input_tokens: int, output_tokens: int) -> float:
-    """Rough per-audit cost estimate in USD (list price, no cache discount)."""
+    """Uncached-traffic cost estimate in USD — the historical guardrail metric.
+    Excludes cache reads/writes and web_search fees; see estimate_cost_usd_true
+    for the full bill."""
     return round(
         input_tokens / 1_000_000 * PRICE_INPUT_PER_MTOK
         + output_tokens / 1_000_000 * PRICE_OUTPUT_PER_MTOK,
+        4,
+    )
+
+
+def estimate_cost_usd_true(input_tokens: int, output_tokens: int,
+                            cache_read_tokens: int = 0,
+                            cache_creation_tokens: int = 0,
+                            web_searches: int = 0) -> float:
+    """Full per-audit cost estimate: all four token buckets + web_search fees.
+    Shadow accounting only — logged and persisted, never wired to the abort
+    ceiling (that stays on estimate_cost_usd for behavioral continuity)."""
+    return round(
+        input_tokens / 1_000_000 * PRICE_INPUT_PER_MTOK
+        + output_tokens / 1_000_000 * PRICE_OUTPUT_PER_MTOK
+        + cache_read_tokens / 1_000_000 * PRICE_CACHE_READ_PER_MTOK
+        + cache_creation_tokens / 1_000_000 * PRICE_CACHE_WRITE_PER_MTOK
+        + web_searches * PRICE_PER_WEB_SEARCH,
         4,
     )
 
@@ -110,11 +151,37 @@ def _system_blocks():
     }]
 
 
+# Block types the API accepts cache_control on. Marking anything else (e.g. a
+# thinking block or a server-tool result) risks a 400, which would be worse
+# than a cache miss — walk backward to the newest markable block instead.
+_CACHEABLE_BLOCK_TYPES = frozenset({
+    "text", "tool_use", "tool_result", "image", "document",
+})
+
+
+def _dictify_content(content: Any) -> List[Any]:
+    """Convert SDK response content blocks (Pydantic objects) to plain
+    wire-shape dicts before appending them to `messages`. Without this, a
+    pause_turn continuation carried Pydantic blocks that
+    _mark_cache_breakpoint's isinstance(blk, dict) check silently skipped —
+    so the request had no conversation breakpoint and re-billed the ENTIRE
+    accumulated context at full input price, up to MAX_PAUSE_TURNS times."""
+    out: List[Any] = []
+    for blk in (content or []):
+        if isinstance(blk, dict):
+            out.append(blk)
+        elif hasattr(blk, "model_dump"):
+            out.append(blk.model_dump(mode="json", exclude_none=True))
+        else:
+            out.append(blk)
+    return out
+
+
 def _mark_cache_breakpoint(messages: List[Dict[str, Any]]) -> None:
-    """Add a cache_control breakpoint to the last block of the last message so
-    the entire conversation prefix (system + tools + all prior turns) is served
-    from cache on the next call. Mutates in place; safe on both string and
-    list-shaped message content."""
+    """Add a cache_control breakpoint to the newest cacheable block of the last
+    message so the conversation prefix (system + tools + all prior turns) is
+    served from cache on the next call. Mutates in place; safe on both string
+    and list-shaped message content."""
     if not messages:
         return
     last = messages[-1]
@@ -125,10 +192,19 @@ def _mark_cache_breakpoint(messages: List[Dict[str, Any]]) -> None:
             "cache_control": {"type": "ephemeral"},
         }]
         return
-    if isinstance(content, list) and content:
-        blk = content[-1]
-        if isinstance(blk, dict):
-            blk["cache_control"] = {"type": "ephemeral"}
+    # Walk messages newest-first: a pause_turn assistant message can consist
+    # entirely of server-tool blocks (no cacheable type) — fall back to the
+    # newest cacheable block in an earlier message rather than marking nothing
+    # (all older markers were just cleared, so returning empty-handed would
+    # re-bill the whole conversation at full price).
+    for m in reversed(messages):
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        for blk in reversed(c):
+            if isinstance(blk, dict) and blk.get("type") in _CACHEABLE_BLOCK_TYPES:
+                blk["cache_control"] = {"type": "ephemeral"}
+                return
 
 
 def _clear_cache_breakpoints(messages: List[Dict[str, Any]]) -> None:
@@ -185,7 +261,8 @@ def _derive_phase_label(tool_name: str, tool_input: Dict[str, Any],
 
 def run_agent_loop(url: str, verbose: bool = False,
                     log_prefix: str = '',
-                    progress_callback: Optional[Any] = None) -> Dict[str, Any]:
+                    progress_callback: Optional[Any] = None,
+                    site_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Drive the Claude tool-use loop until the agent emits <audit>...</audit>.
 
     Returns:
@@ -218,13 +295,23 @@ def run_agent_loop(url: str, verbose: bool = False,
             "Execute all 15 phases in order. Use the tools as specified. "
             "When finished, your FINAL message must be ONLY a single JSON "
             "object wrapped in <audit>...</audit> tags."
+            # Optional measured site-wide crawl signals (narrative-only —
+            # empty string when absent, keeping the prompt byte-identical).
+            + site_context_block(site_context)
         ),
     }]
 
     tool_call_log: List[Dict[str, Any]] = []
     errors: List[str] = []
+    # Retain the FULL deterministic-scripts output (with each check's structured
+    # `detail`) so the post-loop chain can join the OBSERVED half of the proof
+    # onto the LLM's findings. The LLM only sees a slimmed copy.
+    det_scripts_output: Optional[Dict[str, Any]] = None
     input_tokens_total = 0
     output_tokens_total = 0
+    cache_read_total = 0
+    cache_creation_total = 0
+    web_searches_total = 0
     raw_final_text = ""
     stop_reason = "unknown"
     turns = 0
@@ -287,6 +374,7 @@ def run_agent_loop(url: str, verbose: bool = False,
                     system=_system_blocks(),
                     tools=TOOLS_SPEC,
                     messages=messages,
+                    **_TEMP_KW,
                 ) as stream:
                     response = stream.get_final_message()
                 break
@@ -307,20 +395,32 @@ def run_agent_loop(url: str, verbose: bool = False,
         if response is None:
             break
 
-        input_tokens_total += response.usage.input_tokens
-        output_tokens_total += response.usage.output_tokens
+        usage = response.usage
+        input_tokens_total += usage.input_tokens
+        output_tokens_total += usage.output_tokens
+        turn_cache_read = getattr(usage, 'cache_read_input_tokens', 0) or 0
+        turn_cache_write = getattr(usage, 'cache_creation_input_tokens', 0) or 0
+        cache_read_total += turn_cache_read
+        cache_creation_total += turn_cache_write
+        _stu = getattr(usage, 'server_tool_use', None)
+        web_searches_total += (getattr(_stu, 'web_search_requests', 0) or 0) if _stu else 0
         stop_reason = response.stop_reason
 
-        log.info('%sturn=%d stop=%s in=%d out=%d',
+        log.info('%sturn=%d stop=%s in=%d out=%d cache_read=%d cache_write=%d',
                  pfx, turns, stop_reason,
-                 response.usage.input_tokens, response.usage.output_tokens)
+                 usage.input_tokens, usage.output_tokens,
+                 turn_cache_read, turn_cache_write)
         if verbose:
             print(f"[turn {turns}] stop={stop_reason} "
                   f"in={response.usage.input_tokens} "
                   f"out={response.usage.output_tokens}", flush=True)
 
-        # Append assistant turn (includes text + tool_use blocks)
-        messages.append({"role": "assistant", "content": response.content})
+        # Append assistant turn (includes text + tool_use blocks) as plain
+        # dicts — REQUIRED so _mark_cache_breakpoint can mark a block inside
+        # it on pause_turn continuations (Pydantic blocks were unmarkable and
+        # silently re-billed the whole conversation at full input price).
+        messages.append({"role": "assistant",
+                         "content": _dictify_content(response.content)})
 
         # Capture latest assistant text + log a preview of reasoning,
         # log server-tool invocations (which Anthropic dispatched itself).
@@ -408,6 +508,12 @@ def run_agent_loop(url: str, verbose: bool = False,
                 log.error('%s  dispatch crash %s: %s\n%s', pfx, name, e,
                           traceback.format_exc())
             elapsed_ms = int((time.time() - t0) * 1000)
+
+            # Capture the full deterministic output before it is slimmed for the
+            # model — this is the source of the OBSERVED proof (per-check detail).
+            if name == 'run_deterministic_scripts' and isinstance(result, dict) \
+                    and 'error' not in result:
+                det_scripts_output = result
 
             # Keep context tractable. Prefer structure-aware shrinking (drop
             # known-bulky, low-signal keys) over a blind byte-slice, which
@@ -499,18 +605,23 @@ def run_agent_loop(url: str, verbose: bool = False,
         log.error('%sfailed to extract usable audit JSON. raw_final_text len=%d preview=%s',
                   pfx, len(raw_final_text), raw_final_text[:300].replace('\n', ' \\n '))
 
-    log.info('%sloop done turns=%d stop=%s tokens=%d+%d errors=%d',
+    log.info('%sloop done turns=%d stop=%s tokens=%d+%d cache=%dr/%dw searches=%d errors=%d',
              pfx, turns, stop_reason, input_tokens_total, output_tokens_total,
+             cache_read_total, cache_creation_total, web_searches_total,
              len(errors))
 
     return {
         "audit": audit,
+        "scripts_output": det_scripts_output,
         "raw_final_text": raw_final_text[:5000],
         "tool_calls": tool_call_log,
         "turns": turns,
         "stop_reason": stop_reason,
         "input_tokens": input_tokens_total,
         "output_tokens": output_tokens_total,
+        "cache_read_tokens": cache_read_total,
+        "cache_creation_tokens": cache_creation_total,
+        "web_search_requests": web_searches_total,
         "errors": errors,
         "duration_seconds": round(time.time() - started, 1),
     }
@@ -525,6 +636,8 @@ def _fail(msg: str) -> Dict[str, Any]:
         "audit": None, "raw_final_text": "", "tool_calls": [],
         "turns": 0, "stop_reason": "error",
         "input_tokens": 0, "output_tokens": 0,
+        "cache_read_tokens": 0, "cache_creation_tokens": 0,
+        "web_search_requests": 0,
         "errors": [msg], "duration_seconds": 0,
     }
 
@@ -622,11 +735,24 @@ def _extract_audit_json(text: str, errors: List[str]):
 
 def run_audit_agent(url: str, output_dir: str = "./audits/",
                      verbose: bool = False,
-                     progress_callback: Optional[Any] = None) -> Dict[str, Any]:
+                     progress_callback: Optional[Any] = None,
+                     site_context: Optional[Dict[str, Any]] = None,
+                     skip_visibility: bool = False) -> Dict[str, Any]:
     """Run the agent loop, attach metadata, render artifacts, return result.
 
     Output shape matches the existing `run_audit()` from audit_pipeline.py so
     main.py and the rest of the FastAPI service work without changes.
+
+    site_context (optional, sanitized upstream): measured site-wide crawl
+    signals for this page. Fed to the agent as narrative-only CONTEXT and
+    recorded in metadata.site_context — it never enters scoring.
+
+    skip_visibility: set by callers that measure AI visibility themselves
+    (AnswerMonk's scoring phase already probes the same engines per session).
+    Skips the post-loop measure_visibility sweep — everything else (checks,
+    citations, scoring, report) is unaffected; the report's measured-
+    visibility section simply doesn't render, exactly as when no engine
+    keys are configured.
     """
     audit_id = str(uuid.uuid4())
     started = time.time()
@@ -638,7 +764,8 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
 
     loop_result = run_agent_loop(url, verbose=verbose,
                                   log_prefix=f'[{audit_id[:8]}] ',
-                                  progress_callback=progress_callback)
+                                  progress_callback=progress_callback,
+                                  site_context=site_context)
 
     audit = loop_result.get("audit")
 
@@ -661,6 +788,15 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
             "tool_call_count": len(loop_result.get("tool_calls", [])),
             "input_tokens": loop_result.get("input_tokens"),
             "output_tokens": loop_result.get("output_tokens"),
+            "cache_read_tokens": loop_result.get("cache_read_tokens"),
+            "cache_creation_tokens": loop_result.get("cache_creation_tokens"),
+            "web_search_requests": loop_result.get("web_search_requests"),
+            "cost_usd_true": estimate_cost_usd_true(
+                loop_result.get("input_tokens") or 0,
+                loop_result.get("output_tokens") or 0,
+                loop_result.get("cache_read_tokens") or 0,
+                loop_result.get("cache_creation_tokens") or 0,
+                loop_result.get("web_search_requests") or 0),
         }
 
     # Inject our authoritative metadata into the agent's audit
@@ -678,9 +814,26 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
     md["agent_stop_reason"] = loop_result.get("stop_reason")
     md["input_tokens"] = loop_result.get("input_tokens")
     md["output_tokens"] = loop_result.get("output_tokens")
+    md["cache_read_tokens"] = loop_result.get("cache_read_tokens")
+    md["cache_creation_tokens"] = loop_result.get("cache_creation_tokens")
+    md["web_search_requests"] = loop_result.get("web_search_requests")
     md["agent_errors"] = loop_result.get("errors", [])
     md["cost_usd"] = estimate_cost_usd(loop_result.get("input_tokens") or 0,
                                        loop_result.get("output_tokens") or 0)
+    # Shadow true-cost: all four token buckets + web_search fees. ai_visibility
+    # spend (if the sweep runs) is added below once its usage is known.
+    md["cost_usd_true"] = estimate_cost_usd_true(
+        loop_result.get("input_tokens") or 0,
+        loop_result.get("output_tokens") or 0,
+        loop_result.get("cache_read_tokens") or 0,
+        loop_result.get("cache_creation_tokens") or 0,
+        loop_result.get("web_search_requests") or 0)
+    # Site-wide crawl context this audit ran with (roadmap 1.4). Tagged as
+    # measured evidence, scoped to narrative severity only — additive metadata;
+    # absent context leaves the record shape untouched.
+    _sc_meta = site_context_metadata(site_context)
+    if _sc_meta:
+        md["site_context"] = _sc_meta
 
     # ------------------------------------------------------------------
     # CHECK-ID VOCABULARY — the model emits variant check_ids between runs
@@ -703,6 +856,61 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
         log.error('%scheck_id normalization failed: %s', f'[{audit_id[:8]}] ', e)
 
     # ------------------------------------------------------------------
+    # OBSERVED PROOF (D25, agent path) — the LLM emits findings without the
+    # structured detail the deterministic scripts measured. Join it back by
+    # check_id so every finding carries observed{customer_url, measured_value,
+    # detail} — the 'on YOUR page, X=Y' half of the proof, alongside the
+    # authoritative citation. Additive; runs after check_ids are canonical.
+    # ------------------------------------------------------------------
+    try:
+        scripts_output = loop_result.get("scripts_output") or {}
+        all_checks = scripts_output.get("all_checks", {}) if isinstance(scripts_output, dict) else {}
+        by_clean = {str(k).split(":", 1)[-1]: v for k, v in all_checks.items()
+                    if isinstance(v, dict)}
+        joined = 0
+        for f in (audit.get("findings") or []):
+            if not isinstance(f, dict) or f.get("observed"):
+                continue
+            cd = by_clean.get(str(f.get("check_id")), {})
+            detail = cd.get("detail") if isinstance(cd.get("detail"), dict) else None
+            url = None
+            if detail:
+                url = detail.get("url") or detail.get("page_url") or detail.get("final_url")
+            url = url or scripts_output.get("final_url") or scripts_output.get("url")
+            if url or detail:
+                f["observed"] = {
+                    "customer_url": url,
+                    "measured_value": f.get("evidence") or None,
+                    "detail": detail,
+                    "method": f.get("evidence_tier", "measured"),
+                }
+                joined += 1
+        md["observed_join"] = {"applied": True, "joined": joined,
+                               "findings": len(audit.get("findings") or [])}
+    except Exception as e:
+        md["observed_join"] = {"applied": False, "error": f"{type(e).__name__}: {e}"}
+        log.error('%sobserved join failed: %s', f'[{audit_id[:8]}] ', e)
+
+    # ------------------------------------------------------------------
+    # DETERMINISTIC RULE BINDING (mode C) — for MEASURED checks (status came
+    # from the deterministic scripts, not the LLM) bind a curated rule VERBATIM
+    # when its predicate holds. binding_verified=True by construction; these
+    # bindings can carry scoring weight (Phase 4). Runs after check_id
+    # canonicalization so the base letter is stable; unmapped bases get no
+    # binding, never a wrong one.
+    # ------------------------------------------------------------------
+    try:
+        from rule_eval import evaluate_measured_bindings
+        audit, rule_eval_stats = evaluate_measured_bindings(audit)
+        md["rule_binding"] = rule_eval_stats
+        log.info('%sdeterministic rule bindings: %d bound of %d measured findings',
+                 f'[{audit_id[:8]}] ', rule_eval_stats.get("bound", 0),
+                 rule_eval_stats.get("measured_findings", 0))
+    except Exception as e:
+        md["rule_binding"] = {"applied": False, "error": f"{type(e).__name__}: {e}"}
+        log.error('%sdeterministic rule binding failed: %s', f'[{audit_id[:8]}] ', e)
+
+    # ------------------------------------------------------------------
     # DETERMINISTIC CITATIONS — Phase 13 is a runtime responsibility now:
     # every fail/warn finding gets the top-3 query_brain citations,
     # replacing whatever subset the model chose (it cited only ~17% of
@@ -720,6 +928,9 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
                  attach_stats.get("citations_attached", 0),
                  attach_stats.get("llm_lists_replaced", 0))
     except Exception as e:
+        from sieve_brain import SieveLiveError
+        if isinstance(e, SieveLiveError):
+            raise  # SIEVE_STRICT: fail the audit rather than ship snapshot citations
         md["citation_attachment"] = {"applied": False,
                                      "error": f"{type(e).__name__}: {e}"}
         log.error('%scitation attachment failed: %s', f'[{audit_id[:8]}] ', e)
@@ -759,10 +970,53 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
                      ground_stats["regrounded_live"], ground_stats["regrounded_snapshot"],
                      ground_stats["unresolved"])
     except Exception as e:
+        from sieve_brain import SieveLiveError
+        if isinstance(e, SieveLiveError):
+            raise  # SIEVE_STRICT: fail the audit rather than ship snapshot citations
         md["citation_grounding"] = {"applied": False,
                                     "error": f"{type(e).__name__}: {e}"}
         log.error('%scitation re-grounding failed: %s\n%s',
                   f'[{audit_id[:8]}] ', e, traceback.format_exc())
+
+    # ------------------------------------------------------------------
+    # BINDING VERIFICATION (mode B) — any LLM-authored bound_rule must survive
+    # three code tests: the id exists, it is a MEMBER of the candidate pool
+    # retrieval returns for this finding (kills hallucinated/prose-scraped ids),
+    # and the finding's evidence topically supports the rule. Never drops a
+    # finding; an unverified binding is flagged and excluded from scoring
+    # weight. Deterministic (mode-C) bindings pass through pre-verified. No-op
+    # until the model emits bound_rule (system_prompt Phase 13).
+    # ------------------------------------------------------------------
+    try:
+        from binding_gate import verify_bindings
+        from rule_eval import _default_resolver
+        _resolve = _default_resolver()
+
+        def _candidates_for(f):
+            try:
+                from tools import query_brain
+                cls = audit.get("classification") or {}
+                res = query_brain(f.get("check_id"), cls.get("page_type") or "homepage",
+                                  cls.get("industry") or "other", 8,
+                                  evidence=f.get("evidence") if isinstance(f.get("evidence"), str) else None)
+                out = set()
+                for c in (res or {}).get("citations", []):
+                    if isinstance(c, dict) and c.get("id") is not None:
+                        out.add((c.get("kind"), str(c.get("id"))))
+                return out
+            except Exception:
+                return set()
+
+        audit, gate_stats = verify_bindings(audit, _resolve, _candidates_for)
+        md["binding_verification"] = gate_stats
+        if gate_stats.get("bindings"):
+            log.info('%sbinding gate: %d verified, %d not-found, %d not-candidate, %d unsupported',
+                     f'[{audit_id[:8]}] ', gate_stats.get("verified", 0),
+                     gate_stats.get("not_found", 0), gate_stats.get("not_candidate", 0),
+                     gate_stats.get("unsupported", 0))
+    except Exception as e:
+        md["binding_verification"] = {"applied": False, "error": f"{type(e).__name__}: {e}"}
+        log.error('%sbinding verification failed: %s', f'[{audit_id[:8]}] ', e)
 
     # ------------------------------------------------------------------
     # FIX-SOURCE RESOLUTION — the top-fix WHY paragraphs reference brain
@@ -789,18 +1043,34 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
     # competitors, and log every raw answer to public.ai_answer_runs.
     # Replaces inference with measurement; no-ops safely without keys.
     # ------------------------------------------------------------------
-    try:
-        from ai_visibility import measure_visibility
-        audit, vis_stats = measure_visibility(audit)
-        md["ai_visibility"] = vis_stats
-        if vis_stats.get("applied"):
-            log.info('%smeasured AI visibility: engines=%s runs=%d errors=%d',
-                     f'[{audit_id[:8]}] ', ','.join(vis_stats.get("engines", [])),
-                     vis_stats.get("runs_total", 0), vis_stats.get("errors", 0))
-    except Exception as e:
+    if skip_visibility:
+        # Caller (AnswerMonk) measures AI visibility itself in its scoring
+        # phase — running the sweep here would probe the same engines twice
+        # per audit and produce numbers the caller never reads.
         md["ai_visibility"] = {"applied": False,
-                               "error": f"{type(e).__name__}: {e}"}
-        log.error('%sai visibility failed: %s', f'[{audit_id[:8]}] ', e)
+                               "skipped": "caller measures visibility (skip_visibility)"}
+        log.info('%sai visibility skipped: caller measures visibility',
+                 f'[{audit_id[:8]}] ')
+    else:
+        try:
+            from ai_visibility import measure_visibility
+            audit, vis_stats = measure_visibility(audit)
+            md["ai_visibility"] = vis_stats
+            if vis_stats.get("applied"):
+                log.info('%smeasured AI visibility: engines=%s runs=%d errors=%d',
+                         f'[{audit_id[:8]}] ', ','.join(vis_stats.get("engines", [])),
+                         vis_stats.get("runs_total", 0), vis_stats.get("errors", 0))
+            # Fold the sweep's own spend into the shadow true-cost figure.
+            _vis_cost = (vis_stats.get("usage") or {}).get("est_cost_usd") \
+                if isinstance(vis_stats, dict) else None
+            if _vis_cost:
+                md["ai_visibility_cost_usd"] = _vis_cost
+                md["cost_usd_true"] = round(
+                    (md.get("cost_usd_true") or 0) + _vis_cost, 4)
+        except Exception as e:
+            md["ai_visibility"] = {"applied": False,
+                                   "error": f"{type(e).__name__}: {e}"}
+            log.error('%sai visibility failed: %s', f'[{audit_id[:8]}] ', e)
 
     # Render artifacts using the existing renderers from audit_pipeline.py
     # (they consume the same shape we produce).

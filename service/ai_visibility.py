@@ -71,7 +71,14 @@ def _engine_openai(query: str) -> Dict[str, Any]:
                             u = getattr(ann, 'url', None)
                             if u:
                                 urls.append(u)
-                return {'answer': getattr(r, 'output_text', '') or '', 'cited_urls': urls}
+                _u = getattr(r, 'usage', None)
+                _searches = sum(1 for item in (getattr(r, 'output', None) or [])
+                                if getattr(item, 'type', '') == 'web_search_call')
+                return {'answer': getattr(r, 'output_text', '') or '',
+                        'cited_urls': urls,
+                        'usage': {'input_tokens': getattr(_u, 'input_tokens', 0) or 0,
+                                  'output_tokens': getattr(_u, 'output_tokens', 0) or 0,
+                                  'web_searches': _searches}}
             except Exception as e:  # noqa: BLE001 — try the older tool name once
                 last_err = e
         raise last_err
@@ -89,7 +96,10 @@ def _engine_openai(query: str) -> Dict[str, Any]:
         u = getattr(uc, 'url', None) if uc else None
         if u:
             urls.append(u)
-    return {'answer': msg.content or '', 'cited_urls': urls}
+    _u = getattr(r, 'usage', None)
+    return {'answer': msg.content or '', 'cited_urls': urls,
+            'usage': {'input_tokens': getattr(_u, 'prompt_tokens', 0) or 0,
+                      'output_tokens': getattr(_u, 'completion_tokens', 0) or 0}}
 
 
 def _engine_anthropic(query: str) -> Dict[str, Any]:
@@ -117,7 +127,13 @@ def _engine_anthropic(query: str) -> Dict[str, Any]:
                 u = getattr(item, 'url', None)
                 if u:
                     urls.append(u)
-    return {'answer': ' '.join(answer_parts), 'cited_urls': urls}
+    _u = getattr(r, 'usage', None)
+    _stu = getattr(_u, 'server_tool_use', None) if _u else None
+    return {'answer': ' '.join(answer_parts), 'cited_urls': urls,
+            'usage': {'input_tokens': getattr(_u, 'input_tokens', 0) or 0,
+                      'output_tokens': getattr(_u, 'output_tokens', 0) or 0,
+                      'web_searches': (getattr(_stu, 'web_search_requests', 0) or 0)
+                      if _stu else 0}}
 
 
 def _available_engines() -> Dict[str, Callable[[str], Dict[str, Any]]]:
@@ -216,6 +232,36 @@ def _log_runs(rows: List[tuple]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Usage / cost accounting (shadow-only — never gates anything)
+# ---------------------------------------------------------------------------
+
+# Sweep list prices (USD per 1M tokens / per search), env-overridable.
+_VIS_ANTH_IN = float(os.getenv('PRICE_INPUT_PER_MTOK', '3.0'))
+_VIS_ANTH_OUT = float(os.getenv('PRICE_OUTPUT_PER_MTOK', '15.0'))
+_VIS_SEARCH = float(os.getenv('PRICE_PER_WEB_SEARCH', '0.01'))
+_VIS_OAI_IN = float(os.getenv('AI_VIS_OPENAI_PRICE_IN', '0.15'))
+_VIS_OAI_OUT = float(os.getenv('AI_VIS_OPENAI_PRICE_OUT', '0.60'))
+# OpenAI bills web_search tool calls per invocation, separately from tokens.
+_VIS_OAI_SEARCH = float(os.getenv('AI_VIS_OPENAI_PRICE_SEARCH', '0.01'))
+
+
+def _usage_summary(usage_totals: Dict[str, Dict[str, int]]) -> Dict[str, Any]:
+    """Aggregate per-engine token/search totals into a stats block with an
+    estimated dollar cost, so the sweep's spend is visible in metadata and
+    METRIC lines (it was previously invisible to all accounting)."""
+    cost = 0.0
+    for eng, tot in usage_totals.items():
+        i, o = tot.get('input_tokens', 0), tot.get('output_tokens', 0)
+        if eng == 'anthropic':
+            cost += i / 1e6 * _VIS_ANTH_IN + o / 1e6 * _VIS_ANTH_OUT
+            cost += tot.get('web_searches', 0) * _VIS_SEARCH
+        elif eng == 'openai':
+            cost += i / 1e6 * _VIS_OAI_IN + o / 1e6 * _VIS_OAI_OUT
+            cost += tot.get('web_searches', 0) * _VIS_OAI_SEARCH
+    return {'per_engine': usage_totals, 'est_cost_usd': round(cost, 4)}
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -256,6 +302,7 @@ def measure_visibility(audit: Dict[str, Any],
                 for eng in engines for (label, q) in queries for i in range(k)]
         raw: List[Dict[str, Any]] = []
         errors = 0
+        usage_totals: Dict[str, Dict[str, int]] = {}
         with ThreadPoolExecutor(max_workers=min(6, len(jobs) or 1)) as pool:
             futs = {pool.submit(engines[eng], q): (eng, label, q, i)
                     for (eng, label, q, i) in jobs}
@@ -267,6 +314,10 @@ def measure_visibility(audit: Dict[str, Any],
                                 'run': i, 'answer': (r.get('answer') or '')[:_ANSWER_CAP],
                                 'cited_urls': [u for u in (r.get('cited_urls') or [])
                                                if isinstance(u, str)][:40]})
+                    for key, val in (r.get('usage') or {}).items():
+                        if isinstance(val, int):
+                            tot = usage_totals.setdefault(eng, {})
+                            tot[key] = tot.get(key, 0) + val
                 except Exception as e:  # noqa: BLE001 — one bad call must not stop the sweep
                     errors += 1
                     log.warning('%s query "%s" run %d failed: %s', eng, label, i, e)
@@ -345,7 +396,8 @@ def measure_visibility(audit: Dict[str, Any],
         stats.update({'applied': True, 'engines': sorted(per_engine.keys()),
                       'queries': len(queries), 'runs_total': total_runs,
                       'errors': errors, 'answers_logged': logged,
-                      'target_inclusion': inclusion})
+                      'target_inclusion': inclusion,
+                      'usage': _usage_summary(usage_totals)})
     except Exception as e:  # noqa: BLE001
         log.error('ai visibility measurement failed: %s', e)
         stats = {'applied': False, 'error': f'{type(e).__name__}: {e}'}

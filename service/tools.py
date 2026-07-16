@@ -85,25 +85,153 @@ def _use_pg() -> bool:
 
 
 # ============================================================================
-# TOOL: render_page_js (Playwright)
+# TOOL: render_page_js (Playwright) — desktop pass + guarded mobile pass
 # ============================================================================
+
+# Mobile emulation profile + parity comparator + honest CWV labels (2.2).
+# Stdlib-only module; safe to import even where Playwright is absent.
+import mobile_parity
+
+_DESKTOP_UA = "Mozilla/5.0 (compatible; AEO-Auditor/1.0; +Playwright)"
+
+
+def _render_pass(browser, url: str, context_kwargs: Dict[str, Any]):
+    """One render pass in a fresh browser context. Returns (metrics, html).
+
+    Shared by the desktop pass and the mobile-emulation pass so both report
+    the identical metric set. LCP/CLS here are LAB values from this single
+    run (labeled by the caller); INP is never measured or fabricated.
+    """
+    ctx = browser.new_context(**context_kwargs)
+    try:
+        page = ctx.new_page()
+
+        console_errors: List[str] = []
+        page.on("console", lambda msg: console_errors.append(msg.text)
+                if msg.type == "error" else None)
+        request_count = [0]
+        page.on("request", lambda _: request_count.__setitem__(0, request_count[0] + 1))
+
+        t0 = time.time()
+        response = page.goto(url, wait_until="networkidle", timeout=30000)
+        load_time_ms = (time.time() - t0) * 1000
+
+        # TTFB from response timing
+        ttfb_ms = None
+        try:
+            timing = response.request.timing if response else None
+            if timing:
+                ttfb_ms = timing.get("responseStart")
+        except Exception:
+            pass
+
+        # LCP via PerformanceObserver — best-effort, LAB (single run)
+        try:
+            lcp = page.evaluate("""
+                () => new Promise((resolve) => {
+                    let lcp = null;
+                    try {
+                        new PerformanceObserver((list) => {
+                            const entries = list.getEntries();
+                            if (entries.length) lcp = entries[entries.length - 1].startTime;
+                        }).observe({type: 'largest-contentful-paint', buffered: true});
+                    } catch(e) {}
+                    setTimeout(() => resolve(lcp), 2000);
+                })
+            """)
+        except Exception:
+            lcp = None
+
+        # CLS — also best-effort, LAB (single run)
+        try:
+            cls = page.evaluate("""
+                () => new Promise((resolve) => {
+                    let cls = 0;
+                    try {
+                        new PerformanceObserver((list) => {
+                            for (const entry of list.getEntries()) {
+                                if (!entry.hadRecentInput) cls += entry.value;
+                            }
+                        }).observe({type: 'layout-shift', buffered: true});
+                    } catch(e) {}
+                    setTimeout(() => resolve(cls), 1500);
+                })
+            """)
+        except Exception:
+            cls = None
+
+        # SPA framework detection
+        spa = page.evaluate("""
+            () => {
+                const out = [];
+                if (window.__NEXT_DATA__) out.push('Next.js');
+                if (window.__NUXT__) out.push('Nuxt');
+                if (window.React || document.querySelector('[data-reactroot]')) out.push('React');
+                if (window.Vue) out.push('Vue');
+                if (window.ng) out.push('Angular');
+                return out;
+            }
+        """) or []
+
+        html = page.content()
+        title = page.title()
+        h1 = ""
+        try:
+            h1_node = page.query_selector("h1")
+            if h1_node:
+                h1 = (h1_node.inner_text() or "").strip()[:300]
+        except Exception:
+            pass
+
+        metrics = {
+            "post_js_html_size": len(html),
+            "title": title[:300],
+            "h1_first": h1,
+            "ttfb_ms": ttfb_ms,
+            "lcp_ms": lcp,
+            "cls": cls,
+            "load_time_ms": round(load_time_ms, 1),
+            "request_count": request_count[0],
+            "console_errors": console_errors[:20],
+            "spa_signals": spa,
+        }
+        return metrics, html
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
 
 def render_page_js(url: str) -> Dict[str, Any]:
     """Render a page with a real browser (Playwright + Chromium).
 
-    Returns post-JS HTML and performance metrics:
+    Runs a DESKTOP pass (original behavior) and — unless AUDIT_MOBILE_RENDER
+    is set to 0/false — a MOBILE emulation pass (viewport 390x844, DPR 3,
+    mobile UA, touch), then computes a deterministic mobile-vs-desktop
+    content-parity check.
+
+    Returns post-JS HTML and performance metrics (desktop fields unchanged,
+    mobile fields additive):
         {
           "url": str,
           "post_js_html_size": int,
           "title": str,
           "h1_first": str,
           "ttfb_ms": float,
-          "lcp_ms": float | None,
-          "cls": float | None,
+          "lcp_ms": float | None,   # LAB value — single run, not field data
+          "cls": float | None,      # LAB value — single run, not field data
           "load_time_ms": float,
           "request_count": int,
           "console_errors": [str],
-          "spa_signals": [str],   # detected frameworks (Next.js, React, etc.)
+          "spa_signals": [str],     # detected frameworks (Next.js, React, etc.)
+          "cwv_source": "lab (single run)",
+          "inp_note": str,          # INP requires CrUX field data — never fabricated
+          "mobile": { same metric keys | "skipped" | "error" },
+          "mobile_parity": {        # deterministic check, evidence_tier=measured
+            "check_id": "A9b_mobile_content_parity",
+            "status": "pass|warn|fail|na", "evidence": str, "detail": {...}
+          },
         }
     """
     try:
@@ -114,103 +242,44 @@ def render_page_js(url: str) -> Dict[str, Any]:
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-            ctx = browser.new_context(
-                user_agent="Mozilla/5.0 (compatible; AEO-Auditor/1.0; +Playwright)"
-            )
-            page = ctx.new_page()
-
-            console_errors: List[str] = []
-            page.on("console", lambda msg: console_errors.append(msg.text)
-                    if msg.type == "error" else None)
-            request_count = [0]
-            page.on("request", lambda _: request_count.__setitem__(0, request_count[0] + 1))
-
-            t0 = time.time()
-            response = page.goto(url, wait_until="networkidle", timeout=30000)
-            load_time_ms = (time.time() - t0) * 1000
-
-            # TTFB from response timing
-            ttfb_ms = None
             try:
-                timing = response.request.timing if response else None
-                if timing:
-                    ttfb_ms = timing.get("responseStart")
-            except Exception:
-                pass
+                desktop, desktop_html = _render_pass(
+                    browser, url, {"user_agent": _DESKTOP_UA})
+                result: Dict[str, Any] = {"url": url, **desktop}
+                # Honest CWV labeling: LCP/CLS above are lab numbers from ONE
+                # run. INP needs CrUX field data — publish the note, never a value.
+                result["cwv_source"] = mobile_parity.CWV_LAB_LABEL
+                result["inp_note"] = mobile_parity.INP_FIELD_NOTE
 
-            # LCP via PerformanceObserver — best-effort
-            try:
-                lcp = page.evaluate("""
-                    () => new Promise((resolve) => {
-                        let lcp = null;
-                        try {
-                            new PerformanceObserver((list) => {
-                                const entries = list.getEntries();
-                                if (entries.length) lcp = entries[entries.length - 1].startTime;
-                            }).observe({type: 'largest-contentful-paint', buffered: true});
-                        } catch(e) {}
-                        setTimeout(() => resolve(lcp), 2000);
-                    })
-                """)
-            except Exception:
-                lcp = None
+                if not mobile_parity.mobile_render_enabled():
+                    reason = (f"mobile render disabled via "
+                              f"{mobile_parity.MOBILE_FLAG_ENV}=0")
+                    result["mobile"] = {"skipped": reason}
+                    result["mobile_parity"] = mobile_parity.parity_na(reason)
+                else:
+                    # Mobile pass is best-effort: a failure here must never
+                    # cost the audit its desktop metrics (same graceful-skip
+                    # posture as the Playwright-missing path).
+                    try:
+                        mobile, mobile_html = _render_pass(
+                            browser, url, mobile_parity.mobile_context_kwargs())
+                        mobile["viewport"] = (
+                            f"{mobile_parity.MOBILE_VIEWPORT['width']}x"
+                            f"{mobile_parity.MOBILE_VIEWPORT['height']} "
+                            f"@{mobile_parity.MOBILE_DEVICE_SCALE_FACTOR}x (touch)")
+                        mobile["user_agent"] = mobile_parity.MOBILE_USER_AGENT
+                        mobile["cwv_source"] = mobile_parity.CWV_LAB_LABEL
+                        result["mobile"] = mobile
+                        result["mobile_parity"] = mobile_parity.parity_check(
+                            desktop_html, mobile_html)
+                    except Exception as me:  # noqa: BLE001 — degrade, don't raise
+                        result["mobile"] = {"error": f"{type(me).__name__}: {me}"}
+                        result["mobile_parity"] = mobile_parity.parity_na(
+                            f"mobile render failed: {type(me).__name__}")
+            finally:
+                browser.close()
 
-            # CLS — also best-effort
-            try:
-                cls = page.evaluate("""
-                    () => new Promise((resolve) => {
-                        let cls = 0;
-                        try {
-                            new PerformanceObserver((list) => {
-                                for (const entry of list.getEntries()) {
-                                    if (!entry.hadRecentInput) cls += entry.value;
-                                }
-                            }).observe({type: 'layout-shift', buffered: true});
-                        } catch(e) {}
-                        setTimeout(() => resolve(cls), 1500);
-                    })
-                """)
-            except Exception:
-                cls = None
-
-            # SPA framework detection
-            spa = page.evaluate("""
-                () => {
-                    const out = [];
-                    if (window.__NEXT_DATA__) out.push('Next.js');
-                    if (window.__NUXT__) out.push('Nuxt');
-                    if (window.React || document.querySelector('[data-reactroot]')) out.push('React');
-                    if (window.Vue) out.push('Vue');
-                    if (window.ng) out.push('Angular');
-                    return out;
-                }
-            """) or []
-
-            html = page.content()
-            title = page.title()
-            h1 = ""
-            try:
-                h1_node = page.query_selector("h1")
-                if h1_node:
-                    h1 = (h1_node.inner_text() or "").strip()[:300]
-            except Exception:
-                pass
-
-            browser.close()
-
-            return {
-                "url": url,
-                "post_js_html_size": len(html),
-                "title": title[:300],
-                "h1_first": h1,
-                "ttfb_ms": ttfb_ms,
-                "lcp_ms": lcp,
-                "cls": cls,
-                "load_time_ms": round(load_time_ms, 1),
-                "request_count": request_count[0],
-                "console_errors": console_errors[:20],
-                "spa_signals": spa,
-            }
+            return result
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}", "url": url}
 
@@ -287,7 +356,8 @@ def _get_brain():
 
 
 def query_brain(check_id: str, page_type: str = "homepage",
-                industry: str = "other", max_citations: int = 3) -> Dict[str, Any]:
+                industry: str = "other", max_citations: int = 3,
+                evidence: str = None) -> Dict[str, Any]:
     """Query the Sieve brain for citations relevant to a given check_id.
 
     Returns top-N rules + anti-patterns ranked by tier ASC, confidence DESC.
@@ -310,7 +380,8 @@ def query_brain(check_id: str, page_type: str = "homepage",
     # through to the snapshot ranker below. The static path is never touched.
     try:
         import sieve_brain
-        live = sieve_brain.live_citations(check_id, page_type, industry, max_citations)
+        live = sieve_brain.live_citations(check_id, page_type, industry, max_citations,
+                                          evidence=evidence)
         if live:
             return {
                 "check_id": check_id,
@@ -319,6 +390,11 @@ def query_brain(check_id: str, page_type: str = "homepage",
                 "source": "sieve-live",
             }
     except Exception as _live_err:  # noqa: BLE001 — never let live path break query_brain
+        # ...EXCEPT in strict mode: SIEVE_STRICT means the operator chose
+        # 'fail the audit' over 'silently cite the April snapshot'.
+        import sieve_brain as _sb
+        if isinstance(_live_err, _sb.SieveLiveError):
+            raise
         log.debug('live brain unavailable, using snapshot: %s', _live_err)
 
     try:
@@ -330,11 +406,28 @@ def query_brain(check_id: str, page_type: str = "homepage",
     resolved_id = _resolve_check_id(check_id, brain.check_to_rules)
 
     try:
-        citations = select_citations(
+        # Curated mapping first (highest-precision, hand-authored), then TOP UP
+        # with evidence-based BM25 search over all three kinds so the ~9.9k-row
+        # library and every principle are reachable — and the ~20 checks with an
+        # empty mapping (A2_title_tag, B1_ttfb, ...) no longer ship sourceless.
+        curated = select_citations(
             brain=brain, check_id=resolved_id,
             page_type=page_type, industry=industry,
             max_citations=max_citations,
         )
+        searched = []
+        if len(curated) < max_citations and hasattr(brain, "search"):
+            try:
+                import sieve_brain
+                query = sieve_brain._query_for(check_id, evidence)
+            except Exception:
+                query = check_id.replace("_", " ")
+            try:
+                searched = brain.search(query, max_citations * 3)
+            except Exception as se:  # noqa: BLE001 — search must never break query_brain
+                log.debug("snapshot search failed: %s", se)
+
+        citations = _merge_citations(curated, searched, max_citations)
         # Trim verbose fields
         for c in citations:
             for k in ("if_condition", "then_action", "description"):
@@ -344,9 +437,29 @@ def query_brain(check_id: str, page_type: str = "homepage",
             "check_id": check_id,
             "resolved_to": resolved_id if resolved_id != check_id else None,
             "citations": citations,
+            "source": "snapshot",
+            "snapshot_date": getattr(brain, "snapshot_date", None),
         }
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}", "citations": []}
+
+
+def _merge_citations(primary, secondary, max_citations):
+    """Curated ids first, then de-duped search results, capped at N. Preserves
+    the exact curated ordering for mapped checks (back-compat) while letting
+    search fill the remainder for thin/empty mappings."""
+    out, seen = [], set()
+    for c in list(primary) + list(secondary):
+        if not isinstance(c, dict):
+            continue
+        key = (c.get("kind"), c.get("id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+        if len(out) >= max_citations:
+            break
+    return out
 
 
 def _resolve_check_id(check_id: str, mappings: Dict[str, Any]) -> str:
@@ -886,12 +999,18 @@ TOOLS_SPEC = [
         "name": "render_page_js",
         "description": (
             "Render a URL with a real headless Chromium browser via Playwright. "
-            "Returns post-JS HTML size, title, first H1, performance metrics "
-            "(TTFB, LCP, CLS, load time, request count), console errors, and "
-            "detected SPA framework signals. Use for Phase 1.5 performance "
-            "measurement and to detect SPA-without-SSR cases. Slower than "
-            "web_fetch (~5–10s) — only use when JS rendering or perf metrics "
-            "are needed."
+            "Runs a desktop pass AND a mobile-emulation pass (390x844 @3x, "
+            "mobile UA, touch). Returns post-JS HTML size, title, first H1, "
+            "performance metrics (TTFB, LCP, CLS, load time, request count), "
+            "console errors, detected SPA framework signals, a `mobile` metric "
+            "block, and a deterministic `mobile_parity` check "
+            "(A9b_mobile_content_parity, evidence_tier=measured) comparing "
+            "rendered text volume, headings and title/H1/meta between the two "
+            "passes. LCP/CLS are LAB values from a single run (`cwv_source`); "
+            "INP is never measured here (`inp_note` — requires CrUX field "
+            "data). Use for Phase 1.5 performance measurement and to detect "
+            "SPA-without-SSR cases. Slower than web_fetch (~5–10s) — only use "
+            "when JS rendering or perf metrics are needed."
         ),
         "input_schema": {
             "type": "object",

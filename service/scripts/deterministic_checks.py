@@ -21,6 +21,27 @@ Checks implemented:
   C12b. date_modified_is_stale            — Flags dateModified that hasn't changed despite other edits (AnswerMonk stale stamp)
   A2b. title_uniqueness_sample            — Samples 3 URLs from sitemap, checks titles differ (catches SPA placeholder titles)
 
+Wired checks (roadmap 0.2 — previously defined in check-definitions.md but
+never executed; all pure page-data checks, canonical ids from
+brain-mappings.json):
+  A5.  robots_meta_indexing               — noindex via meta robots AND X-Robots-Tag, plus the robots.txt-vs-noindex contradiction
+  A1.  https_enforcement                  — http→https redirect, HSTS header presence
+  B9.  no_mixed_content                   — http:// subresources on an HTTPS page (active vs passive)
+  A3.  meta_description                   — presence, 120–160 length band, duplicate-of-title
+  C10. open_graph_tags                    — og:title / og:description / og:image presence
+  E4.  no_nosnippet_noarchive             — nosnippet / max-snippet:0 / data-nosnippet directives
+  E12. no_noarchive                       — noarchive directive (meta or header)
+
+E-E-A-T deterministic subset (roadmap 2.4 — measured inputs feeding the
+G-section LLM trust judgment; G1/G2 canonical ids, G7b/G7c sub-checks of G7):
+  G1.  author_byline                      — visible byline pattern / byline markup / schema author
+  G2.  author_schema_credentials          — Article author → Person/Org with sameAs|jobTitle|hasCredential
+  G7b. about_contact_discoverability      — about/contact/impressum links (nav/footer membership recorded)
+  G7c. editorial_policy_link              — editorial/review-policy link or publishingPrinciples schema
+
+Every check result carries evidence_tier='measured' (roadmap 0.1) — the
+verdict is computed by Python from real page bytes, never by the LLM.
+
 Each check returns:
   {
     "status": "pass" | "fail" | "warn" | "na",
@@ -1185,13 +1206,963 @@ def check_d14_hreflang_coverage(html):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Shared helpers for the header/meta-based checks (A5, A1, B9, A3, C10,
+# E4, E12 — the "defined but unexecuted" checks wired in roadmap item 0.2)
+# ──────────────────────────────────────────────────────────────────────────
+
+# Order- and quote-agnostic attribute extractor (same pattern A4b uses).
+_ATTR_PAT = r'''(?<![\w-]){name}\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))'''
+
+
+def _tag_attr(tag_html, name):
+    """Extract one attribute value from a single tag's HTML, or None."""
+    m = re.search(_ATTR_PAT.format(name=name), tag_html, re.IGNORECASE)
+    if not m:
+        return None
+    return html_unescape(next(g for g in m.groups() if g is not None).strip())
+
+
+def _meta_tags(html):
+    """Yield the raw HTML of every <meta ...> tag."""
+    for m in re.finditer(r'<meta\b[^>]*>', html or '', re.IGNORECASE):
+        yield m.group(0)
+
+
+def _get_header(headers, name):
+    """Case-insensitive response-header lookup. Headers come from fetch() as a
+    plain dict with original casing; None/empty-safe."""
+    if not headers:
+        return None
+    target = name.lower()
+    for k, v in headers.items():
+        if str(k).lower() == target:
+            return v
+    return None
+
+
+# X-Robots-Tag directives that legitimately contain a colon (value-carrying);
+# everything else before a colon is a user-agent scope prefix to strip.
+_VALUED_ROBOTS_DIRECTIVES = (
+    'max-snippet', 'max-image-preview', 'max-video-preview', 'unavailable_after',
+)
+
+
+def _robots_directives(html, headers):
+    """Collect robots directives from meta robots/googlebot/bingbot tags AND
+    the X-Robots-Tag response header. Returns [(source, directive), ...] with
+    directives lowercased (e.g. ('meta[name=robots]', 'noindex'))."""
+    out = []
+    for tag_html in _meta_tags(html):
+        name = (_tag_attr(tag_html, 'name') or '').strip().lower()
+        if name not in ('robots', 'googlebot', 'bingbot'):
+            continue
+        content = _tag_attr(tag_html, 'content') or ''
+        for d in content.split(','):
+            d = d.strip().lower()
+            if d:
+                out.append((f'meta[name={name}]', d))
+    xrt = _get_header(headers, 'X-Robots-Tag') or ''
+    for part in str(xrt).split(','):
+        d = part.strip().lower()
+        if not d:
+            continue
+        # UA-scoped form "googlebot: noindex" — strip the UA prefix, but keep
+        # value-carrying directives like "max-snippet:0" intact.
+        if ':' in d:
+            left, right = d.split(':', 1)
+            if left.strip() not in _VALUED_ROBOTS_DIRECTIVES:
+                d = right.strip()
+        if d:
+            out.append(('x-robots-tag', d))
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CHECK A5: robots meta / X-Robots-Tag indexing + robots.txt contradiction
+# ──────────────────────────────────────────────────────────────────────────
+
+def check_a5_robots_meta_indexing(html, headers, page_url,
+                                  robots_txt=None, robots_status=None):
+    """A5 — Robots meta allows indexing.
+
+    Checks noindex via BOTH the meta robots tag AND the X-Robots-Tag response
+    header, and flags the robots.txt-vs-noindex contradiction the 2026 report
+    warns about: a page blocked by robots.txt can never surface its noindex to
+    crawlers, so the URL can stay indexed ("indexed, though blocked").
+
+    `robots_txt`/`robots_status` are injectable for offline tests; when None,
+    robots.txt is fetched from the page's origin (SSRF-guarded fetch()).
+    """
+    directives = _robots_directives(html, headers)
+    # 'none' == noindex + nofollow per Google's robots meta spec.
+    noindex_sources = sorted({src for src, d in directives
+                              if d in ('noindex', 'none')})
+
+    # robots.txt evaluation (for the contradiction check)
+    robots_blocked = None
+    robots_note = ''
+    if robots_txt is None and robots_status is None:
+        m = re.match(r'(https?://[^/]+)', str(page_url or ''))
+        if m:
+            body, _, st, _, _ = fetch(m.group(1) + '/robots.txt', timeout=10)
+            robots_txt, robots_status = body, st
+    if robots_txt is not None:
+        st = robots_status if robots_status is not None else 200
+        if st == 200:
+            try:
+                from check_robots_txt import (
+                    parse_robots_txt, find_matching_groups, evaluate_path_access)
+                parsed_rb = parse_robots_txt(robots_txt)
+                pu = urllib.parse.urlparse(str(page_url or ''))
+                path = pu.path or '/'
+                if pu.query:
+                    path += '?' + pu.query
+                groups = find_matching_groups(parsed_rb, 'Googlebot')
+                allowed, why = evaluate_path_access(groups, path)
+                robots_blocked = not allowed
+                robots_note = why
+            except Exception as e:
+                robots_note = f'robots.txt parse failed: {type(e).__name__}'
+        elif 400 <= (st or 0) < 500:
+            robots_blocked = False
+            robots_note = f'robots.txt HTTP {st} — permissive default (no robots.txt)'
+        else:
+            robots_note = (f'robots.txt unavailable (HTTP {st}) — '
+                           f'contradiction not assessable')
+
+    detail = {
+        'noindex_sources': noindex_sources,
+        'directives': [f'{s}: {d}' for s, d in directives][:20],
+        'robots_txt_blocked': robots_blocked,
+        'robots_txt_note': robots_note,
+    }
+
+    if noindex_sources and robots_blocked:
+        return {
+            'status': 'fail',
+            'severity': 'critical',
+            'evidence': (
+                f'Contradiction: the page carries noindex '
+                f'({", ".join(noindex_sources)}) AND its path is blocked by '
+                f'robots.txt ({robots_note}). Crawlers that obey robots.txt '
+                f'never fetch the page, so they cannot see the noindex — the '
+                f'URL can remain indexed ("indexed, though blocked by '
+                f'robots.txt"). Unblock the path if the noindex is intentional.'),
+            'detail': detail,
+        }
+    if noindex_sources:
+        return {
+            'status': 'fail',
+            'severity': 'critical',
+            'evidence': (
+                f'Page opts out of indexing: noindex directive found via '
+                f'{", ".join(noindex_sources)}. Search and answer engines '
+                f'will drop this page from their indexes.'),
+            'detail': detail,
+        }
+    evidence = ('No noindex directive in meta robots or X-Robots-Tag — '
+                'the page allows indexing.')
+    if robots_blocked:
+        evidence += (f' Note: robots.txt blocks this path ({robots_note}) — '
+                     f'crawl access is the binding constraint (see A10).')
+    return {'status': 'pass', 'severity': 'critical',
+            'evidence': evidence, 'detail': detail}
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CHECK A1: HTTPS enforcement (http→https redirect + HSTS)
+# ──────────────────────────────────────────────────────────────────────────
+
+def check_a1_https_enforcement(input_url, final_url, headers,
+                               redirect_chain=None, http_probe=None):
+    """A1 — HTTPS enforcement.
+
+    Verifies: the page is served over HTTPS, the http:// variant redirects to
+    https:// (probed, unless the initial fetch already demonstrated it), and
+    the Strict-Transport-Security header is present.
+
+    `http_probe` ({'final_url':..., 'status':...}) is injectable for offline
+    tests; when None the http:// variant is fetched via the SSRF-guarded
+    fetch().
+    """
+    fu = str(final_url or input_url or '')
+    final_https = fu.lower().startswith('https://')
+    hsts = _get_header(headers, 'Strict-Transport-Security')
+    detail = {
+        'final_url': fu,
+        'hsts_present': bool(hsts),
+        'hsts_value': str(hsts or '')[:120],
+    }
+
+    if not final_https:
+        return {
+            'status': 'fail',
+            'severity': 'critical',
+            'evidence': f'Page is served over HTTP, not HTTPS (final URL: {fu}).',
+            'detail': detail,
+        }
+
+    redirect_enforced = None
+    probe_note = ''
+    if str(input_url or '').lower().startswith('http://'):
+        # The initial fetch itself went http → https: redirect demonstrated.
+        redirect_enforced = True
+        probe_note = ('input URL was http:// and resolved to https:// '
+                      '(redirect observed on the initial fetch)')
+    else:
+        if http_probe is None:
+            http_url = 'http://' + re.sub(r'^https://', '', fu,
+                                          flags=re.IGNORECASE)
+            _, probe_final, probe_status, _, probe_chain = fetch(
+                http_url, timeout=10)
+            http_probe = {'final_url': probe_final, 'status': probe_status,
+                          'hops': len(probe_chain)}
+        detail['http_probe'] = http_probe
+        pf = str(http_probe.get('final_url') or '').lower()
+        ps = http_probe.get('status') or 0
+        if ps == 0:
+            redirect_enforced = None
+            probe_note = ('http:// variant unreachable (port 80 closed or '
+                          'timeout) — no insecure fallback exposed')
+        elif pf.startswith('https://'):
+            redirect_enforced = True
+            probe_note = f'http:// variant redirects to https:// (final HTTP {ps})'
+        else:
+            redirect_enforced = False
+            probe_note = (f'http:// variant serves HTTP {ps} at '
+                          f'{http_probe.get("final_url")} without redirecting '
+                          f'to https://')
+    detail['redirect_enforced'] = redirect_enforced
+    detail['probe_note'] = probe_note
+
+    if redirect_enforced is False:
+        return {
+            'status': 'fail',
+            'severity': 'critical',
+            'evidence': (f'HTTPS not enforced: {probe_note}. The page has a '
+                         f'live insecure duplicate.'),
+            'detail': detail,
+        }
+    if hsts:
+        return {
+            'status': 'pass',
+            'severity': 'critical',
+            'evidence': (f'HTTPS enforced ({probe_note}) and '
+                         f'Strict-Transport-Security is set '
+                         f'({str(hsts)[:80]}).'),
+            'detail': detail,
+        }
+    return {
+        'status': 'warn',
+        'severity': 'critical',
+        'evidence': (f'Served over HTTPS ({probe_note}) but the '
+                     f'Strict-Transport-Security (HSTS) header is missing — '
+                     f'first visits over http:// are not protected.'),
+        'detail': detail,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CHECK B9: mixed content (http:// subresources on an HTTPS page)
+# ──────────────────────────────────────────────────────────────────────────
+
+# Subresource tags whose http:// references browsers BLOCK (active mixed
+# content) vs merely warn about (passive).
+_ACTIVE_MIXED_TAGS = frozenset({'script', 'iframe', 'embed', 'object', 'link'})
+_FETCHABLE_LINK_RELS = frozenset({
+    'stylesheet', 'icon', 'shortcut', 'apple-touch-icon', 'preload',
+    'prefetch', 'modulepreload', 'manifest', 'mask-icon',
+})
+
+
+def check_b9_mixed_content(html, final_url):
+    """B9 — no mixed content. Scans subresource tags (img, script, iframe,
+    link[rel=stylesheet/icon/...], media) for literal http:// references on an
+    HTTPS page. <a href> is navigation, not mixed content, and is ignored;
+    likewise <link rel="canonical"/"alternate"> (pointers, not fetched)."""
+    if not str(final_url or '').lower().startswith('https://'):
+        return {
+            'status': 'na',
+            'evidence': 'Page is not served over HTTPS — mixed content not applicable.',
+            'detail': {},
+        }
+
+    active, passive = [], []
+    for m in re.finditer(
+            r'<(img|script|iframe|embed|object|source|audio|video|track|link)\b[^>]*>',
+            html or '', re.IGNORECASE):
+        tag = m.group(1).lower()
+        tag_html = m.group(0)
+        if tag == 'link':
+            rel_tokens = set((_tag_attr(tag_html, 'rel') or '').lower().split())
+            if not (rel_tokens & _FETCHABLE_LINK_RELS):
+                continue  # canonical/alternate/etc. are not fetched subresources
+        urls = []
+        for attr in ('src', 'href', 'data', 'poster'):
+            v = _tag_attr(tag_html, attr)
+            if v and v.lower().startswith('http://'):
+                urls.append(v)
+        for cand in (_tag_attr(tag_html, 'srcset') or '').split(','):
+            u = cand.strip().split(' ')[0]
+            if u.lower().startswith('http://'):
+                urls.append(u)
+        if not urls:
+            continue
+        (active if tag in _ACTIVE_MIXED_TAGS else passive).extend(urls)
+
+    detail = {
+        'active_count': len(active), 'passive_count': len(passive),
+        'active_examples': active[:5], 'passive_examples': passive[:5],
+    }
+    if active:
+        return {
+            'status': 'fail',
+            'severity': 'high',
+            'evidence': (
+                f'{len(active)} active mixed-content reference(s) (script/'
+                f'iframe/stylesheet over http:// — browsers BLOCK these) '
+                f'plus {len(passive)} passive. Examples: {active[:3]}'),
+            'detail': detail,
+        }
+    if passive:
+        return {
+            'status': 'warn',
+            'severity': 'high',
+            'evidence': (
+                f'{len(passive)} passive mixed-content reference(s) '
+                f'(images/media loaded over http:// on an HTTPS page). '
+                f'Examples: {passive[:3]}'),
+            'detail': detail,
+        }
+    return {
+        'status': 'pass',
+        'severity': 'high',
+        'evidence': 'No http:// subresources found on this HTTPS page.',
+        'detail': detail,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CHECK A3: meta description (presence, length band, duplicate-of-title)
+# ──────────────────────────────────────────────────────────────────────────
+
+def check_a3_meta_description(html):
+    """A3 — meta description present, 120–160 chars, not a copy of <title>."""
+    descs = []
+    for tag_html in _meta_tags(html):
+        name = (_tag_attr(tag_html, 'name') or '').strip().lower()
+        if name == 'description':
+            descs.append((_tag_attr(tag_html, 'content') or '').strip())
+    non_empty = [d for d in descs if d]
+    title = extract_title_from_html(html or '') or ''
+
+    if not non_empty:
+        return {
+            'status': 'fail',
+            'severity': 'high',
+            'evidence': ('No meta description found (or its content is '
+                         'empty). Search and answer engines will synthesize '
+                         'their own snippet.'),
+            'detail': {'tag_count': len(descs)},
+        }
+
+    desc = non_empty[0]
+    length = len(desc)
+
+    def _norm(s):
+        return re.sub(r'\s+', ' ', s).strip().lower()
+
+    duplicates_title = bool(title) and _norm(desc) == _norm(title)
+    detail = {
+        'length': length,
+        'description': desc[:220],
+        'duplicates_title': duplicates_title,
+        'tag_count': len(descs),
+    }
+    multi_note = (f' ({len(non_empty)} description tags found — engines use '
+                  f'the first)' if len(non_empty) > 1 else '')
+
+    if duplicates_title:
+        return {
+            'status': 'warn',
+            'severity': 'high',
+            'evidence': (f'Meta description is an exact copy of the <title> '
+                         f'("{desc[:80]}"). Write a distinct 120–160 char '
+                         f'summary.{multi_note}'),
+            'detail': detail,
+        }
+    if 120 <= length <= 160:
+        return {
+            'status': 'pass',
+            'severity': 'high',
+            'evidence': (f'Meta description present, {length} chars '
+                         f'(target band 120–160).{multi_note}'),
+            'detail': detail,
+        }
+    band = 'short' if length < 120 else 'long'
+    return {
+        'status': 'warn',
+        'severity': 'high',
+        'evidence': (f'Meta description present but too {band}: {length} '
+                     f'chars (target band 120–160).{multi_note}'),
+        'detail': detail,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CHECK C10: Open Graph basics (og:title / og:description / og:image)
+# ──────────────────────────────────────────────────────────────────────────
+
+def check_c10_open_graph(html):
+    """C10 — Open Graph basics. Requires og:title, og:description and
+    og:image; reports og:type presence in detail."""
+    og = {}
+    for tag_html in _meta_tags(html):
+        prop = (_tag_attr(tag_html, 'property')
+                or _tag_attr(tag_html, 'name') or '').strip().lower()
+        if not prop.startswith('og:'):
+            continue
+        content = (_tag_attr(tag_html, 'content') or '').strip()
+        if content and prop not in og:
+            og[prop] = content
+    required = ('og:title', 'og:description', 'og:image')
+    present = [k for k in required if og.get(k)]
+    missing = [k for k in required if not og.get(k)]
+    detail = {
+        'present': present,
+        'missing': missing,
+        'og_type': og.get('og:type'),
+        'all_og_keys': sorted(og.keys())[:15],
+    }
+    type_note = ('' if og.get('og:type')
+                 else ' og:type is also missing (recommended).')
+    if not present:
+        return {
+            'status': 'fail',
+            'severity': 'medium',
+            'evidence': ('No Open Graph tags found — shares and AI link '
+                         'previews fall back to guessed title/image.'),
+            'detail': detail,
+        }
+    if missing:
+        return {
+            'status': 'warn',
+            'severity': 'medium',
+            'evidence': (f'Open Graph incomplete: missing '
+                         f'{", ".join(missing)}.{type_note}'),
+            'detail': detail,
+        }
+    return {
+        'status': 'pass',
+        'severity': 'medium',
+        'evidence': ('og:title, og:description and og:image all present.'
+                     + type_note),
+        'detail': detail,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CHECK E4: no nosnippet / max-snippet:0 (snippets available to answer engines)
+# ──────────────────────────────────────────────────────────────────────────
+
+def check_e4_nosnippet_directives(html, headers):
+    """E4 — no nosnippet/max-snippet:0. Reads meta robots AND X-Robots-Tag;
+    also flags data-nosnippet attributes (partial snippet blocking)."""
+    directives = _robots_directives(html, headers)
+    nosnippet = [f'{s}: {d}' for s, d in directives if d == 'nosnippet']
+    max0, max_small = [], []
+    for s, d in directives:
+        m = re.match(r'max-snippet\s*:\s*(-?\d+)', d)
+        if not m:
+            continue
+        n = int(m.group(1))
+        if n == 0:
+            max0.append(f'{s}: {d}')
+        elif 0 < n < 50:
+            max_small.append(f'{s}: {d}')
+    data_nosnippet = len(re.findall(r'\bdata-nosnippet\b', html or '',
+                                    re.IGNORECASE))
+    detail = {
+        'nosnippet': nosnippet,
+        'max_snippet_zero': max0,
+        'max_snippet_small': max_small,
+        'data_nosnippet_attrs': data_nosnippet,
+    }
+    if nosnippet or max0:
+        return {
+            'status': 'fail',
+            'severity': 'critical',
+            'evidence': (
+                f'Snippets are disabled: {", ".join(nosnippet + max0)}. '
+                f'Search and AI answer engines cannot quote this page — it '
+                f'is effectively invisible in answers.'),
+            'detail': detail,
+        }
+    if max_small or data_nosnippet:
+        parts = []
+        if max_small:
+            parts.append(f'restrictive {", ".join(max_small)}')
+        if data_nosnippet:
+            parts.append(f'{data_nosnippet} data-nosnippet attribute(s)')
+        return {
+            'status': 'warn',
+            'severity': 'critical',
+            'evidence': (f'Partial snippet restrictions: {"; ".join(parts)}. '
+                         f'Quoted answers may be truncated or exclude key '
+                         f'content.'),
+            'detail': detail,
+        }
+    return {
+        'status': 'pass',
+        'severity': 'critical',
+        'evidence': ('No nosnippet/max-snippet:0 restrictions in meta robots '
+                     'or X-Robots-Tag.'),
+        'detail': detail,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# CHECK E12: no noarchive
+# ──────────────────────────────────────────────────────────────────────────
+
+def check_e12_noarchive(html, headers):
+    """E12 — no noarchive directive (meta robots or X-Robots-Tag). Cached
+    copies feed several answer engines; noarchive removes the page from them."""
+    directives = _robots_directives(html, headers)
+    hits = [f'{s}: {d}' for s, d in directives if d == 'noarchive']
+    detail = {'noarchive': hits}
+    if hits:
+        return {
+            'status': 'fail',
+            'severity': 'high',
+            'evidence': (f'noarchive directive present ({", ".join(hits)}) — '
+                         f'cached/archived copies are disabled; engines that '
+                         f'read from cache lose access to this page.'),
+            'detail': detail,
+        }
+    return {
+        'status': 'pass',
+        'severity': 'high',
+        'evidence': 'No noarchive directive in meta robots or X-Robots-Tag.',
+        'detail': detail,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# E-E-A-T deterministic subset (roadmap 2.4). These measure the objective
+# substrate of the G-section trust judgment — presence of bylines, About/
+# Contact discoverability, editorial-policy links, and schema-author linkage.
+# They FEED the LLM's G-section assessment as measured inputs; canonical ids
+# from brain-mappings.json (G1, G2 exact; G7b/G7c sub-checks of G7 following
+# the A2b/A4b/C12b convention — query_brain resolves them to G7).
+# ──────────────────────────────────────────────────────────────────────────
+
+def _iter_jsonld_items(html):
+    """Yield every dict node from all JSON-LD blocks, descending into @graph.
+    Shared walker for the G-section schema checks."""
+    for b in extract_jsonld_blocks(html):
+        try:
+            data = json.loads(b.strip())
+        except json.JSONDecodeError:
+            continue
+        stack = list(data) if isinstance(data, list) else [data]
+        while stack:
+            item = stack.pop()
+            if not isinstance(item, dict):
+                continue
+            yield item
+            graph = item.get('@graph')
+            if isinstance(graph, list):
+                stack.extend(g for g in graph if isinstance(g, dict))
+
+
+def _node_types(node):
+    """'@type' may be a string or a list — normalize to a list of strings."""
+    t = node.get('@type')
+    if isinstance(t, list):
+        return [x for x in t if isinstance(x, str)]
+    return [t] if isinstance(t, str) else []
+
+
+# Visible byline patterns. The bare "By <Name>" form requires TWO capitalized
+# tokens (first + last name) to avoid matching prose like "by using". The
+# explicit verb forms accept a single capitalized name. The verb/label part is
+# case-insensitive via a scoped (?i:...) group; the NAME tokens stay
+# case-SENSITIVE — that capitalization requirement is the false-positive gate.
+_NAME_TOKEN = r"[A-Z][\w.'’-]+"
+_BYLINE_EXPLICIT_RE = re.compile(
+    r'\b(?i:written\s+by|authored\s+by|reviewed\s+by|'
+    r'medically\s+reviewed\s+by|posted\s+by|verfasst\s+von|'
+    r'geschrieben\s+von)[:\s]+('
+    + _NAME_TOKEN + r'(?:\s+' + _NAME_TOKEN + r'){0,3})')
+_BYLINE_BARE_RE = re.compile(
+    r'\b[Bb]y[:\s]+(' + _NAME_TOKEN + r'(?:\s+' + _NAME_TOKEN + r'){1,3})\b')
+_AUTHOR_LABEL_RE = re.compile(
+    r'\b(?i:author|autor)\s*:\s*(' + _NAME_TOKEN
+    + r'(?:\s+' + _NAME_TOKEN + r'){0,3})')
+
+# Byline-intent markup: rel=author, class/id/itemprop author|byline.
+_BYLINE_MARKUP_RE = re.compile(
+    r'''(?:rel\s*=\s*["']?author|itemprop\s*=\s*["']?author|'''
+    r'''(?:class|id)\s*=\s*["'][^"']*\b(?:byline|author)\b)''',
+    re.IGNORECASE)
+
+
+def _schema_author_names(html):
+    """Author names declared anywhere in JSON-LD ('author' property values,
+    string or Person/Organization node(s)). Sorted for determinism."""
+    names = set()
+    for item in _iter_jsonld_items(html):
+        author = item.get('author')
+        if author is None:
+            continue
+        vals = author if isinstance(author, list) else [author]
+        for a in vals:
+            if isinstance(a, str) and a.strip():
+                names.add(a.strip())
+            elif isinstance(a, dict):
+                n = a.get('name')
+                if isinstance(n, str) and n.strip():
+                    names.add(n.strip())
+    return sorted(names)
+
+
+def check_g1_author_byline(html):
+    """G1 — author byline visible (OR declared via schema author).
+
+    Measures the objective substrate of the E-E-A-T authorship judgment:
+    a visible byline pattern in the rendered text / byline-intent markup,
+    and/or an author declared in JSON-LD. pass = visibly bylined;
+    warn = schema-only (add a visible byline); fail = neither.
+    """
+    text = strip_tags(html)
+    visible_hits = []
+    for pat in (_BYLINE_EXPLICIT_RE, _AUTHOR_LABEL_RE, _BYLINE_BARE_RE):
+        for match in pat.finditer(text):
+            visible_hits.append(match.group(1).strip())
+    # de-dupe, keep first-seen order for stable evidence
+    seen = set()
+    visible_hits = [h for h in visible_hits
+                    if not (h in seen or seen.add(h))]
+    markup_hit = bool(_BYLINE_MARKUP_RE.search(html or ''))
+    schema_authors = _schema_author_names(html)
+
+    detail = {
+        'visible_byline_names': visible_hits[:5],
+        'byline_markup_present': markup_hit,
+        'schema_authors': schema_authors[:5],
+    }
+
+    if visible_hits or markup_hit:
+        how = []
+        if visible_hits:
+            how.append(f'visible byline ({visible_hits[0]})')
+        if markup_hit:
+            how.append('byline/author markup (rel/class/itemprop)')
+        if schema_authors:
+            how.append(f'schema author ({schema_authors[0]})')
+        return {
+            'status': 'pass',
+            'evidence': 'Author attribution present: ' + '; '.join(how) + '.',
+            'detail': detail,
+        }
+    if schema_authors:
+        return {
+            'status': 'warn',
+            'evidence': (
+                f'Author declared in schema ({schema_authors[0]}) but no '
+                f'visible byline pattern found on the page — answer engines '
+                f'weight visible attribution; add a byline.'),
+            'detail': detail,
+        }
+    return {
+        'status': 'fail',
+        'evidence': ('No author byline found: no visible byline pattern, no '
+                     'byline markup, and no schema author. E-E-A-T authorship '
+                     'is unverifiable for this page.'),
+        'detail': detail,
+    }
+
+
+_ARTICLE_TYPES_RE = re.compile(r'Article$|^BlogPosting$|^Report$', )
+
+
+def check_g2_schema_author_linkage(html):
+    """G2 — schema-author linkage: Article author → Person/Organization
+    with sameAs (or jobTitle/hasCredential, per the G2 definition).
+
+    pass = an Article-family node's author resolves (inline or via @id) to a
+    Person/Organization carrying sameAs / jobTitle / hasCredential.
+    warn = author present but unlinked (bare string) or lacking those props.
+    fail = Article-family schema present with NO author at all.
+    na   = no Article-family node and no author property anywhere.
+    """
+    items = list(_iter_jsonld_items(html))
+    by_id = {item['@id']: item for item in items
+             if isinstance(item.get('@id'), str)}
+
+    def resolve(author):
+        """Resolve an author value to a node dict where possible."""
+        if isinstance(author, dict):
+            ref = author.get('@id')
+            if ref and len(author) <= 2 and ref in by_id:
+                return by_id[ref]     # {'@id': ...} (+optional @type) reference
+            return author
+        if isinstance(author, str):
+            return by_id.get(author)  # bare '@id' string reference
+        return None
+
+    def credential_props(node):
+        props = []
+        same_as = node.get('sameAs')
+        if (isinstance(same_as, str) and same_as.strip()) or \
+                (isinstance(same_as, list) and any(
+                    isinstance(u, str) and u.strip() for u in same_as)):
+            props.append('sameAs')
+        if isinstance(node.get('jobTitle'), str) and node['jobTitle'].strip():
+            props.append('jobTitle')
+        if node.get('hasCredential'):
+            props.append('hasCredential')
+        return props
+
+    article_nodes = [i for i in items
+                     if any(_ARTICLE_TYPES_RE.search(t)
+                            for t in _node_types(i))]
+    # Author properties on any node (covers WebPage.author etc.)
+    author_bearing = [i for i in items if i.get('author') is not None]
+
+    if not article_nodes and not author_bearing:
+        return {
+            'status': 'na',
+            'evidence': ('No Article-family schema and no author property in '
+                         'any JSON-LD node — schema-author linkage not '
+                         'applicable.'),
+            'detail': {'article_nodes': 0},
+        }
+
+    linked, unlinked = [], []
+    source_nodes = article_nodes if article_nodes else author_bearing
+    articles_missing_author = 0
+    for node in source_nodes:
+        author = node.get('author')
+        if author is None:
+            articles_missing_author += 1
+            continue
+        vals = author if isinstance(author, list) else [author]
+        for a in vals:
+            resolved = resolve(a)
+            if isinstance(resolved, dict):
+                types = _node_types(resolved)
+                is_person_org = any(t in ('Person', 'Organization')
+                                    for t in types)
+                props = credential_props(resolved)
+                name = resolved.get('name') if isinstance(
+                    resolved.get('name'), str) else None
+                entry = {'name': name, 'types': types, 'linked_props': props}
+                if is_person_org and props:
+                    linked.append(entry)
+                else:
+                    unlinked.append(entry)
+            else:
+                unlinked.append({'name': a if isinstance(a, str) else None,
+                                 'types': [], 'linked_props': []})
+
+    detail = {
+        'article_nodes': len(article_nodes),
+        'authors_linked': linked[:5],
+        'authors_unlinked': unlinked[:5],
+        'articles_missing_author': articles_missing_author,
+    }
+
+    if linked:
+        first = linked[0]
+        return {
+            'status': 'pass',
+            'evidence': (
+                f'Schema author linked: {first["name"] or "(unnamed)"} '
+                f'({"/".join(first["types"]) or "untyped"}) carries '
+                f'{", ".join(first["linked_props"])}. '
+                f'{len(linked)} linked author node(s) total.'),
+            'detail': detail,
+        }
+    if unlinked:
+        return {
+            'status': 'warn',
+            'evidence': (
+                f'Author declared in schema but not linked to an identity: '
+                f'{len(unlinked)} author value(s) are bare strings or '
+                f'Person/Organization nodes without sameAs / jobTitle / '
+                f'hasCredential. Add sameAs profile URLs to the author node.'),
+            'detail': detail,
+        }
+    return {
+        'status': 'fail',
+        'evidence': (
+            f'{len(article_nodes)} Article-family schema node(s) present but '
+            f'none declares an author — add author → Person/Organization '
+            f'with sameAs.'),
+        'detail': detail,
+    }
+
+
+# About / Contact / editorial-policy link detection. Matched against BOTH the
+# href and the anchor text (lowercased). Word-ish boundaries keep 'contact'
+# from matching inside unrelated tokens.
+_ABOUT_PAT = re.compile(
+    r'(?:\babout(?:[-_/ ]?us)?\b|\bcompany\b|\bwho[-_ ]we[-_ ]are\b|'
+    r'\bteam\b|\büber[-_ ]?uns\b|\bueber[-_ ]?uns\b)', re.IGNORECASE)
+_CONTACT_PAT = re.compile(
+    r'(?:\bcontact(?:[-_/ ]?us)?\b|\bkontakt\b|\bimpressum\b|\bimprint\b|'
+    r'\bget[-_ ]in[-_ ]touch\b)', re.IGNORECASE)
+_EDITORIAL_PAT = re.compile(
+    r'(?:editorial[-_ ](?:policy|guidelines|standards|process)|'
+    r'review[-_ ](?:policy|process|guidelines)|'
+    r'content[-_ ](?:policy|standards|guidelines|integrity)|'
+    r'corrections?[-_ ]policy|'
+    r'fact[-_ ]?check(?:ing)?(?:[-_ ]policy)?|'
+    r'publishing[-_ ]principles|ethics[-_ ](?:policy|statement))',
+    re.IGNORECASE)
+
+_ANCHOR_RE = re.compile(r'<a\b[^>]*>(.*?)</a\s*>', re.IGNORECASE | re.DOTALL)
+
+
+def _page_anchors(html):
+    """[(href, text, in_nav_or_footer), ...] for every anchor on the page.
+    nav/footer/header membership is judged by position inside those blocks
+    (regex block spans — good enough for discoverability evidence)."""
+    spans = []
+    for tag in ('nav', 'footer', 'header'):
+        for m in re.finditer(rf'<{tag}\b[^>]*>.*?</{tag}\s*>',
+                             html or '', re.IGNORECASE | re.DOTALL):
+            spans.append((m.start(), m.end()))
+    out = []
+    for m in _ANCHOR_RE.finditer(html or ''):
+        tag_open = m.group(0)
+        href_m = re.search(_ATTR_PAT.format(name='href'), tag_open,
+                           re.IGNORECASE)
+        href = ''
+        if href_m:
+            href = html_unescape(
+                next(g for g in href_m.groups() if g is not None).strip())
+        text = re.sub(r'<[^>]+>', ' ', m.group(1))
+        text = re.sub(r'\s+', ' ', html_unescape(text)).strip()
+        in_chrome = any(s <= m.start() < e for s, e in spans)
+        out.append((href, text, in_chrome))
+    return out
+
+
+def check_g7b_about_contact(html):
+    """G7b — About/Contact discoverability: links to about / contact /
+    impressum reachable from the page (nav/footer membership recorded).
+    An identifiable operator is a core E-E-A-T trust signal.
+    """
+    about_links, contact_links = [], []
+    for href, text, in_chrome in _page_anchors(html):
+        hay_href, hay_text = href or '', text or ''
+        entry = {'href': href[:200], 'text': text[:80],
+                 'in_nav_or_footer': in_chrome}
+        if _ABOUT_PAT.search(hay_href) or _ABOUT_PAT.search(hay_text):
+            about_links.append(entry)
+        # 'contact' can legitimately co-exist with about on one link; check both
+        if _CONTACT_PAT.search(hay_href) or _CONTACT_PAT.search(hay_text):
+            contact_links.append(entry)
+
+    detail = {
+        'about_links': about_links[:5],
+        'contact_links': contact_links[:5],
+        'about_in_nav_or_footer': any(l['in_nav_or_footer']
+                                      for l in about_links),
+        'contact_in_nav_or_footer': any(l['in_nav_or_footer']
+                                        for l in contact_links),
+    }
+
+    if about_links and contact_links:
+        return {
+            'status': 'pass',
+            'evidence': (
+                f'About and Contact are discoverable: '
+                f'{len(about_links)} about-link(s) '
+                f'(e.g. {about_links[0]["href"] or about_links[0]["text"]}), '
+                f'{len(contact_links)} contact/impressum link(s).'),
+            'detail': detail,
+        }
+    if about_links or contact_links:
+        missing = 'contact/impressum' if about_links else 'about'
+        found = about_links[0] if about_links else contact_links[0]
+        return {
+            'status': 'warn',
+            'evidence': (
+                f'Only one operator-identity link found '
+                f'({found["href"] or found["text"]}); no {missing} link '
+                f'detected in the page (incl. nav/footer).'),
+            'detail': detail,
+        }
+    return {
+        'status': 'fail',
+        'evidence': ('No About or Contact/Impressum links found anywhere on '
+                     'the page — the operator behind the content is not '
+                     'discoverable, a core E-E-A-T trust gap.'),
+        'detail': detail,
+    }
+
+
+def check_g7c_editorial_policy(html):
+    """G7c — editorial / review-policy link presence (or schema
+    publishingPrinciples). Never fails: absence is a warn — the signal
+    matters most for YMYL/publisher pages, which the LLM judges in context.
+    """
+    policy_links = []
+    for href, text, in_chrome in _page_anchors(html):
+        if _EDITORIAL_PAT.search(href or '') or _EDITORIAL_PAT.search(text or ''):
+            policy_links.append({'href': href[:200], 'text': text[:80],
+                                 'in_nav_or_footer': in_chrome})
+    publishing_principles = None
+    for item in _iter_jsonld_items(html):
+        pp = item.get('publishingPrinciples')
+        if isinstance(pp, str) and pp.strip():
+            publishing_principles = pp.strip()
+            break
+        if isinstance(pp, dict):
+            ref = pp.get('@id') or pp.get('url')
+            if isinstance(ref, str) and ref.strip():
+                publishing_principles = ref.strip()
+                break
+
+    detail = {
+        'policy_links': policy_links[:5],
+        'publishing_principles': publishing_principles,
+    }
+
+    if policy_links or publishing_principles:
+        how = []
+        if policy_links:
+            how.append(f'link ({policy_links[0]["href"] or policy_links[0]["text"]})')
+        if publishing_principles:
+            how.append(f'schema publishingPrinciples ({publishing_principles})')
+        return {
+            'status': 'pass',
+            'evidence': 'Editorial/review-policy signal present: '
+                        + '; '.join(how) + '.',
+            'detail': detail,
+        }
+    return {
+        'status': 'warn',
+        'evidence': ('No editorial/review-policy link or publishingPrinciples '
+                     'schema found. Important for YMYL/publisher pages; '
+                     'optional elsewhere.'),
+        'detail': detail,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Main orchestrator
 # ──────────────────────────────────────────────────────────────────────────
 
 def run_all_checks(url):
     """Run all deterministic checks and return consolidated JSON."""
-    # Fetch the page once
-    html, final_url, status_code, _, _ = fetch(url)
+    # Fetch the page once — keep headers + redirect chain: A5/E4/E12 read
+    # X-Robots-Tag, A1 reads HSTS + the http→https redirect evidence.
+    html, final_url, status_code, headers, redirect_chain = fetch(url)
 
     if not html:
         return {
@@ -1217,6 +2188,24 @@ def run_all_checks(url):
         ('C12b_datemodified_staleness', check_c12b_datemodified_staleness, (html,)),
         ('D12_person_schema_with_credentials', check_d12_person_schema, (html,)),
         ('D14_hreflang_coverage', check_d14_hreflang_coverage, (html,)),
+        # Wired checks (roadmap 0.2) — canonical ids from brain-mappings.json
+        ('A3_meta_description', check_a3_meta_description, (html,)),
+        ('C10_open_graph_tags', check_c10_open_graph, (html,)),
+        # E-E-A-T deterministic subset (roadmap 2.4) — measured inputs that
+        # feed the G-section trust judgment. G1/G2 canonical; G7b/G7c are
+        # sub-checks of G7 (privacy/terms → operator-identity links).
+        ('G1_author_byline', check_g1_author_byline, (html,)),
+        ('G2_author_schema_credentials', check_g2_schema_author_linkage, (html,)),
+        ('G7b_about_contact_discoverability', check_g7b_about_contact, (html,)),
+        ('G7c_editorial_policy_link', check_g7c_editorial_policy, (html,)),
+        ('E4_no_nosnippet_noarchive', check_e4_nosnippet_directives, (html, headers)),
+        ('E12_no_noarchive', check_e12_noarchive, (html, headers)),
+        ('B9_no_mixed_content', check_b9_mixed_content, (html, final_url)),
+        # Network checks below (robots.txt fetch / http probe / samples)
+        ('A5_robots_meta_indexing', check_a5_robots_meta_indexing,
+         (html, headers, final_url)),
+        ('A1_https_enforcement', check_a1_https_enforcement,
+         (url, final_url, headers, redirect_chain)),
         ('A4b_canonical_redirect_chain', check_a4b_canonical_redirect_chain, (html, final_url)),
         ('B1_ttfb_median_5_samples', check_b1_ttfb_median, (url,)),
         ('A2b_title_uniqueness_sample', check_a2b_title_uniqueness, (url,)),
@@ -1247,6 +2236,13 @@ def run_all_checks(url):
                     'evidence': f'check crashed: {type(e).__name__}: {e}',
                     'detail': {},
                 }
+
+    # Evidence tier (roadmap 0.1): every verdict emitted here comes from
+    # deterministic Python over real page bytes — stamp it 'measured' so the
+    # report/compact rows can distinguish it from LLM-judged findings.
+    for check_result in results['checks'].values():
+        if isinstance(check_result, dict):
+            check_result.setdefault('evidence_tier', 'measured')
 
     # Summary counts
     statuses = [c['status'] for c in results['checks'].values()]

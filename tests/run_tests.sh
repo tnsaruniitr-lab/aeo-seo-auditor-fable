@@ -128,7 +128,75 @@ assert_contains "audit POSTed with key header; 5xx retried once; 4xx/unconfigure
 
 # ----------------------------------------------------------------------
 echo ""
-echo "[10] py_compile — every service module + script parses"
+echo "[10] Wired deterministic checks (A5/A1/B9/A3/C10/E4/E12) + evidence tiers"
+OUT=$(python3 "${SCRIPT_DIR}/test_new_checks.py" 2>&1)
+assert_contains "noindex/HTTPS/mixed-content/meta-desc/OG/snippet checks + measured|llm-judged tiers; PCR weights unchanged" "$OUT" "NEWCHECKS_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10b] Site context seam — lenient sanitation + measured/narrative-only prompt block + request acceptance"
+OUT=$(cd "${SERVICE_DIR}" && python3 "${SCRIPT_DIR}/test_site_context.py" 2>&1)
+assert_contains "siteContext sanitized leniently; prompt CONTEXT measured + narrative-only; start request accepted with and without it" "$OUT" "SITE_CONTEXT_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10b2] Cost tier-0/1: true-cost shadow accounting + pause_turn cache-breakpoint fix + Phase-13 runtime citations + skip_visibility seam"
+OUT=$(cd "${SERVICE_DIR}" && python3 "${SCRIPT_DIR}/test_cost_tier01.py" 2>&1)
+assert_contains "cache fix marks dictified blocks + never non-cacheable types; ceiling metric frozen; Phase 13 mandate gone; skipVisibility accepted" "$OUT" "COST_TIER01_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10c] Mobile parity + honest CWV labels + deterministic E-E-A-T subset (G1/G2/G7b/G7c)"
+OUT=$(python3 "${SCRIPT_DIR}/test_mobile_eeat.py" 2>&1)
+assert_contains "mobile flag + parity comparator + lab-CWV/INP honesty + byline/about-contact/editorial/schema-author checks; PCR weights unchanged" "$OUT" "MOBILE_EEAT_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10d] Brain freshness: status filter + provenance rank + strict mode + disclosure"
+OUT=$(python3 "${SCRIPT_DIR}/test_brain_freshness.py" 2>&1)
+assert_contains "retired rules unciteable; provenance-ranked URLs; SIEVE_STRICT typed error; report disclosure + evidence_tier column" "$OUT" "BRAIN_FRESHNESS_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10e] Brain Console: routes + central auth gate + probe validation + page markers"
+OUT=$(python3 "${SCRIPT_DIR}/test_brain_console.py" 2>&1)
+assert_contains "console routes registered, auth centralized at include, SourceSpec validation, probe spec errors, HTML markers" "$OUT" "BRAIN_CONSOLE_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10f] Sieve binding Phase 1: evidence query + cosine floor + relevance-first sort + embed pinning"
+OUT=$(python3 "${SCRIPT_DIR}/test_sieve_binding.py" 2>&1)
+assert_contains "evidence query, off-topic floor, relevance beats authority across bands, DB cosine floor, embed guard" "$OUT" "SIEVE_BINDING_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10g] Sieve binding Phase 2: BM25 snapshot retrieval over all 3 kinds + neutral AP confidence + freshness"
+OUT=$(python3 "${SCRIPT_DIR}/test_sieve_snapshot.py" 2>&1)
+assert_contains "principles reachable, empty-mapping checks covered, AP confidence neutral not risk-derived, snapshot freshness stamped" "$OUT" "SIEVE_SNAPSHOT_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10h] Sieve binding Phase 3: deterministic rule_eval (mode C) + binding_gate verifier (mode B)"
+OUT=$(cd "${SERVICE_DIR}" && python3 rule_eval.py 2>&1)
+assert_contains "measured checks bound to a verbatim rule; unresolved/non-measured never mis-bound" "$OUT" "RULE_EVAL_OK"
+OUT=$(cd "${SERVICE_DIR}" && python3 binding_gate.py 2>&1)
+assert_contains "binding gate: existence + candidacy + support; hallucinated/off-topic ids rejected not stamped" "$OUT" "BINDING_GATE_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10i] Sieve binding Phase 4: rule-weighted scoring — byte-identical default, bounded + symmetric"
+OUT=$(python3 "${SCRIPT_DIR}/test_sieve_scoring.py" 2>&1)
+assert_contains "LAMBDA=0 byte-identical to unweighted; verified binding reweights bounded+symmetric; unverified never moves; status never flipped" "$OUT" "SIEVE_SCORING_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10j] Sieve binding Phase 5: compact API emits citations + boundRule + brain-mode disclosure"
+OUT=$(python3 "${SCRIPT_DIR}/test_compact_citations.py" 2>&1)
+assert_contains "compact issues carry slim citations + verified boundRule; sourcesMode live/snapshot/mixed/none; snapshotDate surfaced" "$OUT" "COMPACT_CITATIONS_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do
     if ! python3 -m py_compile "$f" 2>/dev/null; then

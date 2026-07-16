@@ -35,7 +35,7 @@ import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 
 # ----------------------------------------------------------------------
@@ -74,11 +74,12 @@ import secrets
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel, HttpUrl, Field
+from pydantic import BaseModel, ConfigDict, HttpUrl, Field
 from typing import List as _List  # avoid clash with the Optional/Dict already imported
 
 from audit_pipeline import run_audit as run_audit_deterministic
 from safety import check_url_safe
+from site_context import sanitize_site_context
 
 # Agent-mode (full parity with the chat skill) is opt-in via AUDIT_MODE env var.
 # Default is "agent" once the parity layer is deployed; falls back automatically
@@ -139,7 +140,9 @@ except Exception:
     billing = None  # type: ignore
 
 
-def run_audit(url: str, output_dir: str, progress_callback=None):
+def run_audit(url: str, output_dir: str, progress_callback=None,
+              site_context: Optional[Dict[str, Any]] = None,
+              skip_visibility: bool = False):
     """Dispatch to the chosen audit pipeline.
 
     Modes:
@@ -150,6 +153,10 @@ def run_audit(url: str, output_dir: str, progress_callback=None):
     progress_callback (optional): called with a dict {phase, tool, turn,
     tool_count, elapsed_seconds, last_tool_ms} after each tool call when
     running in agent mode. Ignored by the deterministic path.
+
+    site_context (optional): sanitized site-wide crawl signals for the audited
+    page (see site_context.py). Threaded into the agent prompt as measured,
+    narrative-only CONTEXT; never touches scoring.
     """
     mode = AUDIT_MODE
     if mode == 'agent' and not AGENT_AVAILABLE:
@@ -162,7 +169,11 @@ def run_audit(url: str, output_dir: str, progress_callback=None):
         mode = 'agent' if AGENT_AVAILABLE else 'deterministic'
     if mode == 'agent':
         return run_audit_agent(url, output_dir=output_dir, verbose=False,
-                                progress_callback=progress_callback)
+                                progress_callback=progress_callback,
+                                site_context=site_context,
+                                skip_visibility=skip_visibility)
+    # Deterministic path has no narrative to enrich — site_context is ignored
+    # (and it runs no visibility sweep, so skip_visibility is moot).
     return run_audit_deterministic(url, output_dir=output_dir)
 
 
@@ -467,6 +478,13 @@ def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(_basic)):
             headers={'WWW-Authenticate': 'Basic realm="AEO Auditor"'},
         )
     return True
+
+
+# Sieve Brain Console (/brain + /api/brain/*): full ruleset visibility + source
+# management without the CLI. Every route in the router is auth-gated here —
+# the router itself defines none, so nothing ships open by accident.
+import brain_console  # noqa: E402
+app.include_router(brain_console.router, dependencies=[Depends(require_auth)])
 
 
 def require_admin(request: Request,
@@ -1530,14 +1548,22 @@ function renderTwoCol(bev, perf, audit) {
     ['Meta robots', pid.meta_robots || bev.meta_robots || 'none'],
     ['Classification', bev.classification],
   ];
+  // Honest CWV labeling: LCP/CLS come from ONE Playwright lab run — label
+  // them as such, and never render an INP number (INP needs CrUX field data).
+  const hasLabCwv = perf.lcp_ms != null || perf.cls != null;
+  const mobParity = perf.mobile_parity || {};
   const perfRows = [
     ['TTFB', perf.ttfb_ms != null ? perf.ttfb_ms + ' ms' : null],
-    ['LCP', perf.lcp_ms != null ? perf.lcp_ms + ' ms' : null],
-    ['CLS', perf.cls != null ? perf.cls.toFixed ? perf.cls.toFixed(3) : perf.cls : null],
+    ['LCP — lab (single run)', perf.lcp_ms != null ? perf.lcp_ms + ' ms' : null],
+    ['CLS — lab (single run)', perf.cls != null ? perf.cls.toFixed ? perf.cls.toFixed(3) : perf.cls : null],
+    ['INP', hasLabCwv ? 'not measured — requires field data (CrUX)' : null],
     ['Load time', perf.load_time_ms != null ? perf.load_time_ms + ' ms' : null],
     ['Request count', perf.request_count],
     ['SPA framework', (perf.spa_signals || []).join(', ') || 'none detected'],
     ['Console errors', perf.console_errors ? perf.console_errors.length : null],
+    ['Mobile parity', mobParity.status ? mobParity.status +
+      (mobParity.status === 'na' && mobParity.detail && mobParity.detail.reason
+        ? ' (' + mobParity.detail.reason + ')' : '') : null],
   ];
 
   function tableRows(rows) {
@@ -1602,18 +1628,23 @@ function renderAllFindings(findings) {
   let rows = '';
   for (const f of sorted.slice(0, 120)) {
     const icon = f.status === 'fail' ? '✗' : f.status === 'warn' ? '⚠' : f.status === 'pass' ? '✓' : '·';
+    const evTier = f.evidence_tier === 'measured'
+      ? '<span class="badge" style="background:#dcfce7;color:#166534">measured</span>'
+      : f.evidence_tier === 'llm-judged'
+        ? '<span class="badge" style="background:#fef9c3;color:#854d0e">llm-judged</span>' : '—';
     rows +=
       '<tr>' +
         '<td><span class="status-icon ' + escapeHtml(f.status || '') + '">' + icon + '</span></td>' +
         '<td><span class="check-id">' + escapeHtml(f.check_id || '') + '</span></td>' +
         '<td>' + (f.severity ? '<span class="sev ' + escapeHtml(String(f.severity).toLowerCase()) + '">' + escapeHtml(f.severity) + '</span>' : '—') + '</td>' +
+        '<td>' + evTier + '</td>' +
         '<td>' + escapeHtml((f.evidence || '').slice(0, 220)) + '</td>' +
         '<td>' + (f.truth_badge ? '<span class="badge truth">' + escapeHtml(f.truth_badge) + '</span>' : '') + '</td>' +
       '</tr>';
   }
   return '<section><details><summary>All findings (' + findings.length + ' checks · click to expand)</summary>' +
     '<table class="findings-table"><thead><tr>' +
-      '<th></th><th>Check</th><th>Severity</th><th>Evidence</th><th>Truth</th>' +
+      '<th></th><th>Check</th><th>Severity</th><th>Basis</th><th>Evidence</th><th>Truth</th>' +
     '</tr></thead><tbody>' + rows + '</tbody></table></details></section>';
 }
 
@@ -1623,6 +1654,10 @@ function renderBrainSources(findings) {
   // are the agent emitting partial/reshaped objects.
   const seen = new Set();
   const byTier = {1:[], 2:[], 3:[], 4:[], 5:[]};
+  // BRAIN-MODE DISCLOSURE: which brain answered, and how fresh it is — counted
+  // over the SAME deduped set the header total uses (a rule cited by N checks
+  // is one source, not N; malformed citations count nowhere).
+  let fromLive = 0, fromSnap = 0, maxVer = '';
   for (const f of findings) {
     for (const c of (f.citations || [])) {
       const name = c.name || c.title;
@@ -1631,6 +1666,8 @@ function renderBrainSources(findings) {
       const dedupKey = (c.id ?? name) + ':' + (c.kind || '?');
       if (seen.has(dedupKey)) continue;
       seen.add(dedupKey);
+      if (c.from === 'snapshot') fromSnap++; else if (c.from) fromLive++;
+      if (c.last_verified && String(c.last_verified) > maxVer) maxVer = String(c.last_verified);
       // Citations the grounding step could NOT verify against the brain keep
       // only LLM-claimed fields — never let them claim an authoritative tier.
       const tier = (c.verbatim === false) ? 5 : (c.tier || 5);
@@ -1641,9 +1678,26 @@ function renderBrainSources(findings) {
   if (!totalCites) return '';
   const tierLabels = {1:'🥇 Tier 1 — Authoritative', 2:'🥈 Tier 2 — Reputable',
                        3:'🥉 Tier 3 — Industry', 4:'📎 Tier 4 — Specialized', 5:'Other'};
-  let html = '<section><h2>Sources cited (' + totalCites + ' from Sieve brain)</h2>';
+  const mode = (fromLive === 0 && fromSnap === 0)
+    ? 'from Sieve brain'   // legacy audit predating mode tagging — claim nothing
+    : fromSnap === 0
+      ? 'live Sieve brain' + (maxVer ? ' · verified through ' + escapeHtml(maxVer) : '')
+      : fromLive === 0
+        ? 'SNAPSHOT ruleset (2026-04-21) — live brain unavailable'
+        : 'MIXED: ' + fromLive + ' live / ' + fromSnap + ' snapshot-fallback';
+  const snapBanner = fromSnap > 0
+    ? '<div style="background:#fef2f2;border:1px solid #fecaca;color:#991b1b;' +
+      'border-radius:8px;padding:10px 14px;margin:0 0 12px 0;font-size:13px">' +
+      '⚠ ' + fromSnap + ' source(s) were grounded from the bundled snapshot ' +
+      'ruleset (April 2026) — the live brain was unreachable or did not hold ' +
+      'them — treat their verified-dates as absent.</div>'
+    : '';
+  let html = '<section><h2>Sources cited (' + totalCites + ' · ' + mode + ')</h2>' + snapBanner;
   for (const t of [1,2,3,4,5]) {
     if (!byTier[t] || !byTier[t].length) continue;
+    // URL-less citations sort last within their tier: a receipt you can click
+    // beats a name you have to trust.
+    byTier[t].sort((a,b) => (a.source_url ? 0 : 1) - (b.source_url ? 0 : 1));
     html += '<div class="tier t' + t + '"><h3>' + tierLabels[t] + '</h3>';
     for (const c of byTier[t].slice(0, 12)) {
       const kindLabels = {rule:'Rule', ap:'AP', anti_pattern:'AP', principle:'Principle'};
@@ -1665,6 +1719,10 @@ function renderBrainSources(findings) {
         ? ' <code style="font-size:11px">[Sieve ' + kind + ' #' + escapeHtml(String(c.id)) + ']</code>'
         : '';
       const safeUrl = c.source_url ? safeHref(c.source_url) : '';
+      const noUrl = !c.source_url
+        ? ' <span class="cite-unver" title="no source URL on this rule">no link</span>' : '';
+      const provNote = c.url_provenance === 'neighbor-inferred'
+        ? ' <span class="cite-unver" title="URL adopted from a similar rule, not the extraction page">inferred link</span>' : '';
       // The rule's own reasoning, verbatim from the brain: when it applies →
       // what to do. Suppressed for unverified citations — their text is
       // LLM-claimed, not brain-backed.
@@ -1681,7 +1739,7 @@ function renderBrainSources(findings) {
         (safeUrl ? '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' : '') +
         '<span class="nm">' + escapeHtml(name) + '</span>' +
         (safeUrl ? '</a>' : '') +
-        conf + risk + idTag + verified + unverified + reasoning +
+        conf + risk + idTag + verified + unverified + noUrl + provNote + reasoning +
         '</div>';
     }
     html += '</div>';
@@ -2083,6 +2141,11 @@ def _run_audit_background(audit_id: str, url: str):
     with JOBS_LOCK:
         JOBS[audit_id]['status'] = 'running'
         JOBS[audit_id]['started_at'] = datetime.now(timezone.utc).isoformat()
+        # Optional site-wide crawl context (API-start only; sanitized at intake)
+        site_context = JOBS[audit_id].get('site_context')
+        # API-start callers may opt out of the visibility sweep (they measure
+        # it themselves); homepage submissions never set this → False.
+        skip_visibility = bool(JOBS[audit_id].get('skip_visibility'))
     if monitoring:
         monitoring.audit_started(audit_id, url, AUDIT_MODE)
 
@@ -2096,7 +2159,9 @@ def _run_audit_background(audit_id: str, url: str):
 
     try:
         result = run_audit(url, output_dir=str(OUTPUT_DIR),
-                            progress_callback=_update_progress)
+                            progress_callback=_update_progress,
+                            site_context=site_context,
+                            skip_visibility=skip_visibility)
         elapsed = round(time.time() - started, 1)
 
         # Agent path returns an error envelope (no exception) when it can't
@@ -2458,8 +2523,23 @@ _IDEMPOTENCY_WINDOW_SECONDS = 60
 
 
 class StartAuditRequest(BaseModel):
+    # Accept both the wire spelling AnswerMonk sends (siteContext, matching
+    # webhookUrl's camelCase) and the pythonic site_context.
+    model_config = ConfigDict(populate_by_name=True)
+
     url: str
     webhookUrl: Optional[str] = None
+    # OPTIONAL site-wide crawl context for the audited page (roadmap 1.4):
+    # { orphan?: bool, clickDepth?: int, duplicateOf?: str, inLinks?: int }.
+    # Validated leniently via sanitize_site_context — unknown keys and junk
+    # values are dropped, and an unusable payload degrades to None (identical
+    # to the field being absent). Narrative-only; never feeds scoring.
+    site_context: Optional[Dict[str, Any]] = Field(default=None,
+                                                   alias='siteContext')
+    # Callers that measure AI visibility themselves (AnswerMonk probes the
+    # same engines in its scoring phase) set this to skip the auditor's
+    # post-loop visibility sweep — identical audit otherwise, ~30% cheaper.
+    skip_visibility: bool = Field(default=False, alias='skipVisibility')
 
 
 class StartAuditResponse(BaseModel):
@@ -2546,6 +2626,37 @@ def _public_status(job: Dict, in_supabase: bool) -> str:
     return 'lost'
 
 
+def _slim_citation(c: Dict) -> Optional[Dict]:
+    """Trim a full finding citation to the fields a consumer needs to render a
+    sourced receipt. Phase 5: the compact contract used to drop citations
+    entirely, so AnswerMonk's technical-audit card could never show a source."""
+    if not isinstance(c, dict):
+        return None
+    return {
+        'kind': c.get('kind'), 'id': c.get('id'),
+        'name': c.get('name'),
+        'sourceOrg': c.get('source_org'), 'sourceUrl': c.get('source_url'),
+        'tier': c.get('tier'), 'tierIcon': c.get('tier_icon'),
+        'confidence': c.get('confidence_score'),
+        'from': c.get('from'), 'freshness': c.get('freshness'),
+        'snapshotDate': c.get('snapshot_date'),
+        'lastVerified': c.get('last_verified'),
+        'grounded': c.get('grounded'), 'verbatim': c.get('verbatim'),
+    }
+
+
+def _slim_bound_rule(br: Dict) -> Optional[Dict]:
+    if not isinstance(br, dict):
+        return None
+    return {
+        'kind': br.get('kind'), 'id': br.get('id'), 'name': br.get('name'),
+        'sourceOrg': br.get('source_org'), 'sourceUrl': br.get('source_url'),
+        'confidence': br.get('confidence_score'),
+        'bindingVerified': br.get('binding_verified'),
+        'basis': br.get('basis'), 'reason': br.get('reason'),
+    }
+
+
 def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
     """Map the full audit dict to the compact result shape AnswerMonk
     consumes for the third-segment card."""
@@ -2590,18 +2701,42 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
         if not fix_hint:
             fix_hint = (f.get('fix_type') or '').replace('_', ' ').title() or None
 
+        citations = [s for c in (f.get('citations') or [])[:3]
+                     if (s := _slim_citation(c)) is not None]
         issues.append({
             'severity': f.get('severity'),
+            'status': f.get('status'),  # additive: 'fail' | 'warn' — without it the
+                                        # consumer must guess and warns get dressed
+                                        # as fails in AnswerMonk's external_audits
             'category': _SECTION_LABELS.get(section_letter, section_letter or 'General'),
             'title': title,
             'fix': fix_hint,
             'checkId': f.get('check_id'),
+            'evidenceTier': f.get('evidence_tier'),  # additive: 'measured' | 'llm-judged' | None (legacy audits)
+            'citations': citations,                  # Phase 5: sourced receipts (was dropped here)
+            'boundRule': _slim_bound_rule(f.get('bound_rule')),  # the verified rule this verdict binds to
+            'observed': f.get('observed'),           # D25/D27: the 'on YOUR page' proof half
         })
 
     total = len(failed_or_warn)
     crit_high = counts['critical'] + counts['high']
     summary = (f"{total} issue{'s' if total != 1 else ''} found — "
                f"{crit_high} critical or high severity")
+
+    # Brain-mode disclosure over the emitted citations: was guidance grounded
+    # from the live brain, the bundled snapshot, or a mix? (Path A previously
+    # carried no provenance at all.)
+    froms = {c.get('from') for iss in issues for c in iss['citations'] if c.get('from')}
+    snap_dates = {c.get('snapshotDate') for iss in issues for c in iss['citations']
+                  if c.get('from') == 'snapshot' and c.get('snapshotDate')}
+    if not froms:
+        sources_mode = 'none'
+    elif froms == {'sieve-live'}:
+        sources_mode = 'live'
+    elif froms == {'snapshot'}:
+        sources_mode = 'snapshot'
+    else:
+        sources_mode = 'mixed'
 
     domain = audit.get('domain') or ''
     # Build full report URL — prefer the request's host if available
@@ -2625,6 +2760,8 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
         'severityCounts': counts,
         'issues': issues,
         'executiveDiagnosis': narrative.get('executive_diagnosis'),
+        'sourcesMode': sources_mode,   # 'live' | 'snapshot' | 'mixed' | 'none'
+        'snapshotDate': sorted(snap_dates)[-1] if snap_dates else None,
         'fullReportUrl': full_url,
         'completedAt': audit.get('date') or audit.get('created_at'),
         'durationSeconds': audit.get('duration_seconds'),
@@ -2750,8 +2887,10 @@ async def api_audit_start(req: StartAuditRequest,
                                 detail=f"Quota exceeded: {decision.get('reason')}")
 
     audit_id = str(uuid.uuid4())
-    log.info('[%s] api/start url=%s webhook=%s', audit_id[:8], url,
-             '(yes)' if req.webhookUrl else '(no)')
+    site_context = sanitize_site_context(req.site_context)
+    log.info('[%s] api/start url=%s webhook=%s site_context=%s', audit_id[:8], url,
+             '(yes)' if req.webhookUrl else '(no)',
+             ','.join(sorted(site_context)) if site_context else '(none)')
     with JOBS_LOCK:
         JOBS[audit_id] = {
             'audit_id': audit_id,
@@ -2762,6 +2901,8 @@ async def api_audit_start(req: StartAuditRequest,
             'result': None,
             'error': None,
             'webhook_url': req.webhookUrl,
+            'site_context': site_context,
+            'skip_visibility': bool(req.skip_visibility),
             'submitted_via': 'api',
             '_submitted_at': time.time(),
         }

@@ -117,6 +117,26 @@ def _plausible(claimed: set, auth: Dict[str, Any]) -> bool:
         (len(inter) / max(1, min(len(claimed), len(fetched)))) >= 0.34
 
 
+def _auth_tokens(auth: Dict[str, Any]) -> set:
+    return _text_tokens(auth.get('name'), auth.get('title'), auth.get('if_condition'),
+                        auth.get('then_action'), auth.get('statement'),
+                        auth.get('description'), auth.get('explanation'))
+
+
+def _supports_fix(claimed: set, auth: Dict[str, Any]) -> bool:
+    """Stricter gate for MINTING a fix source from a prose-scraped id: a real
+    source_url stamped on a fix is a customer-facing receipt, so we require
+    genuine topical support and REFUSE on no evidence (unlike _plausible, which
+    is permissive on empty). Closes the ground_fix_sources hole where any
+    hallucinated 'Sieve Rule #1668' resolved to a real Google URL."""
+    fetched = _auth_tokens(auth)
+    if not claimed or not fetched:
+        return False
+    inter = claimed & fetched
+    ratio = len(inter) / min(len(claimed), len(fetched))
+    return len(inter) >= 3 and ratio >= 0.25
+
+
 def _norm_kind(kind: Any) -> Optional[str]:
     if not isinstance(kind, str):
         return None
@@ -164,26 +184,37 @@ def _fetch_live_rows(wanted: Dict[str, List[str]]) -> Dict[Tuple[str, str], Dict
         conn = psycopg2.connect(sieve_brain.SIEVE_DB_URL, connect_timeout=10)
         conn.autocommit = True
         try:
+            cols_by_table = sieve_brain._optional_cols(conn)
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 for kind, ids in wanted.items():
                     if not ids:
                         continue
                     cfg = _KIND_CFG[kind]
+                    cols = cols_by_table.get(cfg['table'], set())
                     t2 = f"t.{cfg['t2']}" if cfg['t2'] else "''"
                     conf = f"t.{cfg['conf']}" if cfg['conf'] else "NULL"
                     risk = f"t.{cfg['risk']}" if cfg['risk'] else "NULL"
+                    prov = "t.url_provenance" if 'url_provenance' in cols else "NULL"
+                    # Retired/superseded guidance is unciteable on this path too:
+                    # a by-id fetch that resurrects a retired rule as 'verified'
+                    # would undo the retrieval-side status filter.
+                    status_f = sieve_brain._trust_filter(cols)
+                    # S4: prefer the document_id FK join; legacy regex only if absent.
+                    doc_join = ("d.id = t.document_id" if 'document_id' in cols
+                                else "d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')")
                     cur.execute(
                         f"""
                         SELECT t.id, t.{cfg['title']} AS title, t.{cfg['t1']} AS text1,
                                {t2} AS text2, t.domain_tag, {conf} AS conf,
                                {risk} AS risk, t.source_org,
                                COALESCE(NULLIF(t.source_url,''), d.source_url) AS source_url,
-                               COALESCE(t.last_verified::text, t.created_at) AS created_at
+                               t.last_verified::text AS last_verified,
+                               t.created_at AS created_at,
+                               {prov} AS url_provenance
                         FROM sieve.{cfg['table']} t
                         LEFT JOIN sieve.documents d
-                          ON d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')
-                        WHERE t.id = ANY(%s)
-                          AND coalesce(t.status::text,'active') NOT IN ('rejected','deprecated')
+                          ON {doc_join}
+                        WHERE t.id = ANY(%s){status_f}
                         """,
                         (ids,),
                     )
@@ -194,6 +225,9 @@ def _fetch_live_rows(wanted: Dict[str, List[str]]) -> Dict[Tuple[str, str], Dict
         finally:
             conn.close()
     except Exception as e:
+        if sieve_brain.SIEVE_STRICT:
+            raise sieve_brain.SieveLiveError(
+                f're-grounding requires the live brain (SIEVE_STRICT): {e}')
         # Keep whatever was already fetched — snapshot covers the rest.
         log.warning('live re-grounding fetch failed (%s) — using snapshot', e)
         return out
@@ -227,7 +261,13 @@ def _live_row_fields(kind: str, r: Dict[str, Any]) -> Dict[str, Any]:
         'if_condition': _cap(r.get('text1')),
         'then_action': _cap(r.get('text2')),
         'domain_tag': r.get('domain_tag'),
-        'last_verified': str(r.get('created_at'))[:10] if r.get('created_at') else None,
+        # D3 — honest freshness on the DELIVERED report: last_verified only when
+        # genuinely re-verified; created_at rides as an 'added' date, never as verified.
+        'last_verified': str(r.get('last_verified'))[:10] if r.get('last_verified') else None,
+        'added': str(r.get('created_at'))[:10] if r.get('created_at') else None,
+        # Overwrites the retrieval-time value so a re-grounded source_url never
+        # carries a stale provenance label from a URL it replaced.
+        'url_provenance': r.get('url_provenance'),
         'from': 'sieve-live',
     }
     if kind == 'ap':
@@ -283,6 +323,7 @@ def _snapshot_fields(kind: str, rid: str) -> Optional[Dict[str, Any]]:
         'if_condition': _cap(row.get(cfg['snap_t1'])),
         'then_action': _cap(row.get(cfg['snap_t2']) if cfg['snap_t2'] else ''),
         'domain_tag': row.get('domain_tag'),
+        'url_provenance': None,  # snapshot rows carry no provenance — clear any stale label
         'from': 'snapshot',
     }
     if kind == 'ap':
@@ -469,11 +510,20 @@ def ground_fix_sources(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
         for f, refs in zip(fixes, per_fix_refs):
             if not isinstance(f, dict) or not refs:
                 continue
+            claimed = _text_tokens(f.get('title'), f.get('why'),
+                                   f.get('before'), f.get('after'))
             sources = []
             for kind, rid in refs:
                 auth = live_rows.get((kind, rid)) or _snapshot_fields(kind, rid)
                 if auth is None:
                     stats['unresolved'] += 1
+                    continue
+                # A prose-scraped id resolves to SOME row; only stamp its
+                # authoritative source_url if that row actually supports the
+                # fix. An off-topic / hallucinated id is dropped, not minted.
+                if not _supports_fix(claimed, auth):
+                    stats['unresolved'] += 1
+                    stats['rejected_offtopic'] = stats.get('rejected_offtopic', 0) + 1
                     continue
                 stats['resolved'] += 1
                 sources.append({
@@ -607,12 +657,18 @@ def _selftest() -> None:
         _, s3 = reground_citations(dict(shape))
         assert s3['applied'] is True and s3['citations_total'] == 0, (shape, s3)
 
-    # Fix-source resolution: WHY-paragraph references become linked sources.
+    # Fix-source resolution: a WHY paragraph that actually DESCRIBES the rule's
+    # content mints a linked source; a fix that merely NAME-DROPS the id (or
+    # cites an off-topic id) does NOT — closing the mint-a-source hole.
     _SNAPSHOT_CACHE = stub_index
     audit3 = {'narrative': {'top_5_fixes': [
-        {'title': 'Fix org schema',
-         'why': 'Per Sieve Rule #1668 (confidence 0.98) this is required; '
-                'see also principle id:999 which does not exist.'},
+        # supported: the fix text shares the rule's actual vocabulary
+        {'title': 'Add Organization schema name and url',
+         'why': 'Your Organization schema must include the name and url '
+                'properties; add the logo too. Per Sieve Rule #1668.'},
+        # off-topic name-drop: rule 1668 is about org schema, not page speed
+        {'title': 'Improve page speed',
+         'why': 'Compress images to cut load time. Per Sieve Rule #1668.'},
         {'why': 'no brain references in this one'},
         'junk-not-a-dict',
     ]}}
@@ -620,9 +676,11 @@ def _selftest() -> None:
     f0 = audit3['narrative']['top_5_fixes'][0]
     assert [(x['kind'], x['id']) for x in f0.get('sources', [])] == [('rule', '1668')], f0
     assert f0['sources'][0]['source_url'] == 'https://schema.org/Organization', f0
-    assert 'sources' not in audit3['narrative']['top_5_fixes'][1]
-    assert s4 == {'applied': True, 'fixes_scanned': 2, 'refs_found': 2,
-                  'resolved': 1, 'unresolved': 1}, s4
+    f1 = audit3['narrative']['top_5_fixes'][1]
+    assert 'sources' not in f1, ('off-topic name-drop must NOT mint a source', f1)
+    assert 'sources' not in audit3['narrative']['top_5_fixes'][2]
+    assert s4['resolved'] == 1 and s4['unresolved'] == 1, s4
+    assert s4['rejected_offtopic'] == 1, ('the off-topic ref must be rejected, not stamped', s4)
     # Parser tolerates the real-world phrasings seen in production audits.
     assert _parse_refs('Schema.org Principle #1250 and anti-pattern id: 42 and Rule id=25694') == \
         [('principle', '1250'), ('ap', '42'), ('rule', '25694')], \

@@ -65,6 +65,27 @@ def ensure_column_and_index(conn, table):
     # HNSW index (created after backfill for speed, but IF NOT EXISTS makes re-run safe)
 
 
+def ensure_embedding_meta(conn, table):
+    """Record which model/dim this table was embedded with, so the runtime
+    (sieve_brain._corpus_model) can refuse a same-dimension model swap that
+    would cosine-compare incompatible embedding spaces without erroring."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sieve.embedding_meta (
+                table_name  text PRIMARY KEY,
+                model       text NOT NULL,
+                dim         integer NOT NULL,
+                embedded_at timestamptz NOT NULL DEFAULT now()
+            )
+        """)
+        cur.execute("""
+            INSERT INTO sieve.embedding_meta (table_name, model, dim, embedded_at)
+            VALUES (%s, %s, %s, now())
+            ON CONFLICT (table_name) DO UPDATE
+              SET model = EXCLUDED.model, dim = EXCLUDED.dim, embedded_at = now()
+        """, (table, MODEL, DIM))
+
+
 def build_text(cols, row):
     parts = [str(row[i]) for i in range(len(cols)) if row[i]]
     return " ".join(parts)[:6000] or "(empty)"
@@ -158,6 +179,8 @@ def main():
                 ensure_column_and_index(conn, t)
                 conn.commit()
                 embed_table(conn, client, t, TABLES[t])
+                ensure_embedding_meta(conn, t)
+                conn.commit()
     finally:
         conn.close()
     print("\nAll requested tables embedded.")
