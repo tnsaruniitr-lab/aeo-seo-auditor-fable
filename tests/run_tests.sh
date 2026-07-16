@@ -190,6 +190,12 @@ assert_contains "LAMBDA=0 byte-identical to unweighted; verified binding reweigh
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10j] Sieve binding Phase 5: compact API emits citations + boundRule + brain-mode disclosure"
+OUT=$(python3 "${SCRIPT_DIR}/test_compact_citations.py" 2>&1)
+assert_contains "compact issues carry slim citations + verified boundRule; sourcesMode live/snapshot/mixed/none; snapshotDate surfaced" "$OUT" "COMPACT_CITATIONS_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do

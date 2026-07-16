@@ -2626,6 +2626,37 @@ def _public_status(job: Dict, in_supabase: bool) -> str:
     return 'lost'
 
 
+def _slim_citation(c: Dict) -> Optional[Dict]:
+    """Trim a full finding citation to the fields a consumer needs to render a
+    sourced receipt. Phase 5: the compact contract used to drop citations
+    entirely, so AnswerMonk's technical-audit card could never show a source."""
+    if not isinstance(c, dict):
+        return None
+    return {
+        'kind': c.get('kind'), 'id': c.get('id'),
+        'name': c.get('name'),
+        'sourceOrg': c.get('source_org'), 'sourceUrl': c.get('source_url'),
+        'tier': c.get('tier'), 'tierIcon': c.get('tier_icon'),
+        'confidence': c.get('confidence_score'),
+        'from': c.get('from'), 'freshness': c.get('freshness'),
+        'snapshotDate': c.get('snapshot_date'),
+        'lastVerified': c.get('last_verified'),
+        'grounded': c.get('grounded'), 'verbatim': c.get('verbatim'),
+    }
+
+
+def _slim_bound_rule(br: Dict) -> Optional[Dict]:
+    if not isinstance(br, dict):
+        return None
+    return {
+        'kind': br.get('kind'), 'id': br.get('id'), 'name': br.get('name'),
+        'sourceOrg': br.get('source_org'), 'sourceUrl': br.get('source_url'),
+        'confidence': br.get('confidence_score'),
+        'bindingVerified': br.get('binding_verified'),
+        'basis': br.get('basis'), 'reason': br.get('reason'),
+    }
+
+
 def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
     """Map the full audit dict to the compact result shape AnswerMonk
     consumes for the third-segment card."""
@@ -2670,6 +2701,8 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
         if not fix_hint:
             fix_hint = (f.get('fix_type') or '').replace('_', ' ').title() or None
 
+        citations = [s for c in (f.get('citations') or [])[:3]
+                     if (s := _slim_citation(c)) is not None]
         issues.append({
             'severity': f.get('severity'),
             'status': f.get('status'),  # additive: 'fail' | 'warn' — without it the
@@ -2680,12 +2713,29 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
             'fix': fix_hint,
             'checkId': f.get('check_id'),
             'evidenceTier': f.get('evidence_tier'),  # additive: 'measured' | 'llm-judged' | None (legacy audits)
+            'citations': citations,                  # Phase 5: sourced receipts (was dropped here)
+            'boundRule': _slim_bound_rule(f.get('bound_rule')),  # the verified rule this verdict binds to
         })
 
     total = len(failed_or_warn)
     crit_high = counts['critical'] + counts['high']
     summary = (f"{total} issue{'s' if total != 1 else ''} found — "
                f"{crit_high} critical or high severity")
+
+    # Brain-mode disclosure over the emitted citations: was guidance grounded
+    # from the live brain, the bundled snapshot, or a mix? (Path A previously
+    # carried no provenance at all.)
+    froms = {c.get('from') for iss in issues for c in iss['citations'] if c.get('from')}
+    snap_dates = {c.get('snapshotDate') for iss in issues for c in iss['citations']
+                  if c.get('from') == 'snapshot' and c.get('snapshotDate')}
+    if not froms:
+        sources_mode = 'none'
+    elif froms == {'sieve-live'}:
+        sources_mode = 'live'
+    elif froms == {'snapshot'}:
+        sources_mode = 'snapshot'
+    else:
+        sources_mode = 'mixed'
 
     domain = audit.get('domain') or ''
     # Build full report URL — prefer the request's host if available
@@ -2709,6 +2759,8 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
         'severityCounts': counts,
         'issues': issues,
         'executiveDiagnosis': narrative.get('executive_diagnosis'),
+        'sourcesMode': sources_mode,   # 'live' | 'snapshot' | 'mixed' | 'none'
+        'snapshotDate': sorted(snap_dates)[-1] if snap_dates else None,
         'fullReportUrl': full_url,
         'completedAt': audit.get('date') or audit.get('created_at'),
         'durationSeconds': audit.get('duration_seconds'),
