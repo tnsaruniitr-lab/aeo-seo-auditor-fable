@@ -184,6 +184,12 @@ assert_contains "binding gate: existence + candidacy + support; hallucinated/off
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10i] Sieve binding Phase 4: rule-weighted scoring — byte-identical default, bounded + symmetric"
+OUT=$(python3 "${SCRIPT_DIR}/test_sieve_scoring.py" 2>&1)
+assert_contains "LAMBDA=0 byte-identical to unweighted; verified binding reweights bounded+symmetric; unverified never moves; status never flipped" "$OUT" "SIEVE_SCORING_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do

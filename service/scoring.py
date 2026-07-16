@@ -28,8 +28,44 @@ Stdlib only.
 from __future__ import annotations
 
 import math
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
+
+# Phase 4 — rule-weighted scoring (mode D). A section score is a weighted mean
+# of its checks' status values; a check backed by a VERIFIED binding to a
+# high-confidence authoritative rule (or high-risk anti-pattern) can count more.
+# INERT BY DEFAULT: SIEVE_RULE_WEIGHT_LAMBDA=0 => every weight is 1.0 => the
+# score is byte-identical to the unweighted formula. An operator raises LAMBDA
+# only after calibrating against a labelled set. The weight is bounded to
+# [1.0, 1.5] and rides only DB-pinned attributes (confidence / risk), so it can
+# never flip a status or move a grade cutoff — it re-weights WITHIN a section.
+RULE_WEIGHT_LAMBDA = float(os.getenv('SIEVE_RULE_WEIGHT_LAMBDA', '0.0'))
+_RULE_WEIGHT_MAX = 1.5
+_RISK_SEVERITY = {'high': 1.0, 'medium': 0.6, 'low': 0.3}
+_STATUS_VAL = {'pass': 1.0, 'warn': 0.5, 'fail': 0.0}
+
+
+def _binding_severity(bound_rule: Dict[str, Any]) -> float:
+    """0..1 severity of a verified binding: rule confidence, or AP risk level."""
+    if bound_rule.get('kind') == 'ap':
+        return _RISK_SEVERITY.get(str(bound_rule.get('risk_level') or '').lower(), 0.6)
+    try:
+        return max(0.0, min(1.0, float(bound_rule.get('confidence_score') or 0.0)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _check_weight(f: Dict[str, Any]) -> float:
+    """Per-check scoring weight. 1.0 unless a VERIFIED binding raises it, and
+    only when LAMBDA is set. Clamped to [1.0, _RULE_WEIGHT_MAX]."""
+    if RULE_WEIGHT_LAMBDA <= 0:
+        return 1.0
+    br = f.get('bound_rule')
+    if not isinstance(br, dict) or br.get('binding_verified') is not True:
+        return 1.0
+    w = 1.0 + RULE_WEIGHT_LAMBDA * _binding_severity(br)
+    return max(1.0, min(_RULE_WEIGHT_MAX, w))
 
 # ---------------------------------------------------------------------------
 # CANONICAL TABLES — the only copies in the codebase
@@ -248,6 +284,10 @@ def compute_from_findings(findings: List[Dict[str, Any]],
     Returns a scoring dict; never raises.
     """
     counts = {L: {'pass': 0, 'warn': 0, 'fail': 0, 'na': 0} for L in SECTION_KEYS}
+    # Weighted accumulators (mode D). With every weight 1.0 these reduce exactly
+    # to (pass + 0.5*warn)/applicable, so the default is byte-identical.
+    wsum = {L: 0.0 for L in SECTION_KEYS}
+    wval = {L: 0.0 for L in SECTION_KEYS}
     tier_counts = {EVIDENCE_MEASURED: 0, EVIDENCE_LLM: 0}
     for f in findings or []:
         if not isinstance(f, dict):
@@ -265,14 +305,16 @@ def compute_from_findings(findings: List[Dict[str, Any]],
         if st not in VALID_STATUSES:
             st = 'na'
         counts[sec][st] += 1
+        if st in _STATUS_VAL:                       # applicable (na excluded)
+            w = _check_weight(f)
+            wsum[sec] += w
+            wval[sec] += w * _STATUS_VAL[st]
 
     section_scores: Dict[str, Optional[float]] = {}
     for L, key in SECTION_KEYS.items():
-        c = counts[L]
-        applicable = c['pass'] + c['warn'] + c['fail']
         section_scores[key] = (
-            None if applicable == 0
-            else round((c['pass'] + 0.5 * c['warn']) / applicable * 100, 1)
+            None if wsum[L] == 0
+            else round(wval[L] / wsum[L] * 100, 1)
         )
 
     # Transport gate — no numeric score if the probe never reached content.
