@@ -300,12 +300,23 @@ def _snapshot_cite(kind: str, row: dict, score: float, snapshot_date: Optional[s
 
 # ----------------------------------------------------------------------
 # DEPRECATION GUARD (contract §7) — deprecated-guidance.json lists
-# case-insensitive regex/substring patterns for guidance the ecosystem has
-# retired (seed: Google's 2023-08 HowTo rich-results deprecation + FAQ
-# rich-results restriction). A candidate citation whose text matches is
-# EXCLUDED from selection — an audit must never prescribe a dead feature.
+# case-insensitive regex patterns for guidance the ecosystem has retired
+# (seed: Google's 2023-08 HowTo rich-results deprecation + FAQ rich-results
+# restriction). A candidate citation whose text matches is EXCLUDED from
+# selection — an audit must never prescribe a dead feature.
+#
+# Patterns are anchored to PRESCRIPTIVE framing (imperative verb + feature,
+# or feature tied to rich results in-clause), never mere mention, and each
+# entry may carry a `negative_pattern`: a row whose text also matches it
+# (anti-reliance phrasing — 'no longer', 'do not rely', 'deprecated',
+# 'restricted to'...) is NOT excluded. The corpus's own deprecation notices
+# (rule 'FAQ Schema No Longer Supports Rich Results', AP 'Relying on FAQ
+# Schema for Rich Results') are exactly the citations to surface when the
+# audited page carries the dead markup.
+#
 # Callers with a stats channel (citation_attach, ground_fix_sources) count
-# exclusions as `deprecated_excluded`; select_citations excludes silently.
+# exclusions as `deprecated_excluded`; select_citations has no stats channel
+# so it counts into module-level DEPRECATION_STATS for observability.
 # ----------------------------------------------------------------------
 
 _DEPRECATED_PATH = os.path.join(
@@ -314,10 +325,15 @@ _DEPRECATED_CACHE: Optional[List[dict]] = None
 _DEPRECATED_TEXT_FIELDS = ('name', 'title', 'if_condition', 'then_action',
                            'description', 'statement', 'explanation')
 
+# select_citations has no stats channel; count its exclusions here so the
+# quality loss is observable (attach/grounding count in their own stats).
+DEPRECATION_STATS = {'select_citations_excluded': 0}
+
 
 def deprecated_entries() -> List[dict]:
     """Load + compile deprecated-guidance.json once. Never raises; a missing
-    or malformed file (or one bad pattern) degrades to fewer entries."""
+    or malformed file (or one bad pattern — positive OR negative) degrades to
+    fewer entries."""
     global _DEPRECATED_CACHE
     if _DEPRECATED_CACHE is None:
         entries = []
@@ -330,6 +346,9 @@ def deprecated_entries() -> List[dict]:
                 try:
                     e = dict(e)
                     e['_re'] = re.compile(str(e['pattern']), re.IGNORECASE)
+                    if e.get('negative_pattern'):
+                        e['_neg_re'] = re.compile(str(e['negative_pattern']),
+                                                  re.IGNORECASE)
                     entries.append(e)
                 except re.error:
                     continue
@@ -342,12 +361,18 @@ def deprecated_entries() -> List[dict]:
 def deprecated_match(cite: Optional[dict]) -> Optional[dict]:
     """Return the deprecated-guidance entry whose pattern matches this
     candidate citation's text, else None. Case-insensitive; checks every
-    text-bearing field the three snapshot kinds carry."""
+    text-bearing field the three snapshot kinds carry. A row whose text also
+    matches the entry's negative_pattern (anti-reliance phrasing: the row
+    itself flags the deprecation) is NOT a match — such rows are current
+    guidance the audit should cite, not stale guidance to suppress."""
     if not isinstance(cite, dict):
         return None
     text = ' '.join(str(cite.get(k) or '') for k in _DEPRECATED_TEXT_FIELDS)
     for entry in deprecated_entries():
         if entry['_re'].search(text):
+            neg = entry.get('_neg_re')
+            if neg is not None and neg.search(text):
+                continue
             return entry
     return None
 
@@ -437,8 +462,14 @@ def select_citations(
     # Deprecation guard (§7): curated mappings can outlive the guidance they
     # point at — drop candidates whose text prescribes a retired feature
     # (HowTo rich results, FAQ rich-result eligibility). No stats channel
-    # here; the attach pass counts exclusions on the paths that reach findings.
-    candidates = [c for c in candidates if deprecated_match(c) is None]
+    # here, so count into module-level DEPRECATION_STATS for observability.
+    kept = []
+    for c in candidates:
+        if deprecated_match(c) is None:
+            kept.append(c)
+        else:
+            DEPRECATION_STATS['select_citations_excluded'] += 1
+    candidates = kept
 
     # Filter by page_type if rules carry tags (gracefully degrade if untagged)
     if page_type:

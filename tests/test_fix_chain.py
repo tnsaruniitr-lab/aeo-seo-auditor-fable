@@ -12,9 +12,12 @@ Quality invariants proven here:
     endpoint truncates it server-side to 400 chars, and retrieve_batch's query
     text is evidence-led via _query_for(check_id, evidence) (§3)
   - deprecation guard: deprecated-guidance.json patterns match retired
-    guidance (HowTo rich results, FAQ rich-result promises) but NOT current
-    guidance about the same features; excluded+counted in citation_attach and
-    ground_fix_sources; excluded in ranker.select_citations (§7)
+    PRESCRIPTIVE guidance (add/apply HowTo schema, FAQ rich-result promises)
+    but NOT the corpus's own deprecation notices, anti-reliance guidance, or
+    rows that merely mention the features — proven against REAL snapshot rows
+    (rules 8177/2254/2255/8377, AP 4697, principles 1667/1179), not synthetic
+    examples; excluded+counted in citation_attach and ground_fix_sources;
+    counted in ranker.DEPRECATION_STATS for select_citations (§7)
 
 Run from the service dir:
     cd service && python3 ../tests/test_fix_chain.py
@@ -161,24 +164,59 @@ assert sieve_brain._spec_query_text({}) == ''
 # ---------------------------------------------------------------------------
 # 4) Deprecation guard (§7) — matcher direction + all three exclusion sites
 # ---------------------------------------------------------------------------
-from ranker import BrainIndex, deprecated_match, select_citations  # noqa: E402
+from ranker import (BrainIndex, DEPRECATION_STATS, deprecated_match,  # noqa: E402
+                    select_citations)
 
-# Retired guidance matches...
+# Retired PRESCRIPTIVE guidance matches...
 dep = deprecated_match({'name': 'Add HowTo schema markup for rich results eligibility'})
 assert dep is not None and dep['since'] == '2023-08', dep
 assert deprecated_match({'then_action': 'Apply FAQPage schema markup to help '
                                         'pages qualify for FAQ rich results'}) is not None
-# ...but CURRENT guidance about the same features does not:
+# ...but mere mention is not prescription:
 assert deprecated_match({'name': 'Structure how-to guides with numbered steps'}) is None
-assert deprecated_match({
-    'name': 'FAQPage Eligibility Restricted to Government and Health Sites',
-    'if_condition': 'a site implements FAQPage structured data and is not a '
-                    'government or health site',
-    'then_action': 'FAQ rich results will not be shown for this site'}) is None
 assert deprecated_match(None) is None and deprecated_match({}) is None
 
+# Regression fixtures from the REAL snapshot corpus (a prior version of the
+# patterns overmatched on mention and excluded these; synthetic examples
+# hand-crafted to dodge the pattern proved nothing about the shipped corpus).
+_rs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       '..', 'service', 'ruleset')
+
+
+def _snapshot_rows(fname):
+    import json
+    with open(os.path.join(_rs_dir, fname)) as f:
+        return {r['id']: r for r in json.load(f) if isinstance(r, dict)}
+
+
+_snap_rules = _snapshot_rows('rules-snapshot.json')
+_snap_aps = _snapshot_rows('anti-patterns-snapshot.json')
+_snap_prins = _snapshot_rows('principles-snapshot.json')
+
+# KEPT: the corpus's own deprecation notices / anti-reliance guidance are
+# exactly what to cite when a page carries the dead markup, and generic
+# principles that merely mention HowTo schema are not prescriptions.
+for _kept_id, _kept in (
+    ('rule 8177', _snap_rules[8177]),    # 'FAQ Schema No Longer Supports Rich Results'
+    ('ap 4697', _snap_aps[4697]),        # 'Relying on FAQ Schema for Rich Results' (warning)
+    ('principle 1667', _snap_prins[1667]),  # generic schema principle, HowTo as example
+    ('principle 1179', _snap_prins[1179]),  # markup-must-match-intent, defensive mention
+):
+    assert deprecated_match(_kept) is None, (
+        'anti-reliance/mention row wrongly excluded', _kept_id)
+# EXCLUDED: rows that PRESCRIBE the dead feature.
+for _stale_id, _stale in (
+    ('rule 2254', _snap_rules[2254]),  # 'Apply FAQPage schema markup ... surface rich results'
+    ('rule 2255', _snap_rules[2255]),  # 'Apply HowTo Schema to Instructional Content'
+    ('rule 8377', _snap_rules[8377]),  # 'Add FAQ Schema markup ... qualify for ... rich snippets'
+):
+    assert deprecated_match(_stale) is not None, (
+        'stale prescriptive row not excluded', _stale_id)
+
 # ranker.select_citations: a curated mapping pointing at retired guidance is
-# excluded; the on-topic rule still comes through.
+# excluded; the on-topic rule still comes through; the exclusion is counted
+# in the module-level observability stat (select_citations has no stats
+# channel of its own).
 brain = BrainIndex(
     rules_by_id={
         10: {'id': 10, 'name': 'Add HowTo schema markup for rich results eligibility',
@@ -189,8 +227,11 @@ brain = BrainIndex(
     aps_by_id={}, playbooks_by_id={}, principles_by_id={},
     check_to_rules={'D7_faq_schema': {'rules': [10, 11], 'anti_patterns': []}},
 )
+_dep_before = DEPRECATION_STATS['select_citations_excluded']
 cites = select_citations(brain, 'D7_faq_schema')
 assert [x['id'] for x in cites] == [11], cites
+assert DEPRECATION_STATS['select_citations_excluded'] == _dep_before + 1, \
+    DEPRECATION_STATS
 
 # citation_attach: excluded BEFORE the cap (a fresh candidate takes the slot)
 # and counted in stats.deprecated_excluded.

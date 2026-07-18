@@ -1,13 +1,15 @@
 [
   {
-    "pattern": "how\\s?-?to\\s+(schema|markup|structured\\s+data|rich\\s+(results?|snippets?))",
-    "reason": "Google deprecated HowTo rich results in August 2023; HowTo structured data no longer produces rich results in Google Search, so guidance recommending HowTo schema for search visibility is stale.",
+    "pattern": "(?:(?<!not )(?<!n't )(?<!never )(?<!avoid )\\b(?:add\\w*|appl(?:y|ie)\\w*|implement\\w*|us(?:e[sd]?|ing)|adopt\\w*|includ\\w*|deploy\\w*|leverag\\w*|consider\\w*|creat\\w*|publish\\w*)\\b[^.!?]{0,80}?\\bhow\\s?-?to\\s+(?:schema|markup|structured\\s+data))|(?:\\bhow\\s?-?to\\s+(?:schema|markup|structured\\s+data)[^.!?]{0,100}?\\brich\\s+(?:results?|snippets?))|(?:\\bhow\\s?-?to\\s+rich\\s+(?:results?|snippets?))",
+    "negative_pattern": "no\\s+longer|do(?:es)?\\s+not\\s+rely|don'?t\\s+rely|deprecat|discontinu|\\bretired\\b|\\bsunset|restricted\\s+to|not\\s+supported|stopp?ed\\s+(?:showing|supporting)|will\\s+not\\s+be\\s+shown",
+    "reason": "Google deprecated HowTo rich results in August 2023; HowTo structured data no longer produces rich results in Google Search, so guidance recommending HowTo schema for search visibility is stale. Matches only PRESCRIPTIVE framing (an imperative verb recommending HowTo schema, HowTo schema tied to rich results in the same clause, or a direct 'HowTo rich results' mention) — never mere mention of the feature. Rows that themselves flag the deprecation ('no longer', 'do not rely', 'deprecated', 'restricted to'...) are anti-reliance guidance the audit SHOULD cite and are exempt via negative_pattern.",
     "source_url": "https://developers.google.com/search/blog/2023/08/howto-faq-changes",
     "since": "2023-08"
   },
   {
     "pattern": "faq[a-z]*\\s+(schema|markup|structured\\s+data)(\\s+markup)?[^.!?]{0,60}?(surface|qualify|eligib\\w*|earn\\w*)[^.!?]{0,60}?(?<!q&a\\s)rich\\s+(results?|snippets?)",
-    "reason": "Google restricted FAQ rich results to well-known authoritative government and health sites in August 2023 (and has since stopped showing the feature); guidance promising FAQ rich-result eligibility from FAQPage markup is stale. FAQPage markup for AI answer engines is unaffected.",
+    "negative_pattern": "no\\s+longer|do(?:es)?\\s+not\\s+rely|don'?t\\s+rely|deprecat|discontinu|\\bretired\\b|\\bsunset|restricted\\s+to|not\\s+supported|stopp?ed\\s+(?:showing|supporting)|will\\s+not\\s+be\\s+shown",
+    "reason": "Google restricted FAQ rich results to well-known authoritative government and health sites in August 2023 (and has since stopped showing the feature); guidance promising FAQ rich-result eligibility from FAQPage markup is stale. FAQPage markup for AI answer engines is unaffected. Rows warning AGAINST relying on FAQ schema for rich results (the corpus's own deprecation notices, e.g. 'FAQ Schema No Longer Supports Rich Results') are exempt via negative_pattern — those are exactly the citations to surface.",
     "source_url": "https://developers.google.com/search/blog/2023/08/howto-faq-changes",
     "since": "2023-08"
   }
