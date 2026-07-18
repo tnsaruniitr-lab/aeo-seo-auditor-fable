@@ -1,0 +1,89 @@
+{
+  "brand_ai_presence": 100.0,
+  "brand_ai_presence_confidence": "low",
+  "combined_directional_score": 66.9,
+  "computed_by": "runtime-deterministic",
+  "evidence_tiers": {
+    "llm-judged": 6,
+    "measured": 4
+  },
+  "grade_basis": "page_citation_readiness",
+  "inconclusive": false,
+  "overall_grade": "D+",
+  "overall_score": 58.6,
+  "page_citation_readiness": 58.6,
+  "section_counts": {
+    "A": {
+      "fail": 1,
+      "na": 0,
+      "pass": 1,
+      "warn": 0
+    },
+    "B": {
+      "fail": 0,
+      "na": 0,
+      "pass": 1,
+      "warn": 0
+    },
+    "C": {
+      "fail": 0,
+      "na": 0,
+      "pass": 0,
+      "warn": 1
+    },
+    "D": {
+      "fail": 0,
+      "na": 1,
+      "pass": 0,
+      "warn": 0
+    },
+    "E": {
+      "fail": 0,
+      "na": 0,
+      "pass": 1,
+      "warn": 0
+    },
+    "F": {
+      "fail": 1,
+      "na": 0,
+      "pass": 0,
+      "warn": 0
+    },
+    "G": {
+      "fail": 0,
+      "na": 0,
+      "pass": 0,
+      "warn": 0
+    },
+    "H": {
+      "fail": 0,
+      "na": 0,
+      "pass": 0,
+      "warn": 1
+    },
+    "I": {
+      "fail": 0,
+      "na": 0,
+      "pass": 1,
+      "warn": 0
+    },
+    "J": {
+      "fail": 0,
+      "na": 0,
+      "pass": 1,
+      "warn": 0
+    }
+  },
+  "section_scores": {
+    "A_technical": 50.0,
+    "B_performance": 100.0,
+    "C_onpage": 50.0,
+    "D_schema": null,
+    "E_aeo_discovery": 100.0,
+    "F_aeo_extraction": 0.0,
+    "G_aeo_trust": null,
+    "H_aeo_selection": 50.0,
+    "I_geo": 100.0,
+    "J_entity": 100.0
+  }
+}

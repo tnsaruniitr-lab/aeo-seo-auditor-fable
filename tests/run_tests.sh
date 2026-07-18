@@ -208,6 +208,12 @@ assert_contains "fix backstop joins narrative by check_id (never invents); compa
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10m] Shadow dual-score: classic byte-identity + evidence-weighted math + null paths + surfaces"
+OUT=$(cd "${SERVICE_DIR}" && python3 "${SCRIPT_DIR}/test_shadow_scoring.py" 2>&1)
+assert_contains "classic scoring byte-identical (golden); shadow counts only evidence-backed findings, renormalized; null with reason when no evidence; validate backstop; compact shadowScore + hero line gated on non-null" "$OUT" "SHADOW_SCORING_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do

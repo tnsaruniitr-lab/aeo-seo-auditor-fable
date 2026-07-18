@@ -202,6 +202,11 @@ OBSERVED_OFF_PAGE = 'observed-off-page'
 OBSERVED_MODEL = 'model-judgment'
 _OFF_PAGE_SECTIONS = frozenset({'H', 'I'})
 
+# Methods that represent a REAL observation (something the runtime measured or
+# looked at), as opposed to a model judgment. The shadow score counts a finding
+# whose observed block carries one of these.
+REAL_OBSERVED_METHODS = frozenset({OBSERVED_ON_PAGE, OBSERVED_OFF_PAGE})
+
 
 def observed_method_for(check_id: Any) -> str:
     """Deterministic observed.method for a check id: off-page families first
@@ -276,6 +281,17 @@ def _section_of(finding: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _evidence_backed(f: Dict[str, Any], tier: str) -> bool:
+    """SHADOW gate: does this finding's verdict ride on real evidence? True for
+    a measured tier, or a runtime-attached observed block whose method is an
+    actual observation (never model-judgment). `tier` is the finding's
+    effective evidence tier as resolved by the caller."""
+    if tier == EVIDENCE_MEASURED:
+        return True
+    obs = f.get('observed')
+    return isinstance(obs, dict) and obs.get('method') in REAL_OBSERVED_METHODS
+
+
 def _transport_inconclusive(audit: Dict[str, Any]) -> Tuple[bool, str]:
     """True when the probe never reached page content, so no numeric grade is
     defensible. Reads the Bot's-Eye-View classification wherever it lives."""
@@ -313,6 +329,13 @@ def compute_from_findings(findings: List[Dict[str, Any]],
     wsum = {L: 0.0 for L in SECTION_KEYS}
     wval = {L: 0.0 for L in SECTION_KEYS}
     tier_counts = {EVIDENCE_MEASURED: 0, EVIDENCE_LLM: 0}
+    # SHADOW (evidence-weighted) accumulators — same section/weight math as the
+    # classic score, counting ONLY evidence-backed findings (_evidence_backed).
+    # Purely additive: the classic accumulators above are untouched.
+    ev_wsum = {L: 0.0 for L in SECTION_KEYS}
+    ev_wval = {L: 0.0 for L in SECTION_KEYS}
+    ev_counted = 0
+    applicable_total = 0
     for f in findings or []:
         if not isinstance(f, dict):
             continue
@@ -333,6 +356,11 @@ def compute_from_findings(findings: List[Dict[str, Any]],
             w = _check_weight(f)
             wsum[sec] += w
             wval[sec] += w * _STATUS_VAL[st]
+            applicable_total += 1
+            if _evidence_backed(f, et):
+                ev_counted += 1
+                ev_wsum[sec] += w
+                ev_wval[sec] += w * _STATUS_VAL[st]
 
     section_scores: Dict[str, Optional[float]] = {}
     for L, key in SECTION_KEYS.items():
@@ -374,8 +402,50 @@ def compute_from_findings(findings: List[Dict[str, Any]],
             'grade_basis': 'page_citation_readiness',
             'inconclusive': True,
             'inconclusive_reason': reason or 'no applicable checks (content not reached)',
+            'shadow': None,
+            'shadow_reason': 'classic score inconclusive — shadow suppressed',
             'computed_by': 'runtime-deterministic',
         }
+
+    # SHADOW (evidence-weighted) PCR — identical section/weight math over the
+    # evidence-backed accumulators. A section with zero evidence-backed
+    # findings is excluded + renormalized exactly like the classic
+    # empty-section rule; with no such section at all the shadow is null with
+    # a reason (never a fabricated number). Shadow means shadow: nothing here
+    # feeds the classic score or grade.
+    ev_section_scores = {
+        key: (None if ev_wsum[L] == 0
+              else round(ev_wval[L] / ev_wsum[L] * 100, 1))
+        for L, key in SECTION_KEYS.items()
+    }
+    ev_weighted = 0.0
+    ev_weight_sum = 0.0
+    sections_with_data = 0
+    for key, w in PCR_WEIGHTS.items():
+        v = ev_section_scores.get(key)
+        if v is not None:
+            ev_weighted += v * w
+            ev_weight_sum += w
+            sections_with_data += 1
+    if ev_weight_sum > 0:
+        pcr_evidence = round(ev_weighted / ev_weight_sum, 1)
+        shadow: Optional[Dict[str, Any]] = {
+            'pcr_evidence': pcr_evidence,
+            'grade_evidence': grade_for(pcr_evidence),
+            'delta_vs_classic': round(pcr_evidence - pcr, 1),
+            'coverage': {
+                # findings_total = findings the CLASSIC score counts
+                # (applicable, sectioned); findings_counted = the
+                # evidence-backed subset the shadow retains.
+                'findings_counted': ev_counted,
+                'findings_total': applicable_total,
+                'sections_with_data': sections_with_data,
+            },
+        }
+        shadow_reason = None
+    else:
+        shadow = None
+        shadow_reason = 'no evidence-backed findings in any scored section'
 
     grade = grade_for(pcr)
     # Informational only. The letter grade is driven by PCR (deterministic);
@@ -394,6 +464,8 @@ def compute_from_findings(findings: List[Dict[str, Any]],
         'overall_grade': grade,
         'grade_basis': 'page_citation_readiness',
         'inconclusive': False,
+        'shadow': shadow,
+        **({'shadow_reason': shadow_reason} if shadow_reason else {}),
         'computed_by': 'runtime-deterministic',
     }
 
@@ -501,6 +573,25 @@ def validate_audit(audit: Dict[str, Any]) -> Dict[str, Any]:
     if grade not in VALID_GRADES:
         # Re-derive from PCR rather than trusting an out-of-enum string.
         scoring['overall_grade'] = grade_for(scoring.get('overall_score'))
+
+    # SHADOW backstop — same clamp discipline as the classic fields so a
+    # persisted-then-edited shadow can't reach the renderer malformed. Kept
+    # separate because delta_vs_classic is legitimately NEGATIVE, so it gets
+    # its own [-100, 100] clamp instead of riding _num_or_none (0..100).
+    shadow = scoring.get('shadow')
+    if shadow is not None and not isinstance(shadow, dict):
+        scoring['shadow'] = None
+    elif isinstance(shadow, dict):
+        shadow['pcr_evidence'] = _num_or_none(shadow.get('pcr_evidence'))
+        sg = str(shadow.get('grade_evidence') or '').strip()
+        if sg not in VALID_GRADES:
+            shadow['grade_evidence'] = grade_for(shadow.get('pcr_evidence'))
+        d = shadow.get('delta_vs_classic')
+        if isinstance(d, bool) or not isinstance(d, (int, float)) \
+                or not math.isfinite(float(d)):
+            shadow['delta_vs_classic'] = None
+        else:
+            shadow['delta_vs_classic'] = round(max(-100.0, min(100.0, float(d))), 1)
 
     # Guard finding statuses too — the renderer keys icons off these.
     # Also stamp the evidence tier (roadmap 0.1): additive — an explicit valid

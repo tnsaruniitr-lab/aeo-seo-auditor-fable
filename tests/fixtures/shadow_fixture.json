@@ -1,0 +1,21 @@
+{
+  "bots_eye_view": {"classification": "fully_accessible"},
+  "findings": [
+    {"check_id": "A1_https_enforcement", "section": "A", "status": "fail"},
+    {"check_id": "A6_single_h1", "section": "A", "status": "pass"},
+    {"check_id": "B1_ttfb_median_5_samples", "status": "pass"},
+    {"check_id": "C1_heading_hierarchy", "section": "C", "status": "warn"},
+    {"check_id": "F3_answer_capsule", "section": "F", "status": "fail",
+     "observed": {"method": "model-judgment", "customer_url": "https://cust.example/page"}},
+    {"check_id": "H1_content_depth_vs_competitors", "section": "H", "status": "warn",
+     "observed": {"method": "observed-off-page",
+                  "measured_value": "competitor median 2400 words vs your 700",
+                  "detail": {"competitors_crawled": 5}}},
+    {"check_id": "E9_llm_style_check", "section": "E", "status": "pass",
+     "evidence_tier": "measured"},
+    {"check_id": "J1_entity_check", "section": "J", "status": "pass"},
+    {"check_id": "I2_brand_mentions", "section": "I", "status": "pass"},
+    {"check_id": "D9_faqpage_schema_vs_visible", "section": "D", "status": "na"},
+    "junk-not-a-dict"
+  ]
+}

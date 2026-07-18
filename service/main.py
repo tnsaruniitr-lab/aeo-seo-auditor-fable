@@ -747,6 +747,8 @@ INDEX_HTML = r"""<!doctype html>
   .grade.A, .grade.B { background:var(--ok-bg); color:var(--ok-ink); }
   .grade.C { background:var(--warn-bg); color:var(--warn-ink); }
   .grade.D, .grade.F { background:var(--err-bg); color:var(--err-ink); }
+  .hero-shadow { font-size:11.5px; color:var(--ink-faint); margin-top:8px;
+    text-align:center; font-variant-numeric:tabular-nums; }
   .hero-diag { grid-column:1 / -1; color:var(--ink-soft); font-size:15.5px;
     line-height:1.65; padding:16px 0 2px; border-top:1px solid var(--hairline); }
   @media (max-width:640px) { .hero { grid-template-columns:1fr; }
@@ -1263,6 +1265,9 @@ function renderFull(audit, status, id) {
     company_name: cls.company_name,
     overall_score: sc.overall_score ?? sc.page_citation_readiness,
     overall_grade: sc.overall_grade,
+    // scoring.shadow is computed at audit time; reloaded audits carry it in
+    // metadata.scoring_shadow (fetch_audit rebuilds scoring from flat columns).
+    shadow: sc.shadow || (audit.metadata || {}).scoring_shadow || null,
     executive_diagnosis: narr.executive_diagnosis,
   };
 
@@ -1313,6 +1318,17 @@ function renderGauge(score) {
   );
 }
 
+function renderShadowLine(sh) {
+  // SHADOW (evidence-weighted) score — rendered ONLY when the runtime computed
+  // one (null = no evidence-backed findings). Number-coerced, so nothing
+  // user-controlled reaches the markup.
+  if (!sh) return '';
+  const n = Number(sh.pcr_evidence);
+  if (!Number.isFinite(n)) return '';
+  return '<div class="hero-shadow">Evidence-weighted (shadow): ' + n.toFixed(1) +
+    ' — counts only measured findings</div>';
+}
+
 function renderHero(s, duration, findingsCount) {
   const grade = (s.overall_grade || '').charAt(0).toUpperCase();
   const pills = [s.page_type, s.industry, s.company_name,
@@ -1328,9 +1344,12 @@ function renderHero(s, duration, findingsCount) {
         '<div class="hero-meta-url">' + escapeHtml(s.url || '') + '</div>' +
         '<div class="hero-meta-tags">' + pills + '</div>' +
       '</div>' +
-      '<div class="hero-score">' +
-        renderGauge(s.overall_score) +
-        '<div class="grade ' + escapeHtml(grade) + '">' + escapeHtml(s.overall_grade || '—') + '</div>' +
+      '<div>' +
+        '<div class="hero-score">' +
+          renderGauge(s.overall_score) +
+          '<div class="grade ' + escapeHtml(grade) + '">' + escapeHtml(s.overall_grade || '—') + '</div>' +
+        '</div>' +
+        renderShadowLine(s.shadow) +
       '</div>' +
       (s.executive_diagnosis ? '<div class="hero-diag">' + escapeHtml(s.executive_diagnosis) + '</div>' : '') +
     '</div>'
@@ -2755,6 +2774,17 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
     else:
         sources_mode = 'mixed'
 
+    # SHADOW dual-score (nullable) — evidence-weighted twin of the classic PCR.
+    # Reloaded audits carry it in metadata.scoring_shadow (fetch_audit rebuilds
+    # scoring from flat DB columns, which drops scoring.shadow).
+    shadow = scoring.get('shadow')
+    if not isinstance(shadow, dict):
+        shadow = (audit.get('metadata') or {}).get('scoring_shadow')
+    shadow_score = ({'score': shadow.get('pcr_evidence'),
+                     'grade': shadow.get('grade_evidence'),
+                     'coverage': shadow.get('coverage')}
+                    if isinstance(shadow, dict) else None)
+
     domain = audit.get('domain') or ''
     # Build full report URL — prefer the request's host if available
     if request is not None:
@@ -2781,6 +2811,8 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
         'grade': scoring.get('overall_grade'),
         'pageCitationReadiness': scoring.get('page_citation_readiness'),
         'brandAiPresence': scoring.get('brand_ai_presence'),
+        'shadowScore': shadow_score,  # nullable {score, grade, coverage} — shadow only, never the grade
+
         'summary': summary,
         'severityCounts': counts,
         'issues': issues,

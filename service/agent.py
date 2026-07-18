@@ -1049,6 +1049,13 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
         from scoring import finalize_scoring
         audit = finalize_scoring(audit)
         md["scoring_authority"] = "runtime-deterministic"
+        # SHADOW dual-score rides the metadata column: fetch_audit reassembles
+        # `scoring` from flat DB columns, which would silently drop
+        # scoring.shadow on reload. Renderers fall back to metadata.
+        _sc = audit.get("scoring") if isinstance(audit.get("scoring"), dict) else {}
+        md["scoring_shadow"] = _sc.get("shadow")
+        if _sc.get("shadow_reason"):
+            md["scoring_shadow_reason"] = _sc.get("shadow_reason")
     except Exception as e:
         # Never let a scoring bug drop a completed audit — but flag loudly.
         md["scoring_authority"] = f"MODEL-REPORTED (recompute failed: {type(e).__name__}: {e})"
