@@ -1,9 +1,13 @@
 {
   "bots_eye_view": {"classification": "fully_accessible"},
   "findings": [
-    {"check_id": "A1_https_enforcement", "section": "A", "status": "fail"},
+    {"check_id": "A1_https_enforcement", "section": "A", "status": "fail",
+     "observed": {"method": "measured-on-page",
+                  "measured_value": "http not redirected to https (script)"}},
     {"check_id": "A6_single_h1", "section": "A", "status": "pass"},
-    {"check_id": "B1_ttfb_median_5_samples", "status": "pass"},
+    {"check_id": "B1_ttfb_median_5_samples", "status": "pass",
+     "observed": {"method": "measured-on-page",
+                  "measured_value": "median TTFB 412ms over 5 samples"}},
     {"check_id": "C1_heading_hierarchy", "section": "C", "status": "warn"},
     {"check_id": "F3_answer_capsule", "section": "F", "status": "fail",
      "observed": {"method": "model-judgment", "customer_url": "https://cust.example/page"}},

@@ -569,16 +569,22 @@ def compute_section_scores(scripts_output: Dict) -> Dict:
     grade table, which was finding SCORE-2 / ENG-4). Converts the all_checks
     map into the findings shape scoring.compute_from_findings expects.
     """
-    from scoring import compute_from_findings
+    from scoring import compute_from_findings, observed_method_for
 
     findings = []
     for full_id, check in scripts_output.get('all_checks', {}).items():
         clean = full_id.split(':', 1)[-1]
+        check = check if isinstance(check, dict) else {}
         findings.append({
             'check_id': clean,
-            'status': (check or {}).get('status', 'na'),
+            'status': check.get('status', 'na'),
             # all_checks verdicts are script-computed → measured tier.
-            'evidence_tier': (check or {}).get('evidence_tier', 'measured'),
+            'evidence_tier': check.get('evidence_tier', 'measured'),
+            # ... and script-observed: stamp the observed method here (a
+            # Python producer, like agent._join_observed on the agent path)
+            # so the shadow's observed-gated evidence rule counts these
+            # Python-verdict findings.
+            'observed': {'method': observed_method_for(clean, check.get('detail'))},
         })
 
     # Provide the Bot's-Eye-View context so scoring's transport gate can fire.

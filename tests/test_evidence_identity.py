@@ -11,6 +11,11 @@ Quality invariants proven here:
     SCRIPT's evidence, never the model's rewording; model-emitted observed
     blocks are STRIPPED (observed is runtime-owned — a fabricated proof can't
     ride through the gate)
+  - runtime competitor producer: agent._webfetch_measure counts words of
+    API-authored web_fetch results; agent._competitor_depth_check builds the
+    H1 all_checks entry ONLY from those runtime measures (never the model's
+    competitor_comparison transcription), so 'observed-competitor' is
+    production-reachable without trusting model-authored data
   - tools.query_brain evidence_led: the curated exact-mapping shortcut is
     skipped and the search query is led by evidence + the ORIGINAL id tail
   - _audit_to_compact carries vocabStatus/originalCheckId per issue (§1) and
@@ -115,6 +120,67 @@ s = agent._join_observed({'findings': [{'check_id': 'A1_https_enforcement'}]},
                          {'all_checks': 'junk'})
 assert s == {'applied': True, 'joined': 0, 'unmatched': 1,
              'stripped_model_observed': 0, 'findings': 1}, s
+
+
+# ---------------------------------------------------------------------------
+# 2b) runtime competitor producer — H1 evidence from runtime-measured
+#     web_fetch results only (API-authored blocks the model cannot forge)
+# ---------------------------------------------------------------------------
+from types import SimpleNamespace  # noqa: E402
+
+# _webfetch_measure: text results word-counted (tags stripped); fetch errors
+# and unknown shapes return None, never raise
+blk = SimpleNamespace(content={
+    'type': 'web_fetch_result', 'url': 'https://rival-a.example/guide',
+    'content': {'source': {'type': 'text', 'data': '<p>one  two</p>\nthree'}}})
+assert agent._webfetch_measure(blk) == {'url': 'https://rival-a.example/guide',
+                                        'words': 3}
+assert agent._webfetch_measure(SimpleNamespace(content={
+    'type': 'web_fetch_tool_result_error',
+    'error_code': 'url_not_accessible'})) is None
+assert agent._webfetch_measure(SimpleNamespace(content=None)) is None
+assert agent._webfetch_measure(SimpleNamespace()) is None
+
+# _competitor_depth_check: same-host fetches measure the target (www-strip),
+# off-host pages are competitors collapsed to their max word count; the
+# median is runtime-computed; junk measures are skipped
+chk = agent._competitor_depth_check('https://www.cust.example/page', [
+    {'url': 'https://cust.example/page', 'words': 700},    # self, www-stripped
+    {'url': 'https://rival-a.example/x', 'words': 2400},
+    {'url': 'https://rival-a.example/x', 'words': 100},    # dupe host -> max
+    {'url': 'https://rival-b.example/y', 'words': 1800},
+    {'url': 'https://rival-c.example/z', 'words': 0},      # empty fetch: ignored
+    {'url': 'no scheme at all', 'words': 5},               # unparsable host
+    {'url': 'https://rival-d.example', 'words': True},     # bool is not a count
+    'junk-not-a-dict',
+])
+assert chk is not None and chk['status'] == 'na', chk
+_d = chk['detail']
+assert _d['competitors_crawled'] == 2 and _d['target_words'] == 700, _d
+assert _d['competitor_median_words'] == 2100, _d
+assert _d['competitor_domains'] == ['rival-a.example', 'rival-b.example'], _d
+assert _d['competitor_words'] == {'rival-a.example': 2400,
+                                  'rival-b.example': 1800}, _d
+assert chk['evidence'].startswith('runtime-measured competitor crawl'), chk
+
+# honesty rule: no off-host fetch (or no target host) -> no check at all
+assert agent._competitor_depth_check('https://cust.example/page', [
+    {'url': 'https://cust.example/other', 'words': 900}]) is None
+assert agent._competitor_depth_check('https://cust.example/page', []) is None
+assert agent._competitor_depth_check('', [
+    {'url': 'https://rival-a.example', 'words': 9}]) is None
+
+# the runtime entry joins onto the model's H1 finding as observed-competitor —
+# the production path for FEATURE 2 (no deterministic script emits H checks)
+audit2 = {'findings': [{'check_id': agent.COMPETITOR_CHECK_ID, 'status': 'warn'}]}
+st2 = agent._join_observed(
+    audit2, {'all_checks': {'runtime:' + agent.COMPETITOR_CHECK_ID: chk}})
+ob = audit2['findings'][0]['observed']
+assert st2['joined'] == 1, st2
+assert ob['method'] == 'observed-competitor', ob
+assert ob['customer_url'] == 'https://www.cust.example/page', ob
+assert ob['measured_value'].startswith('runtime-measured competitor crawl'), ob
+assert ob['detail']['competitor_median_words'] == 2100, ob
 
 
 # ---------------------------------------------------------------------------

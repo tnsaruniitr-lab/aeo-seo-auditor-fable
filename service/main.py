@@ -1326,7 +1326,7 @@ function renderShadowLine(sh) {
   const n = Number(sh.pcr_evidence);
   if (!Number.isFinite(n)) return '';
   return '<div class="hero-shadow">Evidence-weighted (shadow): ' + n.toFixed(1) +
-    ' — counts only measured findings</div>';
+    ' — counts only runtime-observed findings</div>';
 }
 
 function renderHero(s, duration, findingsCount) {
@@ -2776,10 +2776,15 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
 
     # SHADOW dual-score (nullable) — evidence-weighted twin of the classic PCR.
     # Reloaded audits carry it in metadata.scoring_shadow (fetch_audit rebuilds
-    # scoring from flat DB columns, which drops scoring.shadow).
+    # scoring from flat DB columns, which drops scoring.shadow). BOTH copies go
+    # through scoring.clamp_shadow here: the metadata mirror never passed
+    # validate_audit, and even the scoring copy could have been edited since —
+    # nothing unclamped may reach the JSON API. Clamp a copy, not the audit.
+    from scoring import clamp_shadow
     shadow = scoring.get('shadow')
     if not isinstance(shadow, dict):
         shadow = (audit.get('metadata') or {}).get('scoring_shadow')
+    shadow = clamp_shadow(dict(shadow)) if isinstance(shadow, dict) else None
     shadow_score = ({'score': shadow.get('pcr_evidence'),
                      'grade': shadow.get('grade_evidence'),
                      'coverage': shadow.get('coverage')}

@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import re
+import statistics
 import sys
 import time
 import traceback
@@ -32,6 +33,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 THIS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(THIS_DIR))
@@ -307,6 +309,10 @@ def run_agent_loop(url: str, verbose: bool = False,
     # `detail`) so the post-loop chain can join the OBSERVED half of the proof
     # onto the LLM's findings. The LLM only sees a slimmed copy.
     det_scripts_output: Optional[Dict[str, Any]] = None
+    # Runtime-measured word counts of every successful server web_fetch —
+    # *_tool_result blocks are API-authored (the model cannot fabricate them),
+    # so these measures are runtime-owned evidence for the competitor producer.
+    web_fetch_measures: List[Dict[str, Any]] = []
     input_tokens_total = 0
     output_tokens_total = 0
     cache_read_total = 0
@@ -458,6 +464,10 @@ def run_agent_loop(url: str, verbose: bool = False,
                 csize = (len(json.dumps(content, default=str))
                          if content is not None else 0)
                 log.info('%s  ← [server] result %dB', pfx, csize)
+                if btype == "web_fetch_tool_result":
+                    m = _webfetch_measure(block)
+                    if m:
+                        web_fetch_measures.append(m)
 
         if stop_reason == "end_turn":
             log.info('%send_turn at turn=%d', pfx, turns)
@@ -613,6 +623,7 @@ def run_agent_loop(url: str, verbose: bool = False,
     return {
         "audit": audit,
         "scripts_output": det_scripts_output,
+        "web_fetch_measures": web_fetch_measures,
         "raw_final_text": raw_final_text[:5000],
         "tool_calls": tool_call_log,
         "turns": turns,
@@ -679,9 +690,101 @@ _AUDIT_TAG_RE = re.compile(r"<audit>\s*(\{.*?\})\s*</audit>", re.DOTALL)
 _REQUIRED_AUDIT_FIELDS = ("scoring", "findings")
 
 
+def _webfetch_measure(block: Any) -> Optional[Dict[str, Any]]:
+    """Runtime word-count of one server web_fetch result: {url, words} or None.
+
+    The *_tool_result block is API-authored (the model cannot fabricate one in
+    its own output), and the count is computed HERE over the fetched text, so
+    the result is runtime-owned evidence. Defensive: error results and
+    unexpected shapes return None; never raises."""
+    try:
+        c = getattr(block, "content", None)
+        if c is not None and hasattr(c, "model_dump"):
+            c = c.model_dump()
+        if not isinstance(c, dict) or c.get("type") != "web_fetch_result":
+            return None  # fetch error, or a shape this parser doesn't know
+        url = c.get("url")
+        doc = c.get("content") if isinstance(c.get("content"), dict) else {}
+        src = doc.get("source") if isinstance(doc.get("source"), dict) else {}
+        text = src.get("data")
+        if not (isinstance(url, str) and url and src.get("type") == "text"
+                and isinstance(text, str) and text.strip()):
+            return None
+        # Crude tag strip so raw-HTML fetches count words, not markup.
+        return {"url": url, "words": len(re.sub(r"<[^>]+>", " ", text).split())}
+    except Exception:
+        return None
+
+
+COMPETITOR_CHECK_ID = "H1_content_depth_vs_competitors"
+
+
+def _host_of(u: Any) -> str:
+    """Lowercased host of a URL, www-stripped; '' when unparsable."""
+    try:
+        h = urlsplit(str(u or "")).netloc.split("@")[-1].split(":")[0].strip().lower()
+    except ValueError:
+        return ""
+    return h[4:] if h.startswith("www.") else h
+
+
+def _competitor_depth_check(target_url: str,
+                            measures: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """RUNTIME COMPETITOR PRODUCER — the deterministic H-family check that
+    makes 'observed-competitor' reachable in production. Built ONLY from the
+    server web_fetch results the loop actually received (API-authored blocks,
+    runtime-counted words — never the model's competitor_comparison
+    transcription, which would be forgeable). Fetches of the target's own
+    host measure the target; every other host is a competitor page, collapsed
+    to its max word count. Honesty rule: no successfully-fetched off-host
+    page means no check (None) — the H section then simply carries no
+    runtime evidence.
+
+    The comparative VERDICT stays with the model finding this joins onto
+    (status here is 'na'); this entry carries the MEASUREMENT only."""
+    tdom = _host_of(target_url)
+    if not tdom:
+        return None
+    target_words: Optional[int] = None
+    competitors: Dict[str, int] = {}
+    for m in measures or []:
+        if not isinstance(m, dict):
+            continue
+        host, words = _host_of(m.get("url")), m.get("words")
+        if not host or isinstance(words, bool) or not isinstance(words, int) \
+                or words <= 0:
+            continue
+        if host == tdom:
+            target_words = max(target_words or 0, words)
+        else:
+            competitors[host] = max(competitors.get(host, 0), words)
+    if not competitors:
+        return None
+    med = statistics.median(competitors.values())
+    med = int(med) if float(med).is_integer() else round(med, 1)
+    evidence = (f"runtime-measured competitor crawl: {len(competitors)} "
+                f"page(s), median {med} words"
+                + (f" vs target {target_words}" if target_words else ""))
+    return {
+        "status": "na",
+        "evidence": evidence,
+        "detail": {
+            "url": target_url,
+            "competitors_crawled": len(competitors),
+            "competitor_domains": sorted(competitors),
+            "competitor_words": competitors,
+            "competitor_median_words": med,
+            "target_words": target_words,
+            "measured_by": "agent-loop web_fetch capture (runtime word count)",
+        },
+    }
+
+
 def _join_observed(audit: Dict[str, Any], scripts_output: Any) -> Dict[str, Any]:
     """OBSERVED PROOF (D25, agent path) — join the deterministic scripts'
     structured detail back onto the LLM's findings by canonical check_id.
+    all_checks may also carry runtime-produced entries (the 'runtime:' H1
+    competitor measurement) — same honesty rules apply to those.
     Honesty rules (contract §5):
 
       - `observed` attaches ONLY when the join matched a real script check
@@ -976,10 +1079,30 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
     # no observed block. Additive; runs after check_ids are canonical.
     # ------------------------------------------------------------------
     try:
-        md["observed_join"] = _join_observed(audit, loop_result.get("scripts_output"))
+        so = loop_result.get("scripts_output")
+        so = dict(so) if isinstance(so, dict) else {}
+        ac = so.get("all_checks")
+        so["all_checks"] = dict(ac) if isinstance(ac, dict) else {}
+        # RUNTIME COMPETITOR PRODUCER — inject the H1 competitor measurement
+        # (runtime word counts of API-authored web_fetch results) so the join
+        # below can attach a real 'observed-competitor' block to the model's
+        # H1 finding. Copies above keep loop_result's scripts_output pristine.
+        comp = _competitor_depth_check(url, loop_result.get("web_fetch_measures") or [])
+        if comp:
+            so["all_checks"]["runtime:" + COMPETITOR_CHECK_ID] = comp
+        md["observed_join"] = _join_observed(audit, so)
+        md["observed_join"]["competitor_producer"] = bool(comp)
     except Exception as e:
         md["observed_join"] = {"applied": False, "error": f"{type(e).__name__}: {e}"}
         log.error('%sobserved join failed: %s', f'[{audit_id[:8]}] ', e)
+        # FAIL-CLOSED: a join that died mid-loop may have left model-emitted
+        # observed blocks unstripped. Without a completed join no observed
+        # block is trustworthy, so drop them all rather than let a fabricated
+        # proof reach the shadow's evidence gate.
+        _fs = audit.get("findings")
+        for _f in (_fs if isinstance(_fs, list) else []):
+            if isinstance(_f, dict):
+                _f.pop("observed", None)
 
     # ------------------------------------------------------------------
     # PER-FINDING FIX BACKSTOP (§2) — fail/warn findings the model left
@@ -1045,6 +1168,11 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
     # score-bearing field so nothing malformed can reach persistence or the
     # public renderer (closes the LLM-arithmetic + score-forgery/XSS vector).
     # ------------------------------------------------------------------
+    # `scoring_shadow` is RUNTIME-OWNED metadata: discard anything the model
+    # emitted under these keys so a forged shadow can't survive the
+    # recompute-failure path below (where they would otherwise be kept as-is).
+    md.pop("scoring_shadow", None)
+    md.pop("scoring_shadow_reason", None)
     try:
         from scoring import finalize_scoring
         audit = finalize_scoring(audit)

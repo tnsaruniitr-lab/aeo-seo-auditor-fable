@@ -102,6 +102,12 @@ PCR_WEIGHTS: Dict[str, float] = {
 }
 assert abs(sum(PCR_WEIGHTS.values()) - 1.0) < 1e-9, 'PCR weights must sum to 1.0'
 
+# Section letters PCR actually scores (I/GEO feeds BAP instead). The shadow's
+# coverage counters are restricted to these so 'findings_total' never claims
+# findings the PCR math (classic or shadow) can't count.
+_PCR_SECTIONS = frozenset(L for L, key in SECTION_KEYS.items()
+                          if key in PCR_WEIGHTS)
+
 # Brand AI Presence (BAP) sub-weights, grouped by check id. Sums to 1.00.
 # BAP is a directional signal derived from GEO (section I) checks.
 BAP_GROUPS: Dict[str, Tuple[List[str], float]] = {
@@ -303,13 +309,20 @@ def _section_of(finding: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _evidence_backed(f: Dict[str, Any], tier: str) -> bool:
-    """SHADOW gate: does this finding's verdict ride on real evidence? True for
-    a measured tier, or a runtime-attached observed block whose method is an
-    actual observation (never model-judgment). `tier` is the finding's
-    effective evidence tier as resolved by the caller."""
-    if tier == EVIDENCE_MEASURED:
-        return True
+def _evidence_backed(f: Dict[str, Any]) -> bool:
+    """SHADOW gate: does this finding's verdict ride on evidence the runtime
+    actually holds? True ONLY for an attached observed block whose method is a
+    real observation (never model-judgment).
+
+    Deliberately ignores `evidence_tier`: on the agent path the model authors
+    the findings, and both an explicit tier stamp and a measured-family
+    check_id are model-forgeable — the observed block is not. On the agent
+    path agent._join_observed strips every model-emitted observed block and
+    attaches one iff a deterministic producer really measured the check (with
+    a fail-closed strip when the join dies); on the legacy pipeline path
+    compute_section_scores stamps its own blocks over Python verdicts. Either
+    way `observed` is producer-owned, so it is the one signal the shadow may
+    trust."""
     obs = f.get('observed')
     return isinstance(obs, dict) and obs.get('method') in REAL_OBSERVED_METHODS
 
@@ -378,11 +391,14 @@ def compute_from_findings(findings: List[Dict[str, Any]],
             w = _check_weight(f)
             wsum[sec] += w
             wval[sec] += w * _STATUS_VAL[st]
-            applicable_total += 1
-            if _evidence_backed(f, et):
-                ev_counted += 1
-                ev_wsum[sec] += w
-                ev_wval[sec] += w * _STATUS_VAL[st]
+            if sec in _PCR_SECTIONS:
+                # Shadow coverage counts only PCR-scored sections — I (GEO)
+                # findings feed BAP, not PCR, so neither counter claims them.
+                applicable_total += 1
+                if _evidence_backed(f):
+                    ev_counted += 1
+                    ev_wsum[sec] += w
+                    ev_wval[sec] += w * _STATUS_VAL[st]
 
     section_scores: Dict[str, Optional[float]] = {}
     for L, key in SECTION_KEYS.items():
@@ -456,9 +472,10 @@ def compute_from_findings(findings: List[Dict[str, Any]],
             'grade_evidence': grade_for(pcr_evidence),
             'delta_vs_classic': round(pcr_evidence - pcr, 1),
             'coverage': {
-                # findings_total = findings the CLASSIC score counts
-                # (applicable, sectioned); findings_counted = the
-                # evidence-backed subset the shadow retains.
+                # findings_total = applicable, sectioned findings in the
+                # PCR-scored sections (I/GEO feeds BAP, not PCR, so it is
+                # excluded); findings_counted = the evidence-backed subset
+                # the shadow retains.
                 'findings_counted': ev_counted,
                 'findings_total': applicable_total,
                 'sections_with_data': sections_with_data,
@@ -561,6 +578,43 @@ def recompute_scores(audit: Dict[str, Any]) -> Dict[str, Any]:
     return audit
 
 
+def clamp_shadow(shadow: Any) -> Optional[Dict[str, Any]]:
+    """Clamp/enum-guard ONE shadow block; returns the sanitized dict or None.
+
+    The shadow lives in two copies — scoring['shadow'] (validated in
+    validate_audit) and the metadata.scoring_shadow mirror that reloaded
+    audits fall back to — and BOTH must pass this single clamp before any
+    renderer or API forwards them. Kept separate from _num_or_none because
+    delta_vs_classic is legitimately NEGATIVE ([-100, 100] clamp), and
+    coverage counters must come out as non-negative ints or not at all.
+    Mutates in place (pass a copy if the source must stay pristine); never
+    raises."""
+    if not isinstance(shadow, dict):
+        return None
+    shadow['pcr_evidence'] = _num_or_none(shadow.get('pcr_evidence'))
+    sg = str(shadow.get('grade_evidence') or '').strip()
+    if sg not in VALID_GRADES:
+        shadow['grade_evidence'] = grade_for(shadow.get('pcr_evidence'))
+    d = shadow.get('delta_vs_classic')
+    if isinstance(d, bool) or not isinstance(d, (int, float)) \
+            or not math.isfinite(float(d)):
+        shadow['delta_vs_classic'] = None
+    else:
+        shadow['delta_vs_classic'] = round(max(-100.0, min(100.0, float(d))), 1)
+    if 'coverage' in shadow:
+        cov = shadow.get('coverage')
+        clean = {}
+        if isinstance(cov, dict):
+            for k in ('findings_counted', 'findings_total', 'sections_with_data'):
+                v = cov.get(k)
+                if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                        or not math.isfinite(float(v)):
+                    continue
+                clean[k] = max(0, int(v))
+        shadow['coverage'] = clean or None
+    return shadow
+
+
 def validate_audit(audit: Dict[str, Any]) -> Dict[str, Any]:
     """Clamp/enum-guard every score-bearing field so nothing malformed can reach
     persistence or the public renderer. Idempotent; never raises.
@@ -597,23 +651,9 @@ def validate_audit(audit: Dict[str, Any]) -> Dict[str, Any]:
         scoring['overall_grade'] = grade_for(scoring.get('overall_score'))
 
     # SHADOW backstop — same clamp discipline as the classic fields so a
-    # persisted-then-edited shadow can't reach the renderer malformed. Kept
-    # separate because delta_vs_classic is legitimately NEGATIVE, so it gets
-    # its own [-100, 100] clamp instead of riding _num_or_none (0..100).
-    shadow = scoring.get('shadow')
-    if shadow is not None and not isinstance(shadow, dict):
-        scoring['shadow'] = None
-    elif isinstance(shadow, dict):
-        shadow['pcr_evidence'] = _num_or_none(shadow.get('pcr_evidence'))
-        sg = str(shadow.get('grade_evidence') or '').strip()
-        if sg not in VALID_GRADES:
-            shadow['grade_evidence'] = grade_for(shadow.get('pcr_evidence'))
-        d = shadow.get('delta_vs_classic')
-        if isinstance(d, bool) or not isinstance(d, (int, float)) \
-                or not math.isfinite(float(d)):
-            shadow['delta_vs_classic'] = None
-        else:
-            shadow['delta_vs_classic'] = round(max(-100.0, min(100.0, float(d))), 1)
+    # persisted-then-edited shadow can't reach the renderer malformed.
+    if scoring.get('shadow') is not None:
+        scoring['shadow'] = clamp_shadow(scoring.get('shadow'))
 
     # Guard finding statuses too — the renderer keys icons off these.
     # Also stamp the evidence tier (roadmap 0.1): additive — an explicit valid

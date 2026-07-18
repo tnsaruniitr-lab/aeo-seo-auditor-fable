@@ -208,9 +208,9 @@ assert_contains "fix backstop joins narrative by check_id (never invents); compa
 
 # ----------------------------------------------------------------------
 echo ""
-echo "[10m] Shadow dual-score: classic byte-identity + evidence-weighted math + null paths + surfaces"
+echo "[10m] Shadow dual-score: classic byte-identity + observed-gated evidence math + null paths + surfaces"
 OUT=$(cd "${SERVICE_DIR}" && python3 "${SCRIPT_DIR}/test_shadow_scoring.py" 2>&1)
-assert_contains "classic scoring byte-identical (golden); shadow counts only evidence-backed findings, renormalized; null with reason when no evidence; validate backstop; compact shadowScore + hero line gated on non-null" "$OUT" "SHADOW_SCORING_OK"
+assert_contains "classic scoring byte-identical (golden); shadow counts only runtime-observed findings (forgeable tier/check_id closed), renormalized, GEO excluded from coverage; null with reason when no evidence; clamp_shadow on both copies (validate + compact metadata fallback); hero line gated on non-null" "$OUT" "SHADOW_SCORING_OK"
 
 # ----------------------------------------------------------------------
 echo ""
