@@ -1,0 +1,10 @@
+{
+  "_comment": "Known-drift check_id aliases (check_vocab.py semantic guard). Each entry is an explicit, human-approved rename: variant id the model has been seen emitting -> the canonical brain-mappings id for the SAME check. Use this table for renames the stopword-stripped token-overlap test cannot prove on its own (acronyms, synonyms). The variant's letter+number slot must match the canonical's — check_vocab refuses cross-slot entries.",
+  "aliases": {
+    "A10_robots_txt": "A10_robots_txt_crawling",
+    "A10_robots_txt_allows_crawling": "A10_robots_txt_crawling",
+    "B10_cwv": "B10_core_web_vitals",
+    "E1_perplexity_bot_access": "E1_perplexitybot_allowed",
+    "E10_ai_crawler_access": "E10_claudebot_chatgpt_applebot"
+  }
+}
