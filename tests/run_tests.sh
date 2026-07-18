@@ -202,6 +202,12 @@ assert_contains "observed only on a real script match (script's words, honest me
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10l] Fix chain: per-finding fix backstop + compact fix/https + brain-retrieve evidence + deprecation guard"
+OUT=$(cd "${SERVICE_DIR}" && python3 "${SCRIPT_DIR}/test_fix_chain.py" 2>&1)
+assert_contains "fix backstop joins narrative by check_id (never invents); compact prefers finding.fix + https fullReportUrl; retrieve evidence-led (truncate 400); deprecated guidance excluded+counted in attach/ranker/fix-sources" "$OUT" "FIX_CHAIN_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do

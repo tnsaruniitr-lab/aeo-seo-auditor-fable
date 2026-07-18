@@ -299,6 +299,60 @@ def _snapshot_cite(kind: str, row: dict, score: float, snapshot_date: Optional[s
 
 
 # ----------------------------------------------------------------------
+# DEPRECATION GUARD (contract §7) — deprecated-guidance.json lists
+# case-insensitive regex/substring patterns for guidance the ecosystem has
+# retired (seed: Google's 2023-08 HowTo rich-results deprecation + FAQ
+# rich-results restriction). A candidate citation whose text matches is
+# EXCLUDED from selection — an audit must never prescribe a dead feature.
+# Callers with a stats channel (citation_attach, ground_fix_sources) count
+# exclusions as `deprecated_excluded`; select_citations excludes silently.
+# ----------------------------------------------------------------------
+
+_DEPRECATED_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'deprecated-guidance.json')
+_DEPRECATED_CACHE: Optional[List[dict]] = None
+_DEPRECATED_TEXT_FIELDS = ('name', 'title', 'if_condition', 'then_action',
+                           'description', 'statement', 'explanation')
+
+
+def deprecated_entries() -> List[dict]:
+    """Load + compile deprecated-guidance.json once. Never raises; a missing
+    or malformed file (or one bad pattern) degrades to fewer entries."""
+    global _DEPRECATED_CACHE
+    if _DEPRECATED_CACHE is None:
+        entries = []
+        try:
+            with open(_DEPRECATED_PATH) as f:
+                raw = json.load(f)
+            for e in raw if isinstance(raw, list) else []:
+                if not isinstance(e, dict) or not e.get('pattern'):
+                    continue
+                try:
+                    e = dict(e)
+                    e['_re'] = re.compile(str(e['pattern']), re.IGNORECASE)
+                    entries.append(e)
+                except re.error:
+                    continue
+        except Exception:
+            entries = []
+        _DEPRECATED_CACHE = entries
+    return _DEPRECATED_CACHE
+
+
+def deprecated_match(cite: Optional[dict]) -> Optional[dict]:
+    """Return the deprecated-guidance entry whose pattern matches this
+    candidate citation's text, else None. Case-insensitive; checks every
+    text-bearing field the three snapshot kinds carry."""
+    if not isinstance(cite, dict):
+        return None
+    text = ' '.join(str(cite.get(k) or '') for k in _DEPRECATED_TEXT_FIELDS)
+    for entry in deprecated_entries():
+        if entry['_re'].search(text):
+            return entry
+    return None
+
+
+# ----------------------------------------------------------------------
 # CITATION SELECTION (the deterministic ranker)
 # ----------------------------------------------------------------------
 
@@ -379,6 +433,12 @@ def select_citations(
             'from': 'snapshot', 'snapshot_date': _snap,
             'freshness': 'snapshot', 'last_verified': None,
         })
+
+    # Deprecation guard (§7): curated mappings can outlive the guidance they
+    # point at — drop candidates whose text prescribes a retired feature
+    # (HowTo rich results, FAQ rich-result eligibility). No stats channel
+    # here; the attach pass counts exclusions on the paths that reach findings.
+    candidates = [c for c in candidates if deprecated_match(c) is None]
 
     # Filter by page_type if rules carry tags (gracefully degrade if untagged)
     if page_type:

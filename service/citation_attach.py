@@ -48,6 +48,22 @@ def _get_query_brain():
     return _query_brain_fn
 
 
+def _get_deprecated_match():
+    """Resolve ranker.deprecated_match (§7) with the ruleset dir on sys.path.
+    Returns None when unavailable — the guard degrades open, never breaks
+    the attach pass (exclusion is a freshness nicety, not a safety gate)."""
+    try:
+        import os
+        import sys
+        rd = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ruleset')
+        if rd not in sys.path:
+            sys.path.insert(0, rd)
+        from ranker import deprecated_match
+        return deprecated_match
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def attach_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Attach deterministic citations to every fail/warn finding, replacing
     the model's selection. Mutates and returns the audit plus stats."""
@@ -55,7 +71,8 @@ def attach_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, A
                              'checks_cited': 0, 'citations_attached': 0,
                              'llm_lists_replaced': 0, 'empty_retrievals': 0,
                              'evidence_led': 0, 'cites_supporting': 0,
-                             'cites_related_only': 0, 'errors': 0}
+                             'cites_related_only': 0,
+                             'deprecated_excluded': 0, 'errors': 0}
     try:
         from binding_gate import supports as _supports, _tokens as _sup_tokens
         findings = audit.get('findings')
@@ -65,6 +82,7 @@ def attach_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, A
         page_type = cls.get('page_type') or 'homepage'
         industry = cls.get('industry') or 'other'
         qb = _get_query_brain()
+        dep_match = _get_deprecated_match()
 
         for f in findings:
             if not isinstance(f, dict):
@@ -89,8 +107,20 @@ def attach_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, A
                 ev = f.get('evidence') if isinstance(f.get('evidence'), str) else None
                 res = qb(query_id, page_type, industry, MAX_CITATIONS,
                          evidence=ev, evidence_led=evidence_led) or {}
-                cites = [c for c in (res.get('citations') or [])
-                         if isinstance(c, dict)][:MAX_CITATIONS]
+                raw = [c for c in (res.get('citations') or [])
+                       if isinstance(c, dict)]
+                # Deprecation guard (§7): retired guidance (HowTo rich
+                # results, FAQ rich-result promises) is excluded BEFORE the
+                # cap so a fresher candidate can take its slot, and counted.
+                if dep_match is not None:
+                    kept = []
+                    for c in raw:
+                        if dep_match(c):
+                            stats['deprecated_excluded'] += 1
+                        else:
+                            kept.append(c)
+                    raw = kept
+                cites = raw[:MAX_CITATIONS]
             except Exception as e:  # noqa: BLE001 — one bad check must not stop the pass
                 from sieve_brain import SieveLiveError
                 if isinstance(e, SieveLiveError):

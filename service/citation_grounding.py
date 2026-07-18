@@ -488,11 +488,14 @@ def ground_fix_sources(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
     """Resolve brain-object references in narrative.top_5_fixes into linked
     sources. Mutates and returns (audit, stats). Never raises."""
     stats: Dict[str, Any] = {'applied': True, 'fixes_scanned': 0,
-                             'refs_found': 0, 'resolved': 0, 'unresolved': 0}
+                             'refs_found': 0, 'resolved': 0, 'unresolved': 0,
+                             'deprecated_excluded': 0}
     try:
         fixes = (audit.get('narrative') or {}).get('top_5_fixes')
         if not isinstance(fixes, list) or not fixes:
             return audit, stats
+        from citation_attach import _get_deprecated_match
+        dep_match = _get_deprecated_match()
 
         per_fix_refs: List[List[Tuple[str, str]]] = []
         wanted: Dict[str, List[str]] = {k: [] for k in _KIND_CFG}
@@ -535,6 +538,12 @@ def ground_fix_sources(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
                 if not _supports_fix(claimed, auth):
                     stats['unresolved'] += 1
                     stats['rejected_offtopic'] = stats.get('rejected_offtopic', 0) + 1
+                    continue
+                # Deprecation guard (§7): a WHY paragraph must not link its
+                # claim to guidance the ecosystem has retired (HowTo rich
+                # results et al.) — excluded and counted, never attached.
+                if dep_match is not None and dep_match(auth):
+                    stats['deprecated_excluded'] += 1
                     continue
                 stats['resolved'] += 1
                 sources.append({
