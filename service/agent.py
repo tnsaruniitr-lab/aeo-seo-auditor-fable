@@ -679,6 +679,52 @@ _AUDIT_TAG_RE = re.compile(r"<audit>\s*(\{.*?\})\s*</audit>", re.DOTALL)
 _REQUIRED_AUDIT_FIELDS = ("scoring", "findings")
 
 
+def _join_observed(audit: Dict[str, Any], scripts_output: Any) -> Dict[str, Any]:
+    """OBSERVED PROOF (D25, agent path) — join the deterministic scripts'
+    structured detail back onto the LLM's findings by canonical check_id.
+    Honesty rules (contract §5):
+
+      - `observed` attaches ONLY when the join matched a real script check
+        (no URL-only fallback: a finding the scripts never measured gets no
+        observed block at all)
+      - `measured_value` is the SCRIPT's evidence string, never the model's
+        rewording of it
+      - `method` derives from scoring.observed_method_for (evidence tier +
+        off-page family), one of measured-on-page | observed-off-page |
+        model-judgment
+
+    Mutates the audit in place; returns the stats dict for metadata."""
+    from scoring import observed_method_for
+    scripts_output = scripts_output if isinstance(scripts_output, dict) else {}
+    all_checks = scripts_output.get("all_checks", {})
+    all_checks = all_checks if isinstance(all_checks, dict) else {}
+    by_clean = {str(k).split(":", 1)[-1]: v for k, v in all_checks.items()
+                if isinstance(v, dict)}
+    joined = unmatched = 0
+    for f in (audit.get("findings") or []):
+        if not isinstance(f, dict) or f.get("observed"):
+            continue
+        cd = by_clean.get(str(f.get("check_id")))
+        if not isinstance(cd, dict):
+            unmatched += 1  # no deterministic match -> no observed block
+            continue
+        detail = cd.get("detail") if isinstance(cd.get("detail"), dict) else None
+        url = None
+        if detail:
+            url = detail.get("url") or detail.get("page_url") or detail.get("final_url")
+        url = url or scripts_output.get("final_url") or scripts_output.get("url")
+        measured = cd.get("evidence")
+        f["observed"] = {
+            "customer_url": url,
+            "measured_value": measured if isinstance(measured, str) and measured else None,
+            "detail": detail,
+            "method": observed_method_for(f.get("check_id")),
+        }
+        joined += 1
+    return {"applied": True, "joined": joined, "unmatched": unmatched,
+            "findings": len(audit.get("findings") or [])}
+
+
 def _audit_missing_fields(audit: Dict[str, Any]) -> List[str]:
     """Return the required top-level fields absent or wrong-typed in `audit`.
     A usable audit must carry a scoring dict and a findings list."""
@@ -858,35 +904,13 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
     # ------------------------------------------------------------------
     # OBSERVED PROOF (D25, agent path) — the LLM emits findings without the
     # structured detail the deterministic scripts measured. Join it back by
-    # check_id so every finding carries observed{customer_url, measured_value,
-    # detail} — the 'on YOUR page, X=Y' half of the proof, alongside the
-    # authoritative citation. Additive; runs after check_ids are canonical.
+    # check_id so a finding the scripts REALLY measured carries
+    # observed{customer_url, measured_value, detail, method} — the 'on YOUR
+    # page, X=Y' half of the proof. Honesty-gated (§5): no script match means
+    # no observed block. Additive; runs after check_ids are canonical.
     # ------------------------------------------------------------------
     try:
-        scripts_output = loop_result.get("scripts_output") or {}
-        all_checks = scripts_output.get("all_checks", {}) if isinstance(scripts_output, dict) else {}
-        by_clean = {str(k).split(":", 1)[-1]: v for k, v in all_checks.items()
-                    if isinstance(v, dict)}
-        joined = 0
-        for f in (audit.get("findings") or []):
-            if not isinstance(f, dict) or f.get("observed"):
-                continue
-            cd = by_clean.get(str(f.get("check_id")), {})
-            detail = cd.get("detail") if isinstance(cd.get("detail"), dict) else None
-            url = None
-            if detail:
-                url = detail.get("url") or detail.get("page_url") or detail.get("final_url")
-            url = url or scripts_output.get("final_url") or scripts_output.get("url")
-            if url or detail:
-                f["observed"] = {
-                    "customer_url": url,
-                    "measured_value": f.get("evidence") or None,
-                    "detail": detail,
-                    "method": f.get("evidence_tier", "measured"),
-                }
-                joined += 1
-        md["observed_join"] = {"applied": True, "joined": joined,
-                               "findings": len(audit.get("findings") or [])}
+        md["observed_join"] = _join_observed(audit, loop_result.get("scripts_output"))
     except Exception as e:
         md["observed_join"] = {"applied": False, "error": f"{type(e).__name__}: {e}"}
         log.error('%sobserved join failed: %s', f'[{audit_id[:8]}] ', e)

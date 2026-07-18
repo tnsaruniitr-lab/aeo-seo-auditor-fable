@@ -342,11 +342,16 @@ def _snapshot_fields(kind: str, rid: str) -> Optional[Dict[str, Any]]:
 
 def reground_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Overwrite every finding citation's content/source fields with the
-    authoritative stored values, resolved by (kind, id). Mutates and returns
-    the audit plus a stats dict. Never raises."""
+    authoritative stored values, resolved by (kind, id). Re-stamps
+    supports_finding (§6) against the authoritative text — the attach-time
+    verdict was computed over retrieval-time fields, which this pass may have
+    just corrected. Mutates and returns the audit plus a stats dict. Never
+    raises."""
     stats = {'applied': True, 'citations_total': 0, 'regrounded_live': 0,
-             'regrounded_snapshot': 0, 'unresolved': 0, 'text_corrected': 0}
+             'regrounded_snapshot': 0, 'unresolved': 0, 'text_corrected': 0,
+             'support_stamped': 0}
     try:
+        from binding_gate import supports as _supports, _tokens as _sup_tokens
         findings = audit.get('findings')
         if not isinstance(findings, list):
             return audit, stats
@@ -381,6 +386,7 @@ def reground_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
             citations = f.get('citations')
             if not isinstance(citations, list):
                 continue
+            ftok = _sup_tokens(f.get('evidence'), f.get('title'))
             for c in citations:
                 if not isinstance(c, dict):
                     stats['unresolved'] += 1
@@ -435,6 +441,11 @@ def reground_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
                 c['id'] = rid
                 c['grounded'] = grounded
                 c['verbatim'] = True
+                # §6: re-stamp support against the AUTHORITATIVE text (the
+                # attach-time stamp saw pre-correction fields). Unresolved
+                # cites above keep their attach-time verdict untouched.
+                c['supports_finding'] = _supports(ftok, c)
+                stats['support_stamped'] += 1
                 stats['regrounded_live' if grounded == 'sieve-live'
                       else 'regrounded_snapshot'] += 1
                 if changed:
@@ -582,7 +593,9 @@ def _selftest() -> None:
     )
 
     audit = {'findings': [
-        {'check_id': 'D6_required_fields', 'status': 'fail', 'citations': [
+        {'check_id': 'D6_required_fields', 'status': 'fail',
+         'evidence': 'organization schema missing the name and url properties',
+         'citations': [
             # LLM paraphrased the quote and dropped the source fields
             {'id': '1668', 'kind': 'rule',
              'name': 'Org schema needs name/URL (paraphrased)',
@@ -614,14 +627,21 @@ def _selftest() -> None:
     assert c1['source_org'] == 'Schema.org' and c1['tier'] == 1, c1
     assert c1['source_url'] == 'https://schema.org/Organization', c1
     assert c1['verbatim'] is True and c1['grounded'] == 'snapshot', c1
+    # §6: support re-stamped against the AUTHORITATIVE text — the evidence
+    # shares the rule's vocabulary, so this cite backs the finding.
+    assert c1['supports_finding'] is True, c1
 
     ghost = audit['findings'][0]['citations'][1]
     assert ghost['grounded'] == 'unresolved' and ghost['verbatim'] is False, ghost
     assert ghost['name'] == 'ghost rule', 'unresolved citations must keep their text'
+    assert 'supports_finding' not in ghost, ('unresolved cites keep their '
+                                             'attach-time verdict', ghost)
 
     ap = audit['findings'][1]['citations'][0]
     assert ap['kind'] == 'ap' and ap['risk_level'] == 'high', ap
     assert ap['if_condition'].startswith('Marking up FAQs'), ap
+    # evidence-less finding: conservative support test refuses -> False
+    assert ap['supports_finding'] is False, ap
 
     mislabeled = audit['findings'][1]['citations'][1]
     assert mislabeled['kind'] == 'ap', ('mislabeled kind must recover to the '
@@ -637,7 +657,8 @@ def _selftest() -> None:
 
     assert stats == {'applied': True, 'citations_total': 7, 'regrounded_live': 0,
                      'regrounded_snapshot': 4, 'unresolved': 3,
-                     'text_corrected': 3, 'kind_corrected': 1}, stats
+                     'text_corrected': 3, 'support_stamped': 4,
+                     'kind_corrected': 1}, stats
 
     # Robustness: snapshot loader exploding must degrade, never raise.
     _SNAPSHOT_CACHE = None

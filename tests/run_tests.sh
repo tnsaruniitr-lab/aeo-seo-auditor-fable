@@ -104,15 +104,15 @@ assert_contains "citations re-fetched from brain by id; paraphrase overwritten; 
 
 # ----------------------------------------------------------------------
 echo ""
-echo "[6] Check-id vocabulary — canonicalization against brain-mappings"
+echo "[6] Check-id vocabulary — semantic guard + canonicalization against brain-mappings"
 OUT=$(cd "${SERVICE_DIR}" && python3 check_vocab.py 2>&1)
-assert_contains "variant check_ids renamed; sub-checks/unknowns preserved; collision-safe" "$OUT" "VOCAB_OK"
+assert_contains "renames need semantic agreement (alias table / token overlap); cross-topic squatters stay foreign; provenance stamped; collision-safe" "$OUT" "VOCAB_OK"
 
 # ----------------------------------------------------------------------
 echo ""
 echo "[7] Deterministic citation attachment — Python cites every fail/warn"
 OUT=$(cd "${SERVICE_DIR}" && python3 citation_attach.py 2>&1)
-assert_contains "fail/warn findings get top-3 brain citations; LLM picks replaced; fault-tolerant" "$OUT" "ATTACH_OK"
+assert_contains "fail/warn findings get top-3 brain citations; LLM picks replaced; supports_finding annotated; foreign/renamed go evidence-led; fault-tolerant" "$OUT" "ATTACH_OK"
 
 # ----------------------------------------------------------------------
 echo ""
@@ -193,6 +193,12 @@ echo ""
 echo "[10j] Sieve binding Phase 5: compact API emits citations + boundRule + brain-mode disclosure"
 OUT=$(python3 "${SCRIPT_DIR}/test_compact_citations.py" 2>&1)
 assert_contains "compact issues carry slim citations + verified boundRule; sourcesMode live/snapshot/mixed/none; snapshotDate surfaced" "$OUT" "COMPACT_CITATIONS_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10k] Evidence identity: observed-join honesty + method labels + evidence-led retrieval + support surfacing"
+OUT=$(cd "${SERVICE_DIR}" && python3 "${SCRIPT_DIR}/test_evidence_identity.py" 2>&1)
+assert_contains "observed only on a real script match (script's words, honest method); evidence_led skips curated mapping; vocabStatus/originalCheckId/supportsFinding surfaced compact+HTML" "$OUT" "EVIDENCE_IDENTITY_OK"
 
 # ----------------------------------------------------------------------
 echo ""

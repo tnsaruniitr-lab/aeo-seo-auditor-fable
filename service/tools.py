@@ -357,7 +357,7 @@ def _get_brain():
 
 def query_brain(check_id: str, page_type: str = "homepage",
                 industry: str = "other", max_citations: int = 3,
-                evidence: str = None) -> Dict[str, Any]:
+                evidence: str = None, evidence_led: bool = False) -> Dict[str, Any]:
     """Query the Sieve brain for citations relevant to a given check_id.
 
     Returns top-N rules + anti-patterns ranked by tier ASC, confidence DESC.
@@ -373,6 +373,12 @@ def query_brain(check_id: str, page_type: str = "homepage",
     like 'A2b_title_uniqueness_sample' (a sub-check of the parent A2) but
     the brain mapping was authored against the parent 'A2_title_tag'. Falling
     back to the parent gives reasonable citations for sub-checks.
+
+    evidence_led=True (contract §6, foreign/renamed check ids): the curated
+    exact-mapping shortcut is SKIPPED entirely — no _resolve_check_id, no
+    select_citations — and retrieval is pure search led by the finding's
+    evidence + the ORIGINAL id's name tail. A model-invented id must not
+    inherit a canonical slot's hand-authored citations.
     """
     # LIVE brain (opt-in via SIEVE_LIVE): retrieve from the fresh Sieve DB
     # (23k rules, real source_url + authority-tier ranking + last_verified).
@@ -403,14 +409,15 @@ def query_brain(check_id: str, page_type: str = "homepage",
     except Exception as e:
         return {"error": f"brain load: {type(e).__name__}: {e}", "citations": []}
 
-    resolved_id = _resolve_check_id(check_id, brain.check_to_rules)
+    resolved_id = check_id if evidence_led else _resolve_check_id(check_id, brain.check_to_rules)
 
     try:
         # Curated mapping first (highest-precision, hand-authored), then TOP UP
         # with evidence-based BM25 search over all three kinds so the ~9.9k-row
         # library and every principle are reachable — and the ~20 checks with an
         # empty mapping (A2_title_tag, B1_ttfb, ...) no longer ship sourceless.
-        curated = select_citations(
+        # Evidence-led mode: curated shortcut skipped (see docstring).
+        curated = [] if evidence_led else select_citations(
             brain=brain, check_id=resolved_id,
             page_type=page_type, industry=industry,
             max_citations=max_citations,

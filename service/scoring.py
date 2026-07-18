@@ -191,6 +191,30 @@ def evidence_tier_for(check_id: Any) -> str:
         return EVIDENCE_MEASURED
     return EVIDENCE_LLM
 
+
+# ---------------------------------------------------------------------------
+# OBSERVED-PROOF METHOD (contract §5) — what kind of observation an attached
+# observed{} block represents. H*/I* checks observe competitors and AI-engine
+# results, not the customer's page — they must never be labeled on-page.
+# ---------------------------------------------------------------------------
+OBSERVED_ON_PAGE = 'measured-on-page'
+OBSERVED_OFF_PAGE = 'observed-off-page'
+OBSERVED_MODEL = 'model-judgment'
+_OFF_PAGE_SECTIONS = frozenset({'H', 'I'})
+
+
+def observed_method_for(check_id: Any) -> str:
+    """Deterministic observed.method for a check id: off-page families first
+    (H competitive, I GEO presence), then measured-on-page for the
+    deterministic script suite, model-judgment for everything else."""
+    cid = str(check_id or '').split(':', 1)[-1].strip()
+    if cid[:1].upper() in _OFF_PAGE_SECTIONS:
+        return OBSERVED_OFF_PAGE
+    if evidence_tier_for(cid) == EVIDENCE_MEASURED:
+        return OBSERVED_ON_PAGE
+    return OBSERVED_MODEL
+
+
 # Bot's-Eye-View classifications meaning the probe never reached real content.
 # A page in one of these states must NOT be scored — the redirect-incident
 # failure mode where a healthy-but-misprobed page scored an F.

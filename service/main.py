@@ -1695,9 +1695,13 @@ function renderBrainSources(findings) {
   let html = '<section><h2>Sources cited (' + totalCites + ' · ' + mode + ')</h2>' + snapBanner;
   for (const t of [1,2,3,4,5]) {
     if (!byTier[t] || !byTier[t].length) continue;
-    // URL-less citations sort last within their tier: a receipt you can click
-    // beats a name you have to trust.
-    byTier[t].sort((a,b) => (a.source_url ? 0 : 1) - (b.source_url ? 0 : 1));
+    // Non-supporting citations sort after supporting ones within their tier
+    // (§6: a "related, not proof" cite must never take the top position);
+    // then URL-less citations sort last — a receipt you can click beats a
+    // name you have to trust.
+    byTier[t].sort((a,b) =>
+      ((a.supports_finding === false ? 1 : 0) - (b.supports_finding === false ? 1 : 0)) ||
+      ((a.source_url ? 0 : 1) - (b.source_url ? 0 : 1)));
     html += '<div class="tier t' + t + '"><h3>' + tierLabels[t] + '</h3>';
     for (const c of byTier[t].slice(0, 12)) {
       const kindLabels = {rule:'Rule', ap:'AP', anti_pattern:'AP', principle:'Principle'};
@@ -1723,6 +1727,10 @@ function renderBrainSources(findings) {
         ? ' <span class="cite-unver" title="no source URL on this rule">no link</span>' : '';
       const provNote = c.url_provenance === 'neighbor-inferred'
         ? ' <span class="cite-unver" title="URL adopted from a similar rule, not the extraction page">inferred link</span>' : '';
+      // §6: retrieval could not tie this cite to the finding it decorates —
+      // still shown (never dropped), but honestly labeled.
+      const related = (c.supports_finding === false)
+        ? ' <span class="cite-unver" title="topically related guidance — not direct proof of this finding">related — not direct proof</span>' : '';
       // The rule's own reasoning, verbatim from the brain: when it applies →
       // what to do. Suppressed for unverified citations — their text is
       // LLM-claimed, not brain-backed.
@@ -1739,7 +1747,7 @@ function renderBrainSources(findings) {
         (safeUrl ? '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' : '') +
         '<span class="nm">' + escapeHtml(name) + '</span>' +
         (safeUrl ? '</a>' : '') +
-        conf + risk + idTag + verified + unverified + noUrl + provNote + reasoning +
+        conf + risk + idTag + verified + unverified + noUrl + provNote + related + reasoning +
         '</div>';
     }
     html += '</div>';
@@ -2642,6 +2650,7 @@ def _slim_citation(c: Dict) -> Optional[Dict]:
         'snapshotDate': c.get('snapshot_date'),
         'lastVerified': c.get('last_verified'),
         'grounded': c.get('grounded'), 'verbatim': c.get('verbatim'),
+        'supportsFinding': c.get('supports_finding'),  # §6: does this cite back THIS finding?
     }
 
 
@@ -2713,6 +2722,8 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
             'fix': fix_hint,
             'checkId': f.get('check_id'),
             'evidenceTier': f.get('evidence_tier'),  # additive: 'measured' | 'llm-judged' | None (legacy audits)
+            'vocabStatus': f.get('vocab_status'),    # §1: 'canonical' | 'aliased' | 'foreign' | None
+            'originalCheckId': f.get('original_check_id'),  # §1: pre-rename id, present iff renamed
             'citations': citations,                  # Phase 5: sourced receipts (was dropped here)
             'boundRule': _slim_bound_rule(f.get('bound_rule')),  # the verified rule this verdict binds to
             'observed': f.get('observed'),           # D25/D27: the 'on YOUR page' proof half
