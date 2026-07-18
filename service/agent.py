@@ -692,8 +692,8 @@ def _join_observed(audit: Dict[str, Any], scripts_output: Any) -> Dict[str, Any]
       - `measured_value` is the SCRIPT's evidence string, never the model's
         rewording of it
       - `method` derives from scoring.observed_method_for (evidence tier +
-        off-page family), one of measured-on-page | observed-off-page |
-        model-judgment
+        off-page family + competitor detail), one of measured-on-page |
+        observed-off-page | observed-competitor | model-judgment
 
     Mutates the audit in place; returns the stats dict for metadata."""
     from scoring import observed_method_for
@@ -725,7 +725,7 @@ def _join_observed(audit: Dict[str, Any], scripts_output: Any) -> Dict[str, Any]
             "customer_url": url,
             "measured_value": measured if isinstance(measured, str) and measured else None,
             "detail": detail,
-            "method": observed_method_for(f.get("check_id")),
+            "method": observed_method_for(f.get("check_id"), detail),
         }
         joined += 1
     return {"applied": True, "joined": joined, "unmatched": unmatched,

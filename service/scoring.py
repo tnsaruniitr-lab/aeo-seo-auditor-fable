@@ -199,21 +199,43 @@ def evidence_tier_for(check_id: Any) -> str:
 # ---------------------------------------------------------------------------
 OBSERVED_ON_PAGE = 'measured-on-page'
 OBSERVED_OFF_PAGE = 'observed-off-page'
+OBSERVED_COMPETITOR = 'observed-competitor'
 OBSERVED_MODEL = 'model-judgment'
 _OFF_PAGE_SECTIONS = frozenset({'H', 'I'})
+# H-family (AEO selection) checks are comparative: their deterministic detail
+# derives from the competitor crawl. Only H earns 'observed-competitor' — the
+# I family observes AI-engine presence, not competitor pages.
+_COMPETITOR_SECTION = 'H'
 
 # Methods that represent a REAL observation (something the runtime measured or
 # looked at), as opposed to a model judgment. The shadow score counts a finding
 # whose observed block carries one of these.
-REAL_OBSERVED_METHODS = frozenset({OBSERVED_ON_PAGE, OBSERVED_OFF_PAGE})
+REAL_OBSERVED_METHODS = frozenset({OBSERVED_ON_PAGE, OBSERVED_OFF_PAGE,
+                                   OBSERVED_COMPETITOR})
 
 
-def observed_method_for(check_id: Any) -> str:
+def _detail_has_competitor_data(detail: Any) -> bool:
+    """True when a deterministic detail block ACTUALLY carries competitor-crawl
+    data: any competitor-named key with a non-empty value. competitors_crawled=0
+    or competitors=[] is not competitor data — the comparison had no basis."""
+    if not isinstance(detail, dict):
+        return False
+    return any('competitor' in str(k).lower() and bool(v)
+               for k, v in detail.items())
+
+
+def observed_method_for(check_id: Any, detail: Any = None) -> str:
     """Deterministic observed.method for a check id: off-page families first
     (H competitive, I GEO presence), then measured-on-page for the
-    deterministic script suite, model-judgment for everything else."""
+    deterministic script suite, model-judgment for everything else. An
+    H-family check whose deterministic `detail` actually contains competitor
+    data refines to 'observed-competitor'; plain off-page stays
+    'observed-off-page'."""
     cid = str(check_id or '').split(':', 1)[-1].strip()
-    if cid[:1].upper() in _OFF_PAGE_SECTIONS:
+    fam = cid[:1].upper()
+    if fam in _OFF_PAGE_SECTIONS:
+        if fam == _COMPETITOR_SECTION and _detail_has_competitor_data(detail):
+            return OBSERVED_COMPETITOR
         return OBSERVED_OFF_PAGE
     if evidence_tier_for(cid) == EVIDENCE_MEASURED:
         return OBSERVED_ON_PAGE

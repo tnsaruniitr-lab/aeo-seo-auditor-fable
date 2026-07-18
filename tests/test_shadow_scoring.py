@@ -90,6 +90,24 @@ assert one['page_citation_readiness'] == round((50 * .10 + 100 * .13) / .36, 1),
 
 
 # ---------------------------------------------------------------------------
+# 3b) 'observed-competitor' (H-family competitor-crawl detail) is a REAL
+#     observation — the shadow counts it like any other observed method
+# ---------------------------------------------------------------------------
+comp = finalize_scoring({
+    'bots_eye_view': {'classification': 'fully_accessible'},
+    'findings': [
+        {'check_id': 'H2_comparison_table', 'section': 'H', 'status': 'pass',
+         'observed': {'method': 'observed-competitor',
+                      'detail': {'competitors_crawled': 5}}},
+        {'check_id': 'C1_heading', 'section': 'C', 'status': 'fail'},  # llm
+    ],
+})['scoring']
+assert comp['shadow']['pcr_evidence'] == 100.0, comp['shadow']
+assert comp['shadow']['coverage'] == {'findings_counted': 1, 'findings_total': 2,
+                                      'sections_with_data': 1}, comp['shadow']
+
+
+# ---------------------------------------------------------------------------
 # 4) Null paths — no evidence at all, and transport-inconclusive
 # ---------------------------------------------------------------------------
 none = finalize_scoring({

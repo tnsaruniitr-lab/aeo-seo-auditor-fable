@@ -4,7 +4,8 @@
 Quality invariants proven here:
   - scoring.observed_method_for: deterministic method labels — off-page
     families (H*/I*) are never labeled on-page; non-measured checks are
-    'model-judgment', never dressed as measurements
+    'model-judgment', never dressed as measurements; H-family details that
+    actually carry competitor-crawl data refine to 'observed-competitor'
   - agent._join_observed honesty gate: `observed` attaches ONLY on a real
     deterministic script match (no URL-only fallback); measured_value is the
     SCRIPT's evidence, never the model's rewording; model-emitted observed
@@ -41,6 +42,23 @@ assert observed_method_for('F3_answer_capsule') == 'model-judgment'
 assert observed_method_for('') == 'model-judgment'
 assert observed_method_for(None) == 'model-judgment'
 
+# competitor refinement: H-family detail that ACTUALLY carries competitor data
+# is 'observed-competitor'; anything else keeps its plain label
+assert observed_method_for('H1_content_depth_vs_competitors',
+                           {'competitors_crawled': 5}) == 'observed-competitor'
+assert observed_method_for('det_checks:H4_schema_vs_competitors',
+                           {'competitor_median_words': 2400}) == 'observed-competitor'
+assert observed_method_for('H1_content_depth_vs_competitors',
+                           {'words': 700}) == 'observed-off-page'
+assert observed_method_for('H1_content_depth_vs_competitors',
+                           {'competitors_crawled': 0}) == 'observed-off-page'
+assert observed_method_for('H1_content_depth_vs_competitors',
+                           {'competitors': []}) == 'observed-off-page'
+assert observed_method_for('I2_brand_mentions',
+                           {'competitors_crawled': 5}) == 'observed-off-page'
+assert observed_method_for('A1_https_enforcement',
+                           {'competitors_crawled': 5}) == 'measured-on-page'
+
 
 # ---------------------------------------------------------------------------
 # 2) agent._join_observed — honesty gate (§5)
@@ -53,7 +71,8 @@ audit = {'findings': [
      'evidence': "the model's rewording of the problem"},
     # LLM-only finding, no script match: NO observed block at all
     {'check_id': 'F3_answer_capsule', 'status': 'fail', 'evidence': 'model judged'},
-    # off-page family with a script match: method must say so
+    # off-page family with a script match whose detail carries competitor
+    # data: method must say competitor, not plain off-page
     {'check_id': 'H1_content_depth_vs_competitors', 'status': 'warn'},
     # model-emitted observed with no script match: STRIPPED, not preserved
     {'check_id': 'A5_robots_meta_indexing',
@@ -82,7 +101,7 @@ assert f0['observed']['detail'] == {'final_url': 'https://cust.example/page',
 assert f0['observed']['customer_url'] == 'https://cust.example/page', f0
 assert 'observed' not in f1, ('no deterministic match -> no observed block '
                               '(URL-only fallback is gone)', f1)
-assert f2['observed']['method'] == 'observed-off-page', f2
+assert f2['observed']['method'] == 'observed-competitor', f2
 assert 'observed' not in f3, ('model-emitted observed must be stripped '
                               '(runtime-owned)', f3)
 assert stats == {'applied': True, 'joined': 2, 'unmatched': 2,
