@@ -7,8 +7,9 @@ Quality invariants proven here:
     'model-judgment', never dressed as measurements
   - agent._join_observed honesty gate: `observed` attaches ONLY on a real
     deterministic script match (no URL-only fallback); measured_value is the
-    SCRIPT's evidence, never the model's rewording; pre-existing observed
-    blocks are untouched
+    SCRIPT's evidence, never the model's rewording; model-emitted observed
+    blocks are STRIPPED (observed is runtime-owned — a fabricated proof can't
+    ride through the gate)
   - tools.query_brain evidence_led: the curated exact-mapping shortcut is
     skipped and the search query is led by evidence + the ORIGINAL id tail
   - _audit_to_compact carries vocabStatus/originalCheckId per issue (§1) and
@@ -54,9 +55,9 @@ audit = {'findings': [
     {'check_id': 'F3_answer_capsule', 'status': 'fail', 'evidence': 'model judged'},
     # off-page family with a script match: method must say so
     {'check_id': 'H1_content_depth_vs_competitors', 'status': 'warn'},
-    # pre-existing observed: untouched
+    # model-emitted observed with no script match: STRIPPED, not preserved
     {'check_id': 'A5_robots_meta_indexing',
-     'observed': {'method': 'measured-on-page', 'customer_url': 'pre'}},
+     'observed': {'method': 'measured-on-page', 'customer_url': 'fabricated'}},
 ]}
 scripts_output = {
     'url': 'https://cust.example/page',
@@ -82,8 +83,10 @@ assert f0['observed']['customer_url'] == 'https://cust.example/page', f0
 assert 'observed' not in f1, ('no deterministic match -> no observed block '
                               '(URL-only fallback is gone)', f1)
 assert f2['observed']['method'] == 'observed-off-page', f2
-assert f3['observed'] == {'method': 'measured-on-page', 'customer_url': 'pre'}, f3
-assert stats == {'applied': True, 'joined': 2, 'unmatched': 1, 'findings': 4}, stats
+assert 'observed' not in f3, ('model-emitted observed must be stripped '
+                              '(runtime-owned)', f3)
+assert stats == {'applied': True, 'joined': 2, 'unmatched': 2,
+                 'stripped_model_observed': 1, 'findings': 4}, stats
 
 # junk shapes never raise
 for shape in ({}, {'findings': None}, {'findings': ['x', 3]}):
@@ -91,7 +94,8 @@ for shape in ({}, {'findings': None}, {'findings': ['x', 3]}):
     assert s['applied'] is True, (shape, s)
 s = agent._join_observed({'findings': [{'check_id': 'A1_https_enforcement'}]},
                          {'all_checks': 'junk'})
-assert s == {'applied': True, 'joined': 0, 'unmatched': 1, 'findings': 1}, s
+assert s == {'applied': True, 'joined': 0, 'unmatched': 1,
+             'stripped_model_observed': 0, 'findings': 1}, s
 
 
 # ---------------------------------------------------------------------------

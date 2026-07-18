@@ -687,6 +687,8 @@ def _join_observed(audit: Dict[str, Any], scripts_output: Any) -> Dict[str, Any]
       - `observed` attaches ONLY when the join matched a real script check
         (no URL-only fallback: a finding the scripts never measured gets no
         observed block at all)
+      - `observed` is runtime-owned: any model-emitted observed block is
+        stripped before the join (counted in stripped_model_observed)
       - `measured_value` is the SCRIPT's evidence string, never the model's
         rewording of it
       - `method` derives from scoring.observed_method_for (evidence tier +
@@ -700,10 +702,15 @@ def _join_observed(audit: Dict[str, Any], scripts_output: Any) -> Dict[str, Any]
     all_checks = all_checks if isinstance(all_checks, dict) else {}
     by_clean = {str(k).split(":", 1)[-1]: v for k, v in all_checks.items()
                 if isinstance(v, dict)}
-    joined = unmatched = 0
+    joined = unmatched = stripped = 0
     for f in (audit.get("findings") or []):
-        if not isinstance(f, dict) or f.get("observed"):
+        if not isinstance(f, dict):
             continue
+        # `observed` is RUNTIME-OWNED on the agent path (this join is its only
+        # legitimate source): discard any model-emitted block so a fabricated
+        # proof can't ride through the honesty gate below.
+        if f.pop("observed", None) is not None:
+            stripped += 1
         cd = by_clean.get(str(f.get("check_id")))
         if not isinstance(cd, dict):
             unmatched += 1  # no deterministic match -> no observed block
@@ -722,6 +729,7 @@ def _join_observed(audit: Dict[str, Any], scripts_output: Any) -> Dict[str, Any]
         }
         joined += 1
     return {"applied": True, "joined": joined, "unmatched": unmatched,
+            "stripped_model_observed": stripped,
             "findings": len(audit.get("findings") or [])}
 
 

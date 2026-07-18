@@ -109,20 +109,6 @@ def _semantically_same(variant: str, canonical_id: str) -> bool:
     return bool(_tail_tokens(variant) & _tail_tokens(canonical_id))
 
 
-def canonical_check_id(check_id: Any) -> Optional[str]:
-    """The canonical id this check_id should map to, or None if it is already
-    canonical / a sub-check / unknown."""
-    if not isinstance(check_id, str):
-        return None
-    canonical, by_prefix = _load_registry()
-    if check_id in canonical:
-        return None
-    m = _CHECK_RE.match(check_id)
-    if not m or m.group(3):  # unparseable or sub-check ('A2b_...') — leave
-        return None
-    return by_prefix.get((m.group(1), m.group(2)))
-
-
 def normalize_check_ids(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """Rename variant check_ids in audit['findings'] to their canonical form
     when the semantic guard approves, and stamp vocabulary provenance
