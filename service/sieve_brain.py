@@ -636,13 +636,25 @@ def _fetch_by_ids(conn, kind: str, ids: List[str]) -> List[Dict[str, Any]]:
     return rows
 
 
+def _spec_query_text(spec: Dict[str, Any]) -> str:
+    """Search text for one retrieve_batch spec. Pure, unit-testable seam:
+    a check_id query is evidence-led via _query_for(check_id, evidence) —
+    the same construction the in-audit citation path uses (contract §3)."""
+    if spec.get('q'):
+        return str(spec['q'])
+    if spec.get('check_id'):
+        return _query_for(spec['check_id'], spec.get('evidence'))
+    return ''
+
+
 def retrieve_batch(queries: List[Dict[str, Any]], min_tier: int = 3,
                    max_citations: int = 3) -> Dict[str, Any]:
     """Batch retrieval for server-to-server consumers (AnswerMonk).
 
-    queries: [{key, q?|check_id?|rule_ids?}] — one result list per key.
+    queries: [{key, q?|check_id?|rule_ids?, evidence?}] — one result list per key.
       q        : free-text search (vector-first, FTS fallback)
-      check_id : auditor-style id, expanded via _query_for
+      check_id : auditor-style id, expanded via _query_for; when the spec
+                 carries `evidence`, it LEADS the query (evidence-led, §3)
       rule_ids : exact rule-id fetch (curated-mapping path)
     min_tier: NORM-slot gate — only citations from orgs at tier <= min_tier
       are returned (tier 5 = unattributed/observed can never be a norm).
@@ -669,8 +681,7 @@ def retrieve_batch(queries: List[Dict[str, Any]], min_tier: int = 3,
                     if spec.get('rule_ids'):
                         rows = _fetch_by_ids(conn, 'rule', list(spec['rule_ids']))
                     else:
-                        text = spec.get('q') or (
-                            _query_for(spec['check_id']) if spec.get('check_id') else '')
+                        text = _spec_query_text(spec)
                         if not text:
                             results[key] = []
                             continue

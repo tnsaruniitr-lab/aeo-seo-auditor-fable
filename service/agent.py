@@ -725,6 +725,64 @@ def _join_observed(audit: Dict[str, Any], scripts_output: Any) -> Dict[str, Any]
             "findings": len(audit.get("findings") or [])}
 
 
+_FIX_MAX_CHARS = 500
+
+
+def _backstop_finding_fixes(audit: Dict[str, Any]) -> Dict[str, Any]:
+    """PER-FINDING FIX (contract §2) — every fail/warn finding should carry an
+    executable `fix` (1–3 imperative steps, joined "; ", ≤500 chars). The model
+    authors it in the findings block; this deterministic backstop covers the
+    findings it left empty by joining the narrative fix written for the same
+    check_id (top_5_fixes first, then all_fixes; the pre-rename id counts too
+    since narrative fixes are keyed on the model's own spelling). No LLM, no
+    invention: a finding with no matching narrative fix simply stays fix-less.
+
+    Mutates the audit in place; returns the stats dict for metadata."""
+    stats = {"applied": True, "eligible": 0, "model_provided": 0,
+             "joined": 0, "unfilled": 0}
+    findings = audit.get("findings")
+    if not isinstance(findings, list):
+        return stats
+
+    narrative = audit.get("narrative")
+    narrative = narrative if isinstance(narrative, dict) else {}
+    by_check: Dict[str, str] = {}
+    for fx in list(narrative.get("top_5_fixes") or []) + \
+            list(narrative.get("all_fixes") or []):
+        if not isinstance(fx, dict):
+            continue
+        cid = fx.get("check_id")
+        if not isinstance(cid, str) or not cid or cid in by_check:
+            continue
+        text = str(fx.get("title") or "").strip()
+        if not text:
+            after = str(fx.get("after") or "").strip()
+            text = after.splitlines()[0].strip() if after else ""
+        if text:
+            by_check[cid] = text[:_FIX_MAX_CHARS]
+
+    for f in findings:
+        if not isinstance(f, dict) or f.get("status") not in ("fail", "warn"):
+            continue
+        stats["eligible"] += 1
+        fix = f.get("fix")
+        if isinstance(fix, (list, tuple)):  # steps as a list -> join per contract
+            fix = "; ".join(str(s).strip() for s in fix if str(s).strip())
+        fix = fix.strip() if isinstance(fix, str) else ""
+        if fix:
+            f["fix"] = fix[:_FIX_MAX_CHARS]
+            stats["model_provided"] += 1
+            continue
+        joined = by_check.get(str(f.get("check_id") or "")) or \
+            by_check.get(str(f.get("original_check_id") or ""))
+        if joined:
+            f["fix"] = joined
+            stats["joined"] += 1
+        else:
+            stats["unfilled"] += 1
+    return stats
+
+
 def _audit_missing_fields(audit: Dict[str, Any]) -> List[str]:
     """Return the required top-level fields absent or wrong-typed in `audit`.
     A usable audit must carry a scoring dict and a findings list."""
@@ -914,6 +972,18 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
     except Exception as e:
         md["observed_join"] = {"applied": False, "error": f"{type(e).__name__}: {e}"}
         log.error('%sobserved join failed: %s', f'[{audit_id[:8]}] ', e)
+
+    # ------------------------------------------------------------------
+    # PER-FINDING FIX BACKSTOP (§2) — fail/warn findings the model left
+    # without a `fix` get the narrative fix authored for the same check_id
+    # (deterministic join, no LLM). Runs after check-id canonicalization so
+    # original_check_id is available for renamed findings.
+    # ------------------------------------------------------------------
+    try:
+        md["fix_backstop"] = _backstop_finding_fixes(audit)
+    except Exception as e:
+        md["fix_backstop"] = {"applied": False, "error": f"{type(e).__name__}: {e}"}
+        log.error('%sfix backstop failed: %s', f'[{audit_id[:8]}] ', e)
 
     # ------------------------------------------------------------------
     # DETERMINISTIC RULE BINDING (mode C) — for MEASURED checks (status came

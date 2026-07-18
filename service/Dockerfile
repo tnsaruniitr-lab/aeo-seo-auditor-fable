@@ -69,5 +69,7 @@ EXPOSE 8000
 
 WORKDIR /app/service
 
-# Run the FastAPI app via uvicorn.
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}
+# Run the FastAPI app via uvicorn. --proxy-headers + --forwarded-allow-ips
+# make uvicorn trust the edge proxy's X-Forwarded-Proto, so request.url.scheme
+# (and therefore fullReportUrl) says https instead of the internal http hop.
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips='*'

@@ -2700,13 +2700,19 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
         evidence = f.get('evidence') or ''
         # Title = first sentence/clause of evidence, capped
         title = evidence.split('.')[0][:120] or f.get('check_id', 'Issue')
-        # Try to match a top fix by keyword
+        # §2: the finding's own executable fix (model-authored, or the runtime
+        # backstop's narrative join) wins; the keyword hint below survives only
+        # for audits persisted before the field existed.
         fix_hint = None
-        check_id_lc = (f.get('check_id') or '').lower()
-        for topic, after in fixes_by_topic.items():
-            if any(tok in topic for tok in check_id_lc.split('_') if len(tok) > 3):
-                fix_hint = (after.split('.')[0])[:160]
-                break
+        own_fix = f.get('fix')
+        if isinstance(own_fix, str) and own_fix.strip():
+            fix_hint = own_fix.strip()[:500]
+        if not fix_hint:
+            check_id_lc = (f.get('check_id') or '').lower()
+            for topic, after in fixes_by_topic.items():
+                if any(tok in topic for tok in check_id_lc.split('_') if len(tok) > 3):
+                    fix_hint = (after.split('.')[0])[:160]
+                    break
         if not fix_hint:
             fix_hint = (f.get('fix_type') or '').replace('_', ' ').title() or None
 
@@ -2754,6 +2760,14 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
     if request is not None:
         scheme = request.url.scheme
         netloc = request.url.netloc
+        # Behind the Railway/CDN edge the app terminates plain HTTP, so the
+        # request scheme reads 'http' unless uvicorn trusts X-Forwarded-Proto
+        # (--proxy-headers). Belt-and-braces: any non-local host is https —
+        # an http:// fullReportUrl breaks as mixed content in consumers.
+        host = (getattr(request.url, 'hostname', None)
+                or netloc.rsplit(':', 1)[0]).strip('[]').lower()
+        if scheme == 'http' and host not in ('localhost', '127.0.0.1', '::1', '0.0.0.0'):
+            scheme = 'https'
         full_url = f"{scheme}://{netloc}/{domain}" if domain else None
     else:
         full_url = f"/{domain}" if domain else None
@@ -3128,6 +3142,9 @@ class BrainQuery(BaseModel):
     q: Optional[str] = Field(None, max_length=400)          # free-text search
     check_id: Optional[str] = Field(None, max_length=120)   # auditor-style id
     rule_ids: Optional[_List[str]] = None                   # exact-id fetch
+    evidence: Optional[str] = None    # §3: finding's observed evidence — leads
+                                      # the check_id query exactly like the
+                                      # in-audit path (server truncates to 400)
 
 
 class BrainRetrieveRequest(BaseModel):
@@ -3142,7 +3159,11 @@ def api_brain_retrieve(req: BrainRetrieveRequest,
     """Batch norm retrieval from the live Sieve brain.
 
     Per query: q (free-text) | check_id (expanded like the audit agent's own
-    queries) | rule_ids (curated-mapping exact fetch). Only status
+    queries) | rule_ids (curated-mapping exact fetch). A check_id query may
+    carry `evidence` (the finding's observed text, truncated server-side to
+    400 chars) — it LEADS the retrieval query via _query_for(check_id,
+    evidence), exactly like the in-audit path, so two findings on the same
+    check with different problems retrieve different norms. Only status
     active/candidate rows are served; the NORM gate (min_tier, default 3)
     means unattributed/observed knowledge can never be returned as a norm.
     Response citations carry source_org, source_url, url_provenance_method,
@@ -3156,7 +3177,8 @@ def api_brain_retrieve(req: BrainRetrieveRequest,
             if not (q.q or q.check_id or q.rule_ids):
                 continue
             specs.append({'key': q.key, 'q': q.q, 'check_id': q.check_id,
-                          'rule_ids': q.rule_ids})
+                          'rule_ids': q.rule_ids,
+                          'evidence': (q.evidence or '')[:400] or None})
         if not specs:
             raise HTTPException(status_code=422,
                                 detail='each query needs q, check_id, or rule_ids')

@@ -197,11 +197,15 @@ effort "getting the number right" — spend it on getting each check's status ri
 G=8%, H=8%, J=3%; GEO section I → BAP, reported separately and directional).
 
 **Phase 12: Fix generation.** For each of the top failures (severity-ranked), \
-write a fix with: title, impact (Critical/High/Medium/Low), effort \
-(Trivial/Easy/Moderate/Heavy), type tag (PAGE HTML / SCHEMA / CONTENT RESTRUCTURE \
-/ SITEWIDE TEMPLATE / OFF-PAGE / CMS CONSTRAINT / CANNOT FIX FROM PAGE), BEFORE \
-state, AFTER state with code blocks, and WHY paragraph invoking specific brain \
-citations. Top 5 are the "headline" fixes; collect all fixes in `all_fixes`.
+write a fix with: check_id (the finding it fixes), title, impact \
+(Critical/High/Medium/Low), effort (Trivial/Easy/Moderate/Heavy), type tag \
+(PAGE HTML / SCHEMA / CONTENT RESTRUCTURE / SITEWIDE TEMPLATE / OFF-PAGE / CMS \
+CONSTRAINT / CANNOT FIX FROM PAGE), BEFORE state, AFTER state with code blocks, \
+and WHY paragraph invoking specific brain citations. Top 5 are the "headline" \
+fixes; collect all fixes in `all_fixes`. Additionally, EVERY fail/warn finding \
+must carry its own `fix` — 1–3 concrete imperative steps for THIS page (joined \
+with "; ", ≤500 chars total); it is the per-issue action line consumers render \
+next to the evidence, so make it executable, not generic.
 
 **Phase 13: Citations — handled by the runtime.** Do NOT run a per-finding \
 `query_brain` sweep and do NOT copy citation objects into the output JSON. \
@@ -280,6 +284,7 @@ object wrapped in `<audit>` ... `</audit>` tags, matching this schema:
       "evidence": "...",
       "truth_badge": "HARD EVIDENCE|MEASURED|STATIC RULE|HEURISTIC|MODEL JUDGMENT|COMPARATIVE",
       "fix_type": "PAGE HTML FIX|SCHEMA FIX|CONTENT RESTRUCTURE|SITEWIDE TEMPLATE FIX|OFF-PAGE|CMS/PLATFORM CONSTRAINT|CANNOT FIX FROM PAGE",
+      "fix": "1–3 concrete imperative steps to fix THIS finding on THIS page, joined with '; ' (≤500 chars). REQUIRED on every fail/warn finding; omit or \\"\\" for pass/na.",
       "citations": []   /* leave empty — runtime attaches deterministic citations */
     }
   ],
@@ -289,9 +294,9 @@ object wrapped in `<audit>` ... `</audit>` tags, matching this schema:
       {"title": "...", "badge": "...", "body": "...", "citation_indexes": [0,1]}
     ],
     "top_5_fixes": [
-      {"rank": 1, "title": "...", "impact": "...", "effort": "...",
-       "type": "...", "truth_badge": "...", "before": "...", "after": "...",
-       "why": "..."}
+      {"rank": 1, "check_id": "D14_hreflang_coverage", "title": "...",
+       "impact": "...", "effort": "...", "type": "...", "truth_badge": "...",
+       "before": "...", "after": "...", "why": "..."}
     ],
     "all_fixes": [ /* same shape, all fixes not just top 5 */ ],
     "quick_wins": ["...", "..."],
