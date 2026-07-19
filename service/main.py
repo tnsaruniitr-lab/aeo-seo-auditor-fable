@@ -197,6 +197,12 @@ MAX_TRACKED_JOBS = int(os.getenv('MAX_TRACKED_JOBS', '500'))
 # A running audit older than this is considered hung and reaped to 'error'
 # so it can't hold a slot / sit in 'running' forever.
 MAX_AUDIT_SECONDS = int(os.getenv('MAX_AUDIT_SECONDS', '1200'))
+# Typical wall-clock of a complete agent audit. Feeds two consumer-facing
+# signals: the estimatedSeconds returned on /api/audit/start (so callers can
+# render a real countdown instead of a hardcoded guess) and the elapsed-time
+# floor in _derive_progress_pct (so progress keeps moving through long
+# tool-free LLM turns).
+EXPECTED_AUDIT_SECONDS = int(os.getenv('EXPECTED_AUDIT_SECONDS', '360'))
 
 # Fail-closed switch: in production a missing auth env var must NOT silently
 # expose the expensive/mutating endpoints. Detected via Railway's injected
@@ -2702,8 +2708,16 @@ def _find_recent_audit_for_url(url: str) -> Optional[str]:
 
 
 def _derive_progress_pct(job: Dict) -> int:
-    """Rough 0–100 progress for status polling. Based on tool_count;
-    typical complete audit emits ~28 tool calls."""
+    """Rough 0–100 progress for status polling.
+
+    Blend of three monotonic signals, take the max:
+      - tool progress: tool_count/30 (typical complete audit ~28 tool calls)
+      - elapsed time:  ramps to 90 over EXPECTED_AUDIT_SECONDS, so the pct
+        keeps moving through long tool-free LLM turns (the final composing
+        turn emits no tool calls and used to freeze the bar for minutes)
+      - pct_hint:      post-loop stages (scoring/entailment/persist) emit an
+        explicit 90–99 hint via the progress callback
+    """
     status_ = job.get('status', 'queued')
     if status_ == 'completed':
         return 100
@@ -2713,7 +2727,18 @@ def _derive_progress_pct(job: Dict) -> int:
         return 2
     p = (job.get('progress') or {})
     tc = p.get('tool_count') or 0
-    return max(5, min(95, int(tc / 30 * 95)))
+    pct = min(95, int(tc / 30 * 95))
+    started = job.get('started_at')
+    if started:
+        try:
+            elapsed = time.time() - datetime.fromisoformat(started).timestamp()
+            pct = max(pct, int(min(90, elapsed / EXPECTED_AUDIT_SECONDS * 90)))
+        except (ValueError, TypeError):
+            pass
+    hint = p.get('pct_hint')
+    if isinstance(hint, (int, float)):
+        pct = max(pct, int(hint))
+    return max(5, min(99, pct))
 
 
 def _public_status(job: Dict, in_supabase: bool) -> str:
@@ -3006,7 +3031,8 @@ async def api_audit_start(req: StartAuditRequest,
     if existing:
         log.info('[%s] idempotency hit for url=%s', existing[:8], url)
         return StartAuditResponse(auditId=existing,
-                                   estimatedSeconds=180, reused=True)
+                                   estimatedSeconds=EXPECTED_AUDIT_SECONDS,
+                                   reused=True)
 
     with JOBS_LOCK:
         _reap_and_evict_locked()
@@ -3047,7 +3073,9 @@ async def api_audit_start(req: StartAuditRequest,
             '_submitted_at': time.time(),
         }
     background_tasks.add_task(_run_audit_background, audit_id, url)
-    return StartAuditResponse(auditId=audit_id, estimatedSeconds=180, reused=False)
+    return StartAuditResponse(auditId=audit_id,
+                              estimatedSeconds=EXPECTED_AUDIT_SECONDS,
+                              reused=False)
 
 
 @app.get('/api/audit/{audit_id}/delta')
@@ -3107,6 +3135,10 @@ def api_audit_status(audit_id: str, _: bool = Depends(require_api_key)):
         'auditId': audit_id,
         'status': status_,
         'progressPct': _derive_progress_pct(job) if job else 0,
+        # Countdown inputs — pollers render "~Xm left" from these instead of
+        # hardcoding an ETA (startedAt is null until the job leaves the queue).
+        'startedAt': job.get('started_at'),
+        'estimatedSeconds': EXPECTED_AUDIT_SECONDS,
     }
     if job.get('progress'):
         p = job['progress']

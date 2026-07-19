@@ -382,6 +382,22 @@ def run_agent_loop(url: str, verbose: bool = False,
                     messages=messages,
                     **_TEMP_KW,
                 ) as stream:
+                    # Watch the text stream for the final composing turn. The
+                    # last turn emits the whole <audit> JSON with zero tool
+                    # calls, so without this the phase label (and pct, which
+                    # was tool-count-driven) froze on the LAST tool for the
+                    # several minutes the model spends writing the report.
+                    _compose_buf = ''
+                    _compose_emitted = False
+                    for _txt in stream.text_stream:
+                        if _compose_emitted:
+                            continue
+                        _compose_buf += _txt
+                        if '<audit' in _compose_buf or len(_compose_buf) > 4000:
+                            _compose_emitted = True
+                            _emit_progress(
+                                'Phase 14: Composing final audit report',
+                                '', turns, len(tool_call_log))
                     response = stream.get_final_message()
                 break
             except Exception as e:
@@ -984,6 +1000,24 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
 
     audit = loop_result.get("audit")
 
+    def _stage(phase: str, pct_hint: int) -> None:
+        """Post-loop progress beacon. pct_hint pins the polled progressPct
+        into the 90–99 finalization band (the loop's tool-count signal is
+        exhausted once the agent stops calling tools)."""
+        if progress_callback is None:
+            return
+        try:
+            progress_callback({
+                'phase': phase,
+                'tool': '',
+                'turn': loop_result.get('turns') or 0,
+                'tool_count': len(loop_result.get('tool_calls', [])),
+                'elapsed_seconds': round(time.time() - started, 1),
+                'pct_hint': pct_hint,
+            })
+        except Exception as e:
+            log.warning('[%s] stage progress callback failed: %s', audit_id[:8], e)
+
     domain = re.sub(r"^https?://", "", url).rstrip("/").split("/")[0]
     duration = round(time.time() - started, 1)
 
@@ -1049,6 +1083,8 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
     _sc_meta = site_context_metadata(site_context)
     if _sc_meta:
         md["site_context"] = _sc_meta
+
+    _stage('Finalizing: verifying findings & evidence', 90)
 
     # ------------------------------------------------------------------
     # CHECK-ID VOCABULARY — the model emits variant check_ids between runs
@@ -1171,6 +1207,7 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
     # `scoring_shadow` is RUNTIME-OWNED metadata: discard anything the model
     # emitted under these keys so a forged shadow can't survive the
     # recompute-failure path below (where they would otherwise be kept as-is).
+    _stage('Finalizing: computing deterministic scores', 93)
     md.pop("scoring_shadow", None)
     md.pop("scoring_shadow_reason", None)
     try:
@@ -1227,6 +1264,7 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
     # blocked on the judge. Default ON; CITATION_ENTAILMENT=0 disables.
     # ------------------------------------------------------------------
     if os.getenv('CITATION_ENTAILMENT', '1') not in ('0', 'false', 'False'):
+        _stage('Finalizing: judging citation relevance', 95)
         try:
             from citation_entailment import judge_citations
             ent_stats = judge_citations(audit.get("findings") or [])
@@ -1319,6 +1357,7 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
         log.info('%sai visibility skipped: caller measures visibility',
                  f'[{audit_id[:8]}] ')
     else:
+        _stage('Finalizing: measuring AI visibility', 96)
         try:
             from ai_visibility import measure_visibility
             audit, vis_stats = measure_visibility(audit)
@@ -1341,6 +1380,7 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
 
     # Render artifacts using the existing renderers from audit_pipeline.py
     # (they consume the same shape we produce).
+    _stage('Finalizing: rendering report artifacts', 97)
     try:
         from audit_pipeline import render_markdown_report, render_pdf_summary
     except ImportError as e:
@@ -1383,6 +1423,7 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
     # audit_id (it's injected above) and the full audit only exists here.
     # Best-effort: a persistence failure never fails the audit itself.
     # ------------------------------------------------------------------
+    _stage('Finalizing: persisting audit', 99)
     try:
         from tools import persist_audit
         persist_result = persist_audit(audit)
