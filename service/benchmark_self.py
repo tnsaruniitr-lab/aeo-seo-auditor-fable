@@ -166,6 +166,37 @@ def status() -> Dict[str, Any]:
         return dict(_state)
 
 
+def detail() -> Dict[str, Any]:
+    """Per-pair verdict-vs-gold table, read from the warm cache (no judging,
+    no spend). Both the pairs and their gold labels already ship publicly in
+    this repo, so serving the comparison exposes nothing new — it exists so
+    the improvement loop can diagnose misjudgment clusters remotely."""
+    import citation_entailment as ce
+    pairs = load_pairs()
+    conn = None
+    try:
+        conn = ce._open_conn()
+    except Exception:  # noqa: BLE001
+        conn = None
+    rows = []
+    for p in pairs:
+        key = ce.cache_key(p.get('finding') or {}, p.get('citation') or {})
+        v = ce._lru_get(key)
+        if v is None and conn is not None:
+            v = ce._db_get(conn, key)
+        rows.append({'i': p.get('i'), 'gold': p.get('gold'), 'verdict': v,
+                     'check': (p.get('finding') or {}).get('check_id'),
+                     'cite': ((p.get('citation') or {}).get('name') or '')[:80],
+                     'agree': v == p.get('gold') if v else None})
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return {'n': len(rows), 'unjudged': sum(1 for r in rows if r['verdict'] is None),
+            'rows': rows}
+
+
 # ---------------------------------------------------------------------------
 # Self-test (stdlib only; stubs the judge — never calls the API)
 # ---------------------------------------------------------------------------

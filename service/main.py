@@ -2069,13 +2069,17 @@ def _brain_ok() -> bool:
 
 
 @app.get('/benchmark-status')
-def benchmark_status():
+def benchmark_status(detail: int = 0):
     """Public, metrics-only: the entailment gate's self-graded acceptance
     scores against the in-repo labelled benchmark (see benchmark_self.py).
     Numbers + model id + git sha only — no data, no config posture. Purely
     read-only: the run is kicked once at app startup (_kick_self_benchmark),
-    so polling this endpoint can never cause spend."""
+    so polling this endpoint can never cause spend. ?detail=1 returns the
+    per-pair verdict-vs-gold table straight from the cache (both pairs and
+    gold labels already ship publicly in-repo; still zero spend)."""
     import benchmark_self
+    if detail:
+        return benchmark_self.detail()
     return benchmark_self.status()
 
 
