@@ -82,10 +82,12 @@ def run_benchmark(pairs: Optional[list] = None,
         citation = p.get('citation') or {}
         gold = p.get('gold')
         try:
-            r = ce.judge_pair(finding, citation, conn=conn, use_cache=use_cache)
+            r = ce.judge_pair(finding, citation, conn=conn, use_cache=use_cache,
+                              retries=3)
         except Exception as e:  # noqa: BLE001 — count and continue
             errors += 1
             log.warning('benchmark judge error on pair %s: %s', p.get('i'), e)
+            time.sleep(1.5)   # let a rate-limit window recover before the next pair
             continue
         judged += 1
         if r.get('cached'):

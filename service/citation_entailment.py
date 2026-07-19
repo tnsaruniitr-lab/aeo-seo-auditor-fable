@@ -58,8 +58,14 @@ UNJUDGED = 'unjudged'
 # ~150-token judgments, cached per rule×check×text (~$0.05/audit worst case,
 # ~zero once warm). MODEL participates in cache_key, so this swap re-judges.
 MODEL = os.getenv('CITATION_ENTAILMENT_MODEL', 'claude-sonnet-4-5')
-CALL_TIMEOUT_S = float(os.getenv('CITATION_ENTAILMENT_TIMEOUT_S', '6'))
-TOTAL_BUDGET_S = float(os.getenv('CITATION_ENTAILMENT_BUDGET_S', '30'))
+CALL_TIMEOUT_S = float(os.getenv('CITATION_ENTAILMENT_TIMEOUT_S', '15'))
+TOTAL_BUDGET_S = float(os.getenv('CITATION_ENTAILMENT_BUDGET_S', '45'))
+# Transient API failures (429 rate limit, 529 overloaded, timeouts) are worth
+# retrying: the first sonnet benchmark run lost 158/206 pairs to instant
+# rate-limit failures under max_retries=0. The AUDIT path stays fail-fast
+# (1 attempt — the unjudged fallback + TOTAL_BUDGET_S protect the audit);
+# the BENCHMARK path is patient (it runs in a daemon thread, latency is free).
+_RETRY_BACKOFF_S = (2.0, 8.0, 20.0)
 
 # Bump whenever _pair_prompt (or verdict semantics) changes: the version is
 # part of cache_key, so a prompt revision re-judges instead of serving the
@@ -277,17 +283,37 @@ def _parse_verdict(text: str) -> Optional[str]:
     return next(iter(found)) if len(found) == 1 else None
 
 
-def _call_api(finding: Dict, citation: Dict) -> str:
-    """One classification call. Raises on missing SDK/key, API error, timeout
-    or unparseable output — the caller decides what a failure means."""
+def _transient(exc: Exception) -> bool:
+    status = getattr(exc, 'status_code', None)
+    if isinstance(status, int) and status in (429, 500, 502, 503, 529):
+        return True
+    return type(exc).__name__ in (
+        'RateLimitError', 'OverloadedError', 'APITimeoutError',
+        'APIConnectionError', 'InternalServerError', 'ServiceUnavailableError',
+    )
+
+
+def _call_api(finding: Dict, citation: Dict, retries: int = 0) -> str:
+    """One classification call (+ up to `retries` backoff retries on transient
+    API failures). Raises on missing SDK/key, terminal API error, timeout or
+    unparseable output — the caller decides what a failure means."""
     from anthropic import Anthropic
     client = Anthropic(timeout=CALL_TIMEOUT_S, max_retries=0)
-    resp = client.messages.create(
-        model=MODEL,
-        max_tokens=64,
-        temperature=0,
-        messages=[{'role': 'user', 'content': _pair_prompt(finding, citation)}],
-    )
+    attempt = 0
+    while True:
+        try:
+            resp = client.messages.create(
+                model=MODEL,
+                max_tokens=64,
+                temperature=0,
+                messages=[{'role': 'user', 'content': _pair_prompt(finding, citation)}],
+            )
+            break
+        except Exception as e:  # noqa: BLE001
+            if attempt >= retries or not _transient(e):
+                raise
+            time.sleep(_RETRY_BACKOFF_S[min(attempt, len(_RETRY_BACKOFF_S) - 1)])
+            attempt += 1
     text = ''.join(getattr(b, 'text', '') for b in resp.content
                    if getattr(b, 'type', '') == 'text')
     v = _parse_verdict(text)
@@ -296,14 +322,14 @@ def _call_api(finding: Dict, citation: Dict) -> str:
     return v
 
 
-def _judge(finding: Dict, citation: Dict) -> str:
+def _judge(finding: Dict, citation: Dict, retries: int = 0) -> str:
     if _judge_fn is not None:
         return _judge_fn(finding, citation)
-    return _call_api(finding, citation)
+    return _call_api(finding, citation, retries=retries)
 
 
 def judge_pair(finding: Dict, citation: Dict, conn: Any = None,
-               use_cache: bool = True) -> Dict[str, Any]:
+               use_cache: bool = True, retries: int = 0) -> Dict[str, Any]:
     """Judge one finding<->citation pair. Returns
     {'verdict': 'supports'|'related'|'unrelated', 'cached': bool}.
 
@@ -328,7 +354,7 @@ def judge_pair(finding: Dict, citation: Dict, conn: Any = None,
         if v is not None:
             _lru_put(key, v)
             return {'verdict': v, 'cached': True}
-        v = _judge(finding, citation)
+        v = _judge(finding, citation, retries=retries)
         if v not in VERDICTS:
             raise ValueError(f'judge returned invalid verdict: {v!r}')
         _lru_put(key, v)
