@@ -1671,7 +1671,7 @@ function renderBrainSources(findings) {
   // Collect unique citations grouped by tier. Skip citations that have no
   // usable content (no name AND no source_org AND no source_url) — those
   // are the agent emitting partial/reshaped objects.
-  const seen = new Set();
+  const seen = new Map();  // dedupKey -> best copy (two-pass, see below)
   const byTier = {1:[], 2:[], 3:[], 4:[], 5:[]};
   // Entailment-first display: the LLM judgment (post-loop, on the final
   // verbatim text) decides where a citation renders. 'supports' → proof;
@@ -1683,6 +1683,12 @@ function renderBrainSources(findings) {
   // over the SAME deduped set the header total uses (a rule cited by N checks
   // is one source, not N; malformed citations count nowhere).
   let fromLive = 0, fromSnap = 0, maxVer = '';
+  // PASS 1 — best copy per dedupKey. The same rule cited by two findings can
+  // carry different verdicts; dedup must keep the BEST one (supports >
+  // unjudged > related), not whichever iterated first — otherwise a
+  // 'related' copy consumes the key and the 'supports' copy renders only in
+  // the collapsed see-also, working against the missed-support (<=5%) goal.
+  const verdictRank = (c) => (c.entailment === 'supports') ? 0 : (c.entailment === 'related' ? 2 : 1);
   for (const f of findings) {
     for (const c of (f.citations || [])) {
       const name = c.name || c.title;
@@ -1692,16 +1698,19 @@ function renderBrainSources(findings) {
       // (judged against a different finding) still renders.
       if (c.entailment === 'unrelated') continue;
       const dedupKey = (c.id ?? name) + ':' + (c.kind || '?');
-      if (seen.has(dedupKey)) continue;
-      seen.add(dedupKey);
-      if (c.from === 'snapshot') fromSnap++; else if (c.from) fromLive++;
-      if (c.last_verified && String(c.last_verified) > maxVer) maxVer = String(c.last_verified);
-      if (c.entailment === 'related') { seeAlso.push(c); continue; }
-      // Citations the grounding step could NOT verify against the brain keep
-      // only LLM-claimed fields — never let them claim an authoritative tier.
-      const tier = (c.verbatim === false) ? 5 : (c.tier || 5);
-      (byTier[tier] = byTier[tier] || []).push(c);
+      const prev = seen.get(dedupKey);
+      if (!prev || verdictRank(c) < verdictRank(prev)) seen.set(dedupKey, c);
     }
+  }
+  // PASS 2 — place each deduped source.
+  for (const c of seen.values()) {
+    if (c.from === 'snapshot') fromSnap++; else if (c.from) fromLive++;
+    if (c.last_verified && String(c.last_verified) > maxVer) maxVer = String(c.last_verified);
+    if (c.entailment === 'related') { seeAlso.push(c); continue; }
+    // Citations the grounding step could NOT verify against the brain keep
+    // only LLM-claimed fields — never let them claim an authoritative tier.
+    const tier = (c.verbatim === false) ? 5 : (c.tier || 5);
+    (byTier[tier] = byTier[tier] || []).push(c);
   }
   // Header counts every DISPLAYED source (proof tiers + see-also);
   // hidden 'unrelated' citations were never added to the deduped set.

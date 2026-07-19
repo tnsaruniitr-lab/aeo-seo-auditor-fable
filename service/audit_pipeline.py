@@ -702,24 +702,51 @@ def render_markdown_report(audit: Dict) -> str:
     md.append("")
 
     md.append("## Brain Intelligence Applied\n")
-    seen_ids = set()
-    by_tier = {1: [], 2: [], 3: [], 4: [], 5: []}
+    # Entailment-aware, same policy as the HTML renderer (renderBrainSources):
+    # 'unrelated' citations are hidden here (kept in the JSON — never dropped);
+    # 'related' renders demoted in a see-also list, never as applied proof;
+    # dedup keeps the BEST-judged copy (supports > unjudged > related).
+    kind_labels = {'rule': 'Rule', 'ap': 'AP', 'anti_pattern': 'AP',
+                   'principle': 'Principle', 'playbook': 'Playbook'}
+
+    def _vrank(c):
+        e = c.get('entailment')
+        return 0 if e == 'supports' else (2 if e == 'related' else 1)
+
+    best = {}
     for f in findings:
         for c in f.get('citations', []):
-            if c['id'] in seen_ids:
+            if c.get('entailment') == 'unrelated':
                 continue
-            seen_ids.add(c['id'])
+            prev = best.get(c['id'])
+            if prev is None or _vrank(c) < _vrank(prev):
+                best[c['id']] = c
+    by_tier = {1: [], 2: [], 3: [], 4: [], 5: []}
+    see_also = []
+    for c in best.values():
+        if c.get('entailment') == 'related':
+            see_also.append(c)
+        else:
             by_tier[c['tier']].append(c)
+
+    def _cite_line(c):
+        org = c.get('source_org', 'unknown')
+        name = c.get('name') or c.get('title', '(no name)')
+        kind_label = kind_labels.get(c.get('kind'), 'Item')
+        return f"- **{org}** — \"{name}\" [Sieve {kind_label} #{c['id']}]"
+
     for tier in [1, 2, 3, 4, 5]:
         if not by_tier[tier]:
             continue
         icon = TIER_ICONS[tier]
         md.append(f"### {icon} Tier {tier} sources\n")
         for c in by_tier[tier][:10]:
-            org = c.get('source_org', 'unknown')
-            name = c.get('name') or c.get('title', '(no name)')
-            kind_label = 'Rule' if c['kind'] == 'rule' else 'AP'
-            md.append(f"- **{org}** — \"{name}\" [Sieve {kind_label} #{c['id']}]")
+            md.append(_cite_line(c))
+        md.append("")
+    if see_also:
+        md.append("### See also — related guidance (not direct proof)\n")
+        for c in see_also[:10]:
+            md.append(_cite_line(c))
         md.append("")
 
     md.append("## Audit Metadata\n")
