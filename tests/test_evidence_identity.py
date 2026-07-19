@@ -276,7 +276,9 @@ html = main.INDEX_HTML
 assert 'related — not direct proof' in html, 'non-supporting cite label missing'
 assert "c.supports_finding === false" in html, 'supports_finding gate missing'
 # the tier sort must demote non-supporting cites BEFORE the URL-less tiebreak
-sort_ix = html.index('a.supports_finding === false ? 1 : 0')
+# (since the entailment pass, demotion lives in demoted() — a judged
+# 'supports' verdict overrides the lexical gate, which stays the fallback)
+sort_ix = html.index('x.supports_finding === false ? 1 : 0')
 url_ix = html.index('a.source_url ? 0 : 1')
 assert sort_ix < url_ix, 'supports_finding must be the primary within-tier sort key'
 

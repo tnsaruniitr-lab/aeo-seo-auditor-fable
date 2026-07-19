@@ -214,6 +214,12 @@ assert_contains "classic scoring byte-identical (golden); shadow counts only run
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10n] Citation entailment: cached LLM display verdict + fail-safe + render branches"
+OUT=$(cd "${SERVICE_DIR}" && python3 "${SCRIPT_DIR}/test_citation_entailment.py" 2>&1)
+assert_contains "entailment verdict cached (LRU+DB) per rule×check-base×evidence; no-key/error/budget stamp unjudged never block; wired after re-grounding; supports/related/unrelated render branches + compact entailment field" "$OUT" "ENTAILMENT_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do

@@ -63,6 +63,16 @@ _KIND_CFG = {
         'snap_t1': 'description', 'snap_t2': None,
         'conf': None, 'risk': 'risk_level',
     },
+    # Playbooks (retrievable since the corpus wiring): use_when → the
+    # condition, summary → the action. No documents join on the live table
+    # ('no_doc_join') — a playbook's source_url is its own. Listed LAST so a
+    # live fetch failure on this optional arm never shadows the core kinds.
+    'playbook': {
+        'table': 'playbooks', 'snapshot_attr': 'playbooks_by_id',
+        'title': 'name', 't1': 'use_when', 't2': 'summary',
+        'snap_t1': 'use_when', 'snap_t2': 'summary',
+        'conf': 'confidence_score', 'risk': None, 'no_doc_join': True,
+    },
 }
 
 _KIND_ALIASES = {
@@ -70,6 +80,7 @@ _KIND_ALIASES = {
     'principle': 'principle', 'principles': 'principle',
     'ap': 'ap', 'anti_pattern': 'ap', 'anti-pattern': 'ap',
     'antipattern': 'ap', 'anti_patterns': 'ap',
+    'playbook': 'playbook', 'playbooks': 'playbook',
 }
 
 # The fields this module owns. Whatever the LLM put there is replaced;

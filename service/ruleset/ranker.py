@@ -51,7 +51,77 @@ from typing import Dict, List, Optional
 
 # ----------------------------------------------------------------------
 # TIER MAPPING (source_org → tier rank)
+#
+# SINGLE SOURCE: org-tiers.json (same directory) carries the canon map +
+# tier bands and is shared with the live path (sieve_brain.py) so the two
+# tables cannot drift. The in-code sets below are the FALLBACK ONLY, kept
+# for safety when the JSON is missing/malformed (this directory is a
+# portable export — a consumer may copy ranker.py alone).
 # ----------------------------------------------------------------------
+
+_ORG_TIERS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'org-tiers.json')
+
+# Fallback canon map (ported from sieve_brain.canon_org): the brain stores a
+# mix of canonical names ('Google') and raw domains/variants
+# ('developers.google.com', 'Google Search Central'). Canonicalize BEFORE the
+# tier lookup so name-drift rules don't sink to tier 5 on the snapshot path.
+_CANON_FALLBACK = {
+    'google search central': 'Google', 'google': 'Google',
+    'developers.google.com': 'Google', 'support.google.com': 'Google',
+    'schema.org': 'Schema.org',
+    'bing webmaster tools': 'Bing', 'bing.com': 'Bing', 'bing': 'Bing',
+    'w3c': 'W3C', 'w3.org': 'W3C',
+    'mdn web docs': 'MDN', 'developer.mozilla.org': 'MDN', 'mozilla': 'MDN',
+    'web.dev': 'web.dev',
+    'perplexity': 'Perplexity', 'perplexity.ai': 'Perplexity',
+    'docs.perplexity.ai': 'Perplexity',
+    'openai': 'OpenAI', 'platform.openai.com': 'OpenAI',
+    'anthropic': 'Anthropic',
+    'backlinko.com': 'Backlinko', 'backlinko': 'Backlinko',
+    'moz.com': 'Moz', 'moz': 'Moz',
+    'ahrefs.com': 'Ahrefs', 'ahrefs': 'Ahrefs',
+    'semrush.com': 'Semrush', 'semrush': 'Semrush',
+    'search engine land': 'Search Engine Land',
+    'searchengineland.com': 'Search Engine Land',
+    'search engine journal': 'Search Engine Journal',
+    'searchenginejournal.com': 'Search Engine Journal',
+}
+
+
+def _load_org_tiers():
+    """Load org-tiers.json → (canon_map, {canonical_name: tier}). Never
+    raises; empty maps mean 'use the code fallbacks'."""
+    canon, tiers = {}, {}
+    try:
+        with open(_ORG_TIERS_PATH) as f:
+            data = json.load(f)
+        canon = {str(k).strip().lower(): str(v)
+                 for k, v in (data.get('canon') or {}).items()}
+        for band, orgs in (data.get('tiers') or {}).items():
+            for o in (orgs or []):
+                tiers[str(o)] = int(band)
+    except Exception:
+        canon, tiers = {}, {}
+    return canon, tiers
+
+
+_SHARED_CANON, _SHARED_TIERS = _load_org_tiers()
+
+
+def canon_org(org: Optional[str]) -> str:
+    """Canonical source-org name (live-parity: mirrors sieve_brain.canon_org)."""
+    if not org:
+        return ''
+    cmap = _SHARED_CANON or _CANON_FALLBACK
+    key = org.strip().lower()
+    if key in cmap:
+        return cmap[key]
+    key2 = re.sub(r'^www\.', '', key)
+    if key2 in cmap:
+        return cmap[key2]
+    return org.strip()
+
 
 # Tier 1 — Primary sources (official documentation)
 TIER_1_SOURCES = {
@@ -75,12 +145,16 @@ TIER_3_SOURCES = {
     'searchenginejournal.com', 'moz.com',
 }
 
-# Tier 4 — Specialized / niche
+# Tier 4 — Specialized / niche + the DELIBERATE practitioner band
+# (growth-domain operators: ranks above anonymous tier-5, below tier-3).
 TIER_4_SOURCES = {
     'amsive.com', 'almcorp.com', 'cxl.com',
     'seerinteractive.com', 'Y Combinator', 'apptweak',
     'Shopify', 'Buffer', 'frase.io', 'animalz.co',
     'b2bcontentos.com', 'appsflyer.com',
+    'Reforge', 'a16z', 'First Round Review', 'For Entrepreneurs',
+    'Demand Curve', 'Animalz', 'AppsFlyer', 'ALM Corp', 'Amsive',
+    'CXL', 'Frase',
 }
 
 # Default tier for unknown source_org
@@ -96,17 +170,22 @@ TIER_ICONS = {
 
 
 def get_tier_rank(source_org: Optional[str]) -> int:
-    """Map a source_org string to a tier rank (lower = more authoritative)."""
+    """Map a source_org string to a tier rank (lower = more authoritative).
+
+    Canonicalizes FIRST (live-parity via org-tiers.json + canon_org) so
+    name-drift rows ('Google Search Central', 'moz') tier correctly, then
+    looks the canonical name up in the shared tier table. The in-code sets
+    remain as the fallback when org-tiers.json is absent."""
     if not source_org:
         return DEFAULT_TIER
-    if source_org in TIER_1_SOURCES:
-        return 1
-    if source_org in TIER_2_SOURCES:
-        return 2
-    if source_org in TIER_3_SOURCES:
-        return 3
-    if source_org in TIER_4_SOURCES:
-        return 4
+    canon = canon_org(source_org)
+    shared = _SHARED_TIERS.get(canon)
+    if shared in (1, 2, 3, 4):
+        return shared
+    for tier, srcs in ((1, TIER_1_SOURCES), (2, TIER_2_SOURCES),
+                       (3, TIER_3_SOURCES), (4, TIER_4_SOURCES)):
+        if source_org in srcs or canon in srcs:
+            return tier
     return DEFAULT_TIER
 
 
@@ -165,19 +244,20 @@ class BrainIndex:
             'rules': len(self.rules_by_id),
             'anti_patterns': len(self.aps_by_id),
             'playbooks': len(self.playbooks_by_id),
-            # principles are LOADED but were historically unreachable; search()
-            # (Phase 2) now retrieves them, so this count reflects real coverage.
+            # principles AND playbooks are LOADED and, since search() (Phase 2
+            # + the playbook wiring), genuinely retrievable — these counts
+            # reflect real coverage, not dead weight.
             'principles': len(self.principles_by_id),
             'mapped_checks': len(self.check_to_rules),
         }
 
     # ------------------------------------------------------------------
-    # Phase 2 — index-backed snapshot retrieval (BM25 over ALL three kinds).
+    # Phase 2 — index-backed snapshot retrieval (BM25 over ALL four kinds).
     # The old snapshot path could only ever cite the 141 hand-mapped ids and
-    # never a single principle. search() indexes rules + anti_patterns +
-    # principles and retrieves on the finding's EVIDENCE, so the ~9.9k-row
-    # library and every principle become reachable offline, with the same
-    # relevance-floored, relevance-first policy as the live path.
+    # never a single principle or playbook. search() indexes rules +
+    # anti_patterns + principles + playbooks and retrieves on the finding's
+    # EVIDENCE, so the full library becomes reachable offline, with the same
+    # relevance-floored, relevance-first, status-gated policy as the live path.
     # ------------------------------------------------------------------
     def _bm25(self) -> dict:
         if self._bm25_index is None:
@@ -205,7 +285,40 @@ _SEARCH_FIELDS = {
     'rule':      ('name', 'if_condition', 'then_action'),
     'ap':        ('title', 'description'),
     'principle': ('title', 'statement', 'explanation'),
+    'playbook':  ('name', 'summary', 'use_when'),
 }
+
+# ----------------------------------------------------------------------
+# STATUS GATE — live-parity (_trust_filter in sieve_brain.py): guidance the
+# curation lifecycle has retired (deprecated/rejected/retired/superseded, or
+# rows superseded by a newer one) is unciteable from the snapshot too.
+# Snapshots exported before `status` was carried have no such key — those
+# rows are treated as active (the filter degrades open on absent fields,
+# exactly like the live SQL's coalesce(t.status,'active')).
+# ----------------------------------------------------------------------
+
+EXCLUDED_STATUSES = frozenset({'deprecated', 'rejected', 'retired', 'superseded'})
+
+
+def status_excluded(row: Optional[dict]) -> bool:
+    """True when a snapshot row's lifecycle status makes it unciteable."""
+    if not isinstance(row, dict):
+        return False
+    if str(row.get('status') or 'active').strip().lower() in EXCLUDED_STATUSES:
+        return True
+    return bool(row.get('superseded_by'))
+
+
+def _row_freshness(row: dict) -> dict:
+    """Freshness/lifecycle fields carried from the snapshot row WHEN PRESENT
+    (post re-export); older snapshot files simply yield None values."""
+    return {
+        'last_verified': (str(row['last_verified'])[:10]
+                          if row.get('last_verified') else None),
+        'status': row.get('status'),
+        'added': (str(row['created_at'])[:10]
+                  if row.get('created_at') else None),
+    }
 
 
 def _tok(text: Optional[str]) -> List[str]:
@@ -218,13 +331,17 @@ def _doc_text(kind: str, row: dict) -> str:
 
 
 def _build_bm25(brain: 'BrainIndex') -> dict:
+    # Status gate at INDEX time (live-parity): retired rows are never
+    # retrievable. They stay in the by-id maps so the grounding path can
+    # distinguish 'deprecated' from 'missing'.
     docs = []  # (kind, id, row)
-    for rid, r in brain.rules_by_id.items():
-        docs.append(('rule', rid, r))
-    for aid, a in brain.aps_by_id.items():
-        docs.append(('ap', aid, a))
-    for pid, p in brain.principles_by_id.items():
-        docs.append(('principle', pid, p))
+    for kind, by_id in (('rule', brain.rules_by_id),
+                        ('ap', brain.aps_by_id),
+                        ('principle', brain.principles_by_id),
+                        ('playbook', brain.playbooks_by_id)):
+        for rid, row in by_id.items():
+            if not status_excluded(row):
+                docs.append((kind, rid, row))
     tfs, doclen, df = [], [], Counter()
     inv = defaultdict(list)
     for i, (kind, _id, row) in enumerate(docs):
@@ -279,14 +396,18 @@ def _snapshot_cite(kind: str, row: dict, score: float, snapshot_date: Optional[s
         'tier': tier, 'tier_icon': TIER_ICONS[tier],
         'source_org': org, 'source_url': row.get('source_url'),
         'name': row.get('name') or row.get('title'),
+        # Playbooks map use_when → the condition and summary → the action, so
+        # the uniform when-it-applies/what-to-do citation shape holds.
         'if_condition': (row.get('if_condition') or row.get('statement')
-                         or row.get('description') or '')[:500],
-        'then_action': (row.get('then_action') or row.get('explanation') or '')[:500],
+                         or row.get('description') or row.get('use_when') or '')[:500],
+        'then_action': (row.get('then_action') or row.get('explanation')
+                        or row.get('summary') or '')[:500],
         'domain_tag': row.get('domain_tag'),
         'relevance': round(score, 4),
         'retrieval_layer': 'bm25',
         'from': 'snapshot', 'snapshot_date': snapshot_date,
-        'freshness': 'snapshot', 'last_verified': None,
+        # Freshness carried from the export WHEN PRESENT, never fabricated.
+        'freshness': 'snapshot', **_row_freshness(row),
     }
     if kind == 'ap':
         cite['risk_level'] = row.get('risk_level')
@@ -323,7 +444,8 @@ _DEPRECATED_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), 'deprecated-guidance.json')
 _DEPRECATED_CACHE: Optional[List[dict]] = None
 _DEPRECATED_TEXT_FIELDS = ('name', 'title', 'if_condition', 'then_action',
-                           'description', 'statement', 'explanation')
+                           'description', 'statement', 'explanation',
+                           'summary', 'use_when', 'avoid_when')
 
 # select_citations has no stats channel; count its exclusions here so the
 # quality loss is observable (attach/grounding count in their own stats).
@@ -418,15 +540,17 @@ def select_citations(
     mapping = brain.check_to_rules.get(check_id, {})
     rule_ids = mapping.get('rules', [])
     ap_ids = mapping.get('anti_patterns', []) if include_anti_patterns else []
+    playbook_ids = mapping.get('playbooks', [])
 
     candidates: List[dict] = []
 
     _snap = brain.snapshot_date
 
-    # Collect rule candidates
+    # Collect rule candidates (status gate: retired rows are unciteable,
+    # live-parity with sieve_brain._trust_filter)
     for rid in rule_ids:
         rule = brain.rules_by_id.get(rid)
-        if not rule:
+        if not rule or status_excluded(rule):
             continue
         candidates.append({
             **rule,
@@ -435,13 +559,13 @@ def select_citations(
             'tier_icon': TIER_ICONS[get_tier_rank(rule.get('source_org'))],
             'guidance_kind': 'apply',
             'from': 'snapshot', 'snapshot_date': _snap,
-            'freshness': 'snapshot', 'last_verified': None,
+            'freshness': 'snapshot', **_row_freshness(rule),
         })
 
     # Collect anti-pattern candidates
     for apid in ap_ids:
         ap = brain.aps_by_id.get(apid)
-        if not ap:
+        if not ap or status_excluded(ap):
             continue
         # APs have no measured confidence. DO NOT fabricate one from risk_level
         # (that inflated high-risk APs above real high-confidence rules and
@@ -456,7 +580,25 @@ def select_citations(
             'guidance_kind': 'avoid',
             'confidence_score': str(_NEUTRAL_AP_CONF),   # neutral, not risk-derived
             'from': 'snapshot', 'snapshot_date': _snap,
-            'freshness': 'snapshot', 'last_verified': None,
+            'freshness': 'snapshot', **_row_freshness(ap),
+        })
+
+    # Collect playbook candidates (mappings may curate them now that the
+    # kind is retrievable; use_when/summary map onto the uniform shape)
+    for pbid in playbook_ids:
+        pb = brain.playbooks_by_id.get(pbid)
+        if not pb or status_excluded(pb):
+            continue
+        candidates.append({
+            **pb,
+            'kind': 'playbook',
+            'tier': get_tier_rank(pb.get('source_org')),
+            'tier_icon': TIER_ICONS[get_tier_rank(pb.get('source_org'))],
+            'if_condition': (pb.get('use_when') or '')[:500],
+            'then_action': (pb.get('summary') or '')[:500],
+            'guidance_kind': 'apply',
+            'from': 'snapshot', 'snapshot_date': _snap,
+            'freshness': 'snapshot', **_row_freshness(pb),
         })
 
     # Deprecation guard (§7): curated mappings can outlive the guidance they
@@ -513,7 +655,8 @@ def format_citation(citation: dict) -> str:
     rid = citation.get('id', '?')
     kind = citation.get('kind', 'rule')
     kind_label = {'rule': 'Rule', 'ap': 'AP', 'anti_pattern': 'AP',
-                  'principle': 'Principle'}.get(kind, 'Item')
+                  'principle': 'Principle',
+                  'playbook': 'Playbook'}.get(kind, 'Item')
     conf = _confidence_float(citation)
     url = citation.get('source_url', '')
     src_title = citation.get('source_title', '')

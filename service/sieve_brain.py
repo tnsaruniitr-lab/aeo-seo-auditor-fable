@@ -56,10 +56,16 @@ class SieveLiveError(RuntimeError):
 TIER_ICONS = {1: '🥇', 2: '🥈', 3: '🥉', 4: '📄', 5: '📝'}
 
 # Which brain tables to search + how their columns map to a uniform citation.
+# playbooks (census cols: name, summary, use_when, avoid_when,
+# confidence_score, source_org/url, status) carry no embeddings, so the arm
+# is FTS-only ('fts_only'), and no documents join ('no_doc_join') — their
+# source_url is their own. use_when → the condition, summary → the action.
 _TABLE_CFG = {
     'rules':         {'kind': 'rule',      'title': 'name',  't1': 'if_condition', 't2': 'then_logic',  'conf': 'confidence_score', 'risk': None},
     'principles':    {'kind': 'principle', 'title': 'title', 't1': 'statement',    't2': 'explanation', 'conf': 'confidence_score', 'risk': None},
     'anti_patterns': {'kind': 'ap',        'title': 'title', 't1': 'description',  't2': None,          'conf': None,               'risk': 'risk_level'},
+    'playbooks':     {'kind': 'playbook',  'title': 'name',  't1': 'use_when',     't2': 'summary',     'conf': 'confidence_score', 'risk': None,
+                      'fts_only': True, 'no_doc_join': True},
 }
 
 
@@ -95,7 +101,32 @@ _CANON = {
 _TIER_1 = {'Google', 'Schema.org', 'Bing', 'W3C', 'web.dev', 'MDN', 'Perplexity', 'OpenAI', 'Anthropic'}
 _TIER_2 = {'Backlinko', 'Ahrefs', 'Semrush', 'Moz'}
 _TIER_3 = {'Search Engine Land', 'Search Engine Journal'}
+# Tier 4 — the DELIBERATE practitioner band (growth-domain operators):
+# ranks above anonymous tier-5, below vendor-doc tier-3. Code fallback only;
+# org-tiers.json is the shared source of truth.
+_TIER_4 = {'Y Combinator', 'Reforge', 'a16z', 'First Round Review',
+           'For Entrepreneurs', 'Demand Curve', 'Animalz', 'AppsFlyer',
+           'ALM Corp', 'Amsive', 'CXL', 'Frase'}
 _DEFAULT_TIER = 5
+
+# SINGLE SOURCE: service/ruleset/org-tiers.json carries the canon map + tier
+# bands and is shared with the snapshot path (ruleset/ranker.py) so the
+# live and snapshot tables cannot drift. The in-code _CANON/_TIER_* above
+# stay as the fallback when the file is missing/malformed.
+_ORG_TIERS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'ruleset', 'org-tiers.json')
+_TIER_MAP: Dict[str, int] = {}
+try:
+    import json as _json
+    with open(_ORG_TIERS_PATH) as _f:
+        _shared = _json.load(_f)
+    _CANON = {**_CANON, **{str(k).strip().lower(): str(v)
+                           for k, v in (_shared.get('canon') or {}).items()}}
+    for _band, _orgs in (_shared.get('tiers') or {}).items():
+        for _o in (_orgs or []):
+            _TIER_MAP[str(_o)] = int(_band)
+except Exception:  # noqa: BLE001 — fall back to the in-code tables
+    _TIER_MAP = {}
 
 
 def canon_org(org: Optional[str]) -> str:
@@ -112,12 +143,17 @@ def canon_org(org: Optional[str]) -> str:
 
 def tier_of(org: Optional[str]) -> int:
     c = canon_org(org)
+    shared = _TIER_MAP.get(c)
+    if shared in (1, 2, 3, 4):
+        return shared
     if c in _TIER_1:
         return 1
     if c in _TIER_2:
         return 2
     if c in _TIER_3:
         return 3
+    if c in _TIER_4:
+        return 4
     return 4 if (org and '.' in org and org.strip().lower() != 'personal blog') else _DEFAULT_TIER
 
 
@@ -299,7 +335,8 @@ def _optional_cols(conn) -> Dict[str, set]:
             SELECT table_name, column_name FROM information_schema.columns
             WHERE table_schema='sieve'
               AND column_name IN ('url_provenance', 'status', 'contested',
-                                  'superseded_by', 'document_id')
+                                  'superseded_by', 'document_id',
+                                  'domain_tag', 'last_verified', 'created_at')
         """)
         for t, c in cur.fetchall():
             out.setdefault(t, set()).add(c)
@@ -310,27 +347,40 @@ def _select_head(cfg, score_sql: str, cols: Optional[set] = None) -> str:
     t2 = f"t.{cfg['t2']}" if cfg['t2'] else "''"
     cols = cols or set()
     prov = "t.url_provenance" if 'url_provenance' in cols else "NULL"
+    # Metadata columns the playbooks table (and any future kind) may lack —
+    # probed per connection like the rest; absent → honest NULL, never an
+    # SQL error that silently removes the whole table from retrieval.
+    dtag = "t.domain_tag" if 'domain_tag' in cols else "NULL"
+    lv = "t.last_verified::text" if 'last_verified' in cols else "NULL"
+    ca = "t.created_at" if 'created_at' in cols else "NULL"
     # S4: join documents on the real document_id FK when the column exists;
     # fall back to the legacy source_refs_json regex only on an older DB.
-    if 'document_id' in cols:
-        doc_join = "d.id = t.document_id"
+    # no_doc_join kinds (playbooks) carry their own source_url — no join.
+    if cfg.get('no_doc_join'):
+        join = ""
+        src_url = "NULLIF(t.source_url,'')"
     else:
-        doc_join = "d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')"
+        if 'document_id' in cols:
+            doc_join = "d.id = t.document_id"
+        else:
+            doc_join = "d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')"
+        join = f"""
+        LEFT JOIN sieve.documents d
+          ON {doc_join}"""
+        src_url = "COALESCE(NULLIF(t.source_url,''), d.source_url)"
     # D2: last_verified and created_at are DISTINCT columns. A never-re-verified
     # rule (last_verified NULL) must NOT borrow created_at and display as
     # 'verified' — that fabricates freshness. created_at rides through only as an
     # honest 'added' date.
     return f"""
         SELECT t.id, t.{cfg['title']} AS title, t.{cfg['t1']} AS text1, {t2} AS text2,
-               t.domain_tag, {_conf_expr(cfg)} AS conf, t.source_org,
-               COALESCE(NULLIF(t.source_url,''), d.source_url) AS source_url,
-               t.last_verified::text AS last_verified,
-               t.created_at AS created_at,
+               {dtag} AS domain_tag, {_conf_expr(cfg)} AS conf, t.source_org,
+               {src_url} AS source_url,
+               {lv} AS last_verified,
+               {ca} AS created_at,
                {prov} AS url_provenance,
                {score_sql} AS score
-        FROM sieve.{{table}} t
-        LEFT JOIN sieve.documents d
-          ON {doc_join}
+        FROM sieve.{{table}} t{join}
     """
 
 
@@ -498,7 +548,9 @@ def _search_all_tables(conn, query_text: str, per_table_k: int) -> List[Dict[str
             found = []
             layer = 'vector'
             try:
-                if qvec_lit:
+                # fts_only kinds (playbooks) have no embeddings — skip the
+                # doomed vector attempt and go straight to keyword search.
+                if qvec_lit and not cfg.get('fts_only'):
                     found = _search_vector(cur, table, cfg, qvec_lit, per_table_k, cols)
                 else:
                     layer = 'fts'
@@ -572,7 +624,8 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
                     found = []
                     layer = 'vector'
                     try:
-                        if qvec_lit:
+                        # fts_only kinds (playbooks): no embeddings, straight to FTS.
+                        if qvec_lit and not cfg.get('fts_only'):
                             found = _search_vector(cur, table, cfg, qvec_lit, per_table_k, cols)
                         else:
                             layer = 'fts'
@@ -647,7 +700,7 @@ def _spec_query_text(spec: Dict[str, Any]) -> str:
     return ''
 
 
-def retrieve_batch(queries: List[Dict[str, Any]], min_tier: int = 3,
+def retrieve_batch(queries: List[Dict[str, Any]], min_tier: int = 4,
                    max_citations: int = 3) -> Dict[str, Any]:
     """Batch retrieval for server-to-server consumers (AnswerMonk).
 
@@ -657,7 +710,11 @@ def retrieve_batch(queries: List[Dict[str, Any]], min_tier: int = 3,
                  carries `evidence`, it LEADS the query (evidence-led, §3)
       rule_ids : exact rule-id fetch (curated-mapping path)
     min_tier: NORM-slot gate — only citations from orgs at tier <= min_tier
-      are returned (tier 5 = unattributed/observed can never be a norm).
+      are returned. Default 4: tier 4 is the explicit PRACTITIONER band
+      (YC/Reforge/a16z-class growth orgs), meaningful guidance since the
+      org-tiers reconciliation — the old default of 3 excluded 62% of the
+      rule corpus. Tier 5 (unattributed/observed) is still always excluded:
+      anonymous knowledge can never be a norm.
     Never raises; on any failure returns {'live': False, 'results': {}}.
     """
     if not live_enabled():

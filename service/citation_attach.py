@@ -138,6 +138,12 @@ def attach_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, A
                 continue
             # Support annotation (§6): does this cite actually back THIS
             # finding's evidence? Annotate-only — never drop a citation.
+            # CANDIDATE annotation since 2026-07-19: the labelled set
+            # measured this lexical test at 50.4% strict precision / 30.3%
+            # missed-support, so the DISPLAY decision now belongs to the
+            # post-loop LLM judge (citation_entailment stamps c['entailment']
+            # after re-grounding); supports_finding survives as the
+            # unjudged-fallback signal only.
             ftok = _sup_tokens(f.get('evidence'), f.get('title'))
             for c in cites:
                 c['supports_finding'] = _supports(ftok, c)

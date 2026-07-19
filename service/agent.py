@@ -1216,6 +1216,36 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
                   f'[{audit_id[:8]}] ', e, traceback.format_exc())
 
     # ------------------------------------------------------------------
+    # CITATION ENTAILMENT — the DISPLAY decision moves off the lexical
+    # supports_finding gate (measured 50.4% strict displayed-proof
+    # precision, 30.3% missed-support on the 2026-07-19 labelled set) to a
+    # cached claude-haiku judgment stamped per citation: supports (proof) /
+    # related (collapsed see-also) / unrelated (hidden, kept in JSON) /
+    # unjudged (renderers fall back to supports_finding). Runs AFTER
+    # re-grounding so judgments read the final verbatim text. Fail-safe:
+    # no key / API error / timeout stamps 'unjudged' — an audit is never
+    # blocked on the judge. Default ON; CITATION_ENTAILMENT=0 disables.
+    # ------------------------------------------------------------------
+    if os.getenv('CITATION_ENTAILMENT', '1') not in ('0', 'false', 'False'):
+        try:
+            from citation_entailment import judge_citations
+            ent_stats = judge_citations(audit.get("findings") or [])
+            md["citation_entailment"] = ent_stats
+            log.info('%scitation entailment: %d judged (%d cached, %d api) — '
+                     '%d supports / %d related / %d unrelated / %d unjudged',
+                     f'[{audit_id[:8]}] ', ent_stats.get("judged", 0),
+                     ent_stats.get("cache_hits", 0), ent_stats.get("api_calls", 0),
+                     ent_stats.get("supports", 0), ent_stats.get("related", 0),
+                     ent_stats.get("unrelated", 0), ent_stats.get("unjudged", 0))
+        except Exception as e:
+            md["citation_entailment"] = {"applied": False,
+                                         "error": f"{type(e).__name__}: {e}"}
+            log.error('%scitation entailment failed: %s', f'[{audit_id[:8]}] ', e)
+    else:
+        md["citation_entailment"] = {"applied": False,
+                                     "reason": "disabled via CITATION_ENTAILMENT=0"}
+
+    # ------------------------------------------------------------------
     # BINDING VERIFICATION (mode B) — any LLM-authored bound_rule must survive
     # three code tests: the id exists, it is a MEMBER of the candidate pool
     # retrieval returns for this finding (kills hallucinated/prose-scraped ids),
