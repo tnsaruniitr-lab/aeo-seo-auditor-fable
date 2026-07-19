@@ -59,7 +59,10 @@ TOTAL_BUDGET_S = float(os.getenv('CITATION_ENTAILMENT_BUDGET_S', '30'))
 # Bump whenever _pair_prompt (or verdict semantics) changes: the version is
 # part of cache_key, so a prompt revision re-judges instead of serving the
 # old prompt's cached verdicts as if they were the new judge's.
-PROMPT_VERSION = 'v1'
+PROMPT_VERSION = 'v2'  # v2: operational supports/related boundary (two-step
+                       # test, generality rule, synthetic calibration examples)
+                       # after v1 self-graded 81.9/20.9 with 15+16 boundary
+                       # confusions on the 206-pair benchmark
 
 _JUDGED_STATUSES = ('fail', 'warn')
 
@@ -218,14 +221,38 @@ def _pair_prompt(finding: Dict, citation: Dict) -> str:
         f"CITED {citation.get('kind') or 'item'}: {name}\n"
         f'IF: {cond}\n'
         f'THEN: {act}\n\n'
-        'Verdict "supports" only if the citation\'s condition bears directly on '
-        'this exact evidence. "related" = same-topic guidance that does not prove '
-        'this specific finding. "unrelated" otherwise. Check explicitly: '
-        '(1) same platform — a LinkedIn/YouTube/social rule never proves a '
-        'website finding; (2) same schema.org entity type; (3) polarity — the '
-        'rule must fault what the finding faults, not endorse it or trigger on '
-        'the inverse condition; (4) more than a single shared token; (5) a '
-        'tactic/outreach tip is not proof of a site-state diagnostic.\n\n'
+        'Decide in two steps.\n\n'
+        'STEP 1 — eliminate "unrelated". It is unrelated if ANY of: '
+        '(1) different platform — a LinkedIn/YouTube/social rule never proves a '
+        'website finding; (2) different schema.org entity type; (3) inverted '
+        'polarity — the rule endorses what the finding faults, or triggers on '
+        'the inverse condition; (4) the overlap is a single shared word; (5) it '
+        'is an outreach/marketing tactic offered against a site-state '
+        'diagnostic.\n\n'
+        'STEP 2 — "supports" requires BOTH: '
+        '(a) the IF-condition describes the same condition class the EVIDENCE '
+        'observed — same feature AND same aspect of it. A more GENERAL rule '
+        'still passes when the observed evidence is an instance of its '
+        'condition (evidence "LCP 4.1s" is an instance of "IF LCP exceeds '
+        '2.5s"). (b) the THEN prescribes fixing or avoiding exactly what the '
+        'finding flags. Same feature but a DIFFERENT aspect fails (a): '
+        'evidence "title lacks the brand name" vs rule "IF title exceeds 60 '
+        'characters THEN shorten" is the same feature (title tag) but a '
+        'different aspect (branding vs length) — that is "related", never '
+        '"supports". Likewise a rule that presupposes a state the evidence '
+        'contradicts (rule about cleaning 404s FROM a sitemap when the '
+        'evidence is "sitemap missing") is "related".\n'
+        'Everything that survives STEP 1 but fails STEP 2 is "related".\n\n'
+        'Calibration examples:\n'
+        '- EVIDENCE "measured LCP 4.1s" / IF "LCP exceeds 2.5s" THEN "reduce '
+        'render-blocking resources" -> supports (instance of the condition).\n'
+        '- EVIDENCE "FAQ-style content carries no FAQPage markup" / IF "page '
+        'answers common questions" THEN "add FAQPage structured data" -> '
+        'supports (general rule, observed instance).\n'
+        '- EVIDENCE "title lacks brand name" / IF "title exceeds 60 chars" '
+        'THEN "shorten it" -> related (same feature, different aspect).\n'
+        '- EVIDENCE "sitemap file missing" / IF "sitemap lists 404 URLs" THEN '
+        '"remove them" -> related (presupposes the missing state).\n\n'
         'Reply with ONLY this JSON: {"verdict":"supports"|"related"|"unrelated"}'
     )
 

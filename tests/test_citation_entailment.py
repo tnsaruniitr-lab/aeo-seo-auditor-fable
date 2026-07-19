@@ -76,7 +76,7 @@ def test_cache_key_stability_and_ddl():
         ce.MODEL = 'claude-other-model'
         assert ce.cache_key(f, c) != k1
         ce.MODEL = saved_model
-        ce.PROMPT_VERSION = 'v2'
+        ce.PROMPT_VERSION = saved_pv + '-test'  # always differs from current
         assert ce.cache_key(f, c) != k1
     finally:
         ce.MODEL, ce.PROMPT_VERSION = saved_model, saved_pv
