@@ -52,7 +52,12 @@ log = logging.getLogger('audit.entailment')
 VERDICTS = ('supports', 'related', 'unrelated')
 UNJUDGED = 'unjudged'
 
-MODEL = os.getenv('CITATION_ENTAILMENT_MODEL', 'claude-haiku-4-5')
+# Default promoted haiku -> sonnet after the self-graded plateau: haiku held
+# ~80 strict / 16-21 missed across prompt v1/v2 on the 206-pair benchmark —
+# the supports/related boundary needs the stronger judge. Cost stays bounded:
+# ~150-token judgments, cached per rule×check×text (~$0.05/audit worst case,
+# ~zero once warm). MODEL participates in cache_key, so this swap re-judges.
+MODEL = os.getenv('CITATION_ENTAILMENT_MODEL', 'claude-sonnet-4-5')
 CALL_TIMEOUT_S = float(os.getenv('CITATION_ENTAILMENT_TIMEOUT_S', '6'))
 TOTAL_BUDGET_S = float(os.getenv('CITATION_ENTAILMENT_BUDGET_S', '30'))
 
