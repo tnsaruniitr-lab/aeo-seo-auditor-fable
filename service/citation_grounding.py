@@ -177,6 +177,47 @@ def _cap(text: Any) -> str:
 # Live fetch (sieve schema) — batch, one connection for the whole audit
 # ---------------------------------------------------------------------------
 
+def _live_sql(cfg: Dict[str, Any], cols: set) -> str:
+    """By-id SELECT for one kind, shaped like sieve_brain._select_head:
+    optional metadata columns (domain_tag / last_verified / created_at /
+    url_provenance) are probed per connection — absent → honest NULL, never
+    an UndefinedColumn that kills the whole batch — and no_doc_join kinds
+    (playbooks) skip the documents join because their source_url is their
+    own. Pure string builder, unit-tested in _selftest."""
+    import sieve_brain
+    t2 = f"t.{cfg['t2']}" if cfg['t2'] else "''"
+    conf = f"t.{cfg['conf']}" if cfg['conf'] else "NULL"
+    risk = f"t.{cfg['risk']}" if cfg['risk'] else "NULL"
+    prov = "t.url_provenance" if 'url_provenance' in cols else "NULL"
+    dtag = "t.domain_tag" if 'domain_tag' in cols else "NULL"
+    lv = "t.last_verified::text" if 'last_verified' in cols else "NULL"
+    ca = "t.created_at" if 'created_at' in cols else "NULL"
+    # Retired/superseded guidance is unciteable on this path too:
+    # a by-id fetch that resurrects a retired rule as 'verified'
+    # would undo the retrieval-side status filter.
+    status_f = sieve_brain._trust_filter(cols)
+    if cfg.get('no_doc_join'):
+        join = ""
+        src_url = "NULLIF(t.source_url,'')"
+    else:
+        # S4: prefer the document_id FK join; legacy regex only if absent.
+        doc_join = ("d.id = t.document_id" if 'document_id' in cols
+                    else "d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')")
+        join = f"\n        LEFT JOIN sieve.documents d\n          ON {doc_join}"
+        src_url = "COALESCE(NULLIF(t.source_url,''), d.source_url)"
+    return f"""
+        SELECT t.id, t.{cfg['title']} AS title, t.{cfg['t1']} AS text1,
+               {t2} AS text2, {dtag} AS domain_tag, {conf} AS conf,
+               {risk} AS risk, t.source_org,
+               {src_url} AS source_url,
+               {lv} AS last_verified,
+               {ca} AS created_at,
+               {prov} AS url_provenance
+        FROM sieve.{cfg['table']} t{join}
+        WHERE t.id = ANY(%s){status_f}
+        """
+
+
 def _fetch_live_rows(wanted: Dict[str, List[str]]) -> Dict[Tuple[str, str], Dict[str, Any]]:
     """Fetch authoritative rows for {kind: [ids]} from the live sieve brain.
     Returns {(kind, id): citation_fields}. Empty dict when live is off or on
@@ -202,34 +243,19 @@ def _fetch_live_rows(wanted: Dict[str, List[str]]) -> Dict[Tuple[str, str], Dict
                         continue
                     cfg = _KIND_CFG[kind]
                     cols = cols_by_table.get(cfg['table'], set())
-                    t2 = f"t.{cfg['t2']}" if cfg['t2'] else "''"
-                    conf = f"t.{cfg['conf']}" if cfg['conf'] else "NULL"
-                    risk = f"t.{cfg['risk']}" if cfg['risk'] else "NULL"
-                    prov = "t.url_provenance" if 'url_provenance' in cols else "NULL"
-                    # Retired/superseded guidance is unciteable on this path too:
-                    # a by-id fetch that resurrects a retired rule as 'verified'
-                    # would undo the retrieval-side status filter.
-                    status_f = sieve_brain._trust_filter(cols)
-                    # S4: prefer the document_id FK join; legacy regex only if absent.
-                    doc_join = ("d.id = t.document_id" if 'document_id' in cols
-                                else "d.id = NULLIF(substring(t.source_refs_json from '\\d+'), '')")
-                    cur.execute(
-                        f"""
-                        SELECT t.id, t.{cfg['title']} AS title, t.{cfg['t1']} AS text1,
-                               {t2} AS text2, t.domain_tag, {conf} AS conf,
-                               {risk} AS risk, t.source_org,
-                               COALESCE(NULLIF(t.source_url,''), d.source_url) AS source_url,
-                               t.last_verified::text AS last_verified,
-                               t.created_at AS created_at,
-                               {prov} AS url_provenance
-                        FROM sieve.{cfg['table']} t
-                        LEFT JOIN sieve.documents d
-                          ON {doc_join}
-                        WHERE t.id = ANY(%s){status_f}
-                        """,
-                        (ids,),
-                    )
-                    for r in cur.fetchall():
+                    try:
+                        cur.execute(_live_sql(cfg, cols), (ids,))
+                        rows = cur.fetchall()
+                    except Exception as ke:
+                        # Per-kind isolation: one arm failing (e.g. the
+                        # optional playbooks table missing on an older DB)
+                        # must not discard the kinds already fetched.
+                        if sieve_brain.SIEVE_STRICT:
+                            raise
+                        log.warning('live re-grounding fetch failed for %s '
+                                    '(%s) — snapshot covers it', kind, ke)
+                        continue
+                    for r in rows:
                         rid = _norm_id(r.get('id'))
                         if rid:
                             out[(kind, rid)] = _live_row_fields(kind, r)
@@ -316,7 +342,14 @@ def _snapshot_fields(kind: str, rid: str) -> Optional[Dict[str, Any]]:
     row = getattr(brain, cfg['snapshot_attr'], {}).get(int(rid))
     if not isinstance(row, dict):
         return None
-    from ranker import get_tier_rank, TIER_ICONS
+    from ranker import get_tier_rank, TIER_ICONS, status_excluded
+    # Status gate, live parity (_trust_filter): a deprecated/superseded row
+    # that reaches a citation (LLM-echoed id, stale mapping) must not
+    # re-ground as a verbatim-verified quote via the snapshot fallback —
+    # it resolves to nothing and the citation stays flagged 'unresolved'.
+    if status_excluded(row):
+        log.info('snapshot re-grounding refused %s #%s: status excluded', kind, rid)
+        return None
     tier = get_tier_rank(row.get('source_org'))
     conf = row.get(cfg['conf']) if cfg['conf'] else None
     if conf is None and kind == 'ap':
@@ -602,6 +635,14 @@ def _selftest() -> None:
                 'then_action': 'THEN declare hreflang annotations',
                 'confidence_score': '0.97', 'source_org': 'Google',
             },
+            # Lifecycle-retired: reachable by id, must NOT re-ground.
+            3001: {
+                'id': 3001, 'name': 'HowTo rich results markup guidance',
+                'if_condition': 'IF the page documents step-by-step instructions',
+                'then_action': 'THEN add HowTo structured data',
+                'confidence_score': '0.9', 'source_org': 'Google',
+                'status': 'deprecated',
+            },
         },
         aps_by_id={2001: {
             'id': 2001, 'title': 'FAQ schema without visible FAQ content',
@@ -623,6 +664,11 @@ def _selftest() -> None:
              'then_action': 'invented remediation text'},
             # unknown id -> must be flagged, not dropped, never raise
             {'id': 999999, 'kind': 'rule', 'name': 'ghost rule'},
+            # deprecated in the snapshot -> the status gate applies on the
+            # regrounding path too: unresolved, never verbatim-verified
+            {'id': 3001, 'kind': 'rule',
+             'name': 'HowTo rich results markup guidance',
+             'if_condition': 'page documents step-by-step instructions'},
         ]},
         {'check_id': 'D7_faq', 'status': 'warn', 'citations': [
             {'id': 2001, 'kind': 'anti_pattern', 'name': 'FAQ abuse'},
@@ -657,6 +703,10 @@ def _selftest() -> None:
     assert 'supports_finding' not in ghost, ('unresolved cites keep their '
                                              'attach-time verdict', ghost)
 
+    dead = audit['findings'][0]['citations'][2]
+    assert dead['grounded'] == 'unresolved' and dead['verbatim'] is False, \
+        ('deprecated snapshot rows must not re-ground as verified', dead)
+
     ap = audit['findings'][1]['citations'][0]
     assert ap['kind'] == 'ap' and ap['risk_level'] == 'high', ap
     assert ap['if_condition'].startswith('Marking up FAQs'), ap
@@ -675,10 +725,28 @@ def _selftest() -> None:
     bare = audit['findings'][1]['citations'][4]
     assert bare['grounded'] == 'snapshot' and bare['name'].startswith('Organization schema'), bare
 
-    assert stats == {'applied': True, 'citations_total': 7, 'regrounded_live': 0,
-                     'regrounded_snapshot': 4, 'unresolved': 3,
+    assert stats == {'applied': True, 'citations_total': 8, 'regrounded_live': 0,
+                     'regrounded_snapshot': 4, 'unresolved': 4,
                      'text_corrected': 3, 'support_stamped': 4,
                      'kind_corrected': 1}, stats
+
+    # _live_sql — the by-id fetch must degrade like sieve_brain._select_head:
+    # the playbook arm probes optional metadata columns (absent -> NULL) and
+    # never joins documents. Before this, a live playbooks table lacking
+    # last_verified/created_at/domain_tag raised UndefinedColumn on EVERY
+    # audit (reground batches every id under ALL kinds), and under
+    # SIEVE_STRICT that silently degraded ALL regrounding to snapshot.
+    pb_sql = _live_sql(_KIND_CFG['playbook'], {'status'})
+    assert 't.last_verified' not in pb_sql and 't.created_at' not in pb_sql, pb_sql
+    assert 't.domain_tag' not in pb_sql and 'documents' not in pb_sql, pb_sql
+    assert "NULLIF(t.source_url,'')" in pb_sql, pb_sql
+    assert "coalesce(t.status,'active')" in pb_sql, 'status gate must apply'
+    rule_sql = _live_sql(_KIND_CFG['rule'],
+                         {'document_id', 'last_verified', 'created_at', 'domain_tag'})
+    assert 'd.id = t.document_id' in rule_sql, rule_sql
+    assert 't.last_verified::text' in rule_sql and 't.created_at' in rule_sql, rule_sql
+    assert 't.domain_tag' in rule_sql, rule_sql
+    assert "COALESCE(NULLIF(t.source_url,''), d.source_url)" in rule_sql, rule_sql
 
     # Robustness: snapshot loader exploding must degrade, never raise.
     _SNAPSHOT_CACHE = None

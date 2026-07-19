@@ -157,6 +157,24 @@ def tier_of(org: Optional[str]) -> int:
     return 4 if (org and '.' in org and org.strip().lower() != 'personal blog') else _DEFAULT_TIER
 
 
+def curated_tier(org: Optional[str]) -> int:
+    """Tier for GATING — tier_of WITHOUT the dotted-domain heuristic.
+
+    tier_of's fallback lets ANY unrecognized dotted org ('someblog.com')
+    display as tier 4; that is a display/tiebreak courtesy, not membership
+    in the curated practitioner band. A tier GATE (retrieve_batch's NORM
+    slot) must only admit orgs actually resolved through org-tiers.json or
+    the in-code fallback sets; everything else is _DEFAULT_TIER (5)."""
+    c = canon_org(org)
+    shared = _TIER_MAP.get(c)
+    if shared in (1, 2, 3, 4):
+        return shared
+    for band, orgs in ((1, _TIER_1), (2, _TIER_2), (3, _TIER_3), (4, _TIER_4)):
+        if c in orgs:
+            return band
+    return _DEFAULT_TIER
+
+
 # ---------------------------------------------------------------------------
 # check_id -> search query
 # ---------------------------------------------------------------------------
@@ -700,6 +718,17 @@ def _spec_query_text(spec: Dict[str, Any]) -> str:
     return ''
 
 
+def _norm_gate(cites: List[Dict[str, Any]], min_tier: int) -> List[Dict[str, Any]]:
+    """The NORM-slot tier gate, enforced in code (pure + unit-testable):
+    min_tier is clamped to 4 — tier 5 (unattributed/observed) can never be
+    requested past the gate — and membership is judged by curated_tier, so
+    tier_of's dotted-domain display heuristic ('someblog.com' → 4) does not
+    admit uncurated sources into the practitioner band."""
+    mt = min(int(min_tier), 4)
+    return [c for c in cites
+            if curated_tier(c.get('source_org_raw')) <= mt]
+
+
 def retrieve_batch(queries: List[Dict[str, Any]], min_tier: int = 4,
                    max_citations: int = 3) -> Dict[str, Any]:
     """Batch retrieval for server-to-server consumers (AnswerMonk).
@@ -709,12 +738,14 @@ def retrieve_batch(queries: List[Dict[str, Any]], min_tier: int = 4,
       check_id : auditor-style id, expanded via _query_for; when the spec
                  carries `evidence`, it LEADS the query (evidence-led, §3)
       rule_ids : exact rule-id fetch (curated-mapping path)
-    min_tier: NORM-slot gate — only citations from orgs at tier <= min_tier
-      are returned. Default 4: tier 4 is the explicit PRACTITIONER band
-      (YC/Reforge/a16z-class growth orgs), meaningful guidance since the
-      org-tiers reconciliation — the old default of 3 excluded 62% of the
-      rule corpus. Tier 5 (unattributed/observed) is still always excluded:
-      anonymous knowledge can never be a norm.
+    min_tier: NORM-slot gate (_norm_gate) — only citations whose org sits at
+      CURATED tier <= min_tier are returned. Default 4: tier 4 is the
+      explicit PRACTITIONER band (YC/Reforge/a16z-class growth orgs,
+      reconciled in org-tiers.json) — the old default of 3 excluded 62% of
+      the rule corpus. The gate uses curated_tier, NOT tier_of: an
+      unrecognized dotted-domain org may DISPLAY as tier 4 but does not pass
+      a tier gate. Tier 5 (unattributed/observed) is excluded in code —
+      min_tier is clamped to 4 — anonymous knowledge can never be a norm.
     Never raises; on any failure returns {'live': False, 'results': {}}.
     """
     if not live_enabled():
@@ -743,8 +774,7 @@ def retrieve_batch(queries: List[Dict[str, Any]], min_tier: int = 4,
                             results[key] = []
                             continue
                         rows = _search_all_tables(conn, text, per_table_k)
-                    cites = [c for c in (_row_to_cite(r) for r in rows)
-                             if c['tier'] <= min_tier]
+                    cites = _norm_gate([_row_to_cite(r) for r in rows], min_tier)
                     results[key] = _rank_and_floor(cites, max_citations)
                 except Exception as qe:
                     log.warning('brain retrieve failed for key %s: %s', key, qe)

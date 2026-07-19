@@ -164,9 +164,28 @@ def test_norm_gate_default_includes_practitioner_tier():
     src = open(os.path.join(_ROOT, 'service', 'main.py')).read()
     assert 'min_tier: int = Field(4, ge=1, le=5)' in src
     assert 'PRACTITIONER band' in src
-    # Tier 5 stays out: the gate is <= min_tier and min_tier caps at 4 by
-    # default — anonymous/observed knowledge can never be a norm.
     assert 'never be a norm' in (sieve_brain.retrieve_batch.__doc__ or '')
+
+    # The gate is enforced in CODE, not prose. curated_tier admits only orgs
+    # resolved through org-tiers.json / the fallback sets — tier_of's
+    # dotted-domain display heuristic must not open the practitioner band to
+    # every dotted org in the corpus.
+    assert sieve_brain.tier_of('somerandomblog.com') == 4        # display
+    assert sieve_brain.curated_tier('somerandomblog.com') == 5   # gate
+    assert sieve_brain.curated_tier('reforge.com') == 4
+    assert sieve_brain.curated_tier('Google Search Central') == 1
+    assert sieve_brain.curated_tier(None) == 5
+    cites = [
+        {'id': 1, 'source_org_raw': 'Google', 'tier': 1},
+        {'id': 2, 'source_org_raw': 'Reforge', 'tier': 4},          # curated 4: in
+        {'id': 3, 'source_org_raw': 'somerandomblog.com', 'tier': 4},  # heuristic 4: OUT
+        {'id': 4, 'source_org_raw': None, 'tier': 5},                  # unattributed: OUT
+    ]
+    assert [c['id'] for c in sieve_brain._norm_gate(cites, 4)] == [1, 2]
+    # Tier 5 exclusion is a clamp, not documentation: an explicit min_tier=5
+    # request behaves exactly like 4 — anonymous knowledge can never be a norm.
+    assert sieve_brain._norm_gate(cites, 5) == sieve_brain._norm_gate(cites, 4)
+    assert [c['id'] for c in sieve_brain._norm_gate(cites, 3)] == [1]
 
 
 if __name__ == '__main__':
