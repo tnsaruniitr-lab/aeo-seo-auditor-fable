@@ -78,3 +78,23 @@ Full website auditor (not included here, lives in the parent directory):
 
 Full audit reports (examples of the output shape):
 - https://github.com/tnsaruniitr-lab/aeo-seo-auditor/tree/main/audit-reports
+
+## Re-exporting the snapshots (freshness/lifecycle fields)
+
+The committed `*-snapshot.json` files were exported 2026-04-21, BEFORE the
+curation-lifecycle columns landed — they carry no `status`, `last_verified`,
+`url_provenance`, or `created_at`. `ranker.py` tolerates their absence (rows
+default to active; freshness renders as unknown) and reads the fields as soon
+as a re-export carries them: the status gate (`status_excluded`) then retires
+deprecated rows from snapshot retrieval exactly like the live path, and
+citations surface real `last_verified` dates instead of `None`.
+
+To re-export (needs the live Sieve DB — cannot run offline):
+
+```bash
+SIEVE_DB_URL=<railway pg url> python3 service/scripts/export_snapshots.py
+bash tests/run_tests.sh   # snapshot selftests run against the real files
+```
+
+Then bump the snapshot date the report renderer discloses (grep `main.py`
+for `SNAPSHOT ruleset (`) and commit the JSONs together with that bump.

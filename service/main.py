@@ -1738,7 +1738,7 @@ function renderBrainSources(findings) {
       ((a.source_url ? 0 : 1) - (b.source_url ? 0 : 1)));
     html += '<div class="tier t' + t + '"><h3>' + tierLabels[t] + '</h3>';
     for (const c of byTier[t].slice(0, 12)) {
-      const kindLabels = {rule:'Rule', ap:'AP', anti_pattern:'AP', principle:'Principle'};
+      const kindLabels = {rule:'Rule', ap:'AP', anti_pattern:'AP', principle:'Principle', playbook:'Playbook'};
       const kind = kindLabels[c.kind] || 'Item';
       const name = c.name || c.title || '(no name)';
       // Confidence rendered numeric-only: citation fields originate in crawled
@@ -3226,7 +3226,7 @@ class BrainQuery(BaseModel):
 
 class BrainRetrieveRequest(BaseModel):
     queries: _List[BrainQuery] = Field(..., max_length=40)
-    min_tier: int = Field(3, ge=1, le=5)      # NORM slot: tier<=3 = canonical orgs only
+    min_tier: int = Field(4, ge=1, le=5)      # NORM slot: tier 4 = practitioner band in; tier 5 never
     max_citations: int = Field(3, ge=1, le=8)
 
 
@@ -3241,8 +3241,12 @@ def api_brain_retrieve(req: BrainRetrieveRequest,
     400 chars) — it LEADS the retrieval query via _query_for(check_id,
     evidence), exactly like the in-audit path, so two findings on the same
     check with different problems retrieve different norms. Only status
-    active/candidate rows are served; the NORM gate (min_tier, default 3)
-    means unattributed/observed knowledge can never be returned as a norm.
+    active/candidate rows are served. NORM gate (min_tier): default 4 since
+    2026-07-19 — tier 4 is the explicit PRACTITIONER band (YC/Reforge/
+    a16z-class growth orgs, reconciled in ruleset/org-tiers.json), and the
+    old default of 3 excluded 62% of the rule corpus. Tier 5 (unattributed/
+    observed) is STILL always excluded: anonymous knowledge can never be a
+    norm. Pass min_tier=3 explicitly for canonical-orgs-only behavior.
     Response citations carry source_org, source_url, url_provenance_method,
     confidence_score, last_verified — render org+URL verbatim; the brain's
     name stays out of client copy.

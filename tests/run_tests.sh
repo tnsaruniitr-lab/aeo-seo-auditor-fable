@@ -220,6 +220,12 @@ assert_contains "entailment verdict cached (LRU+DB) per rule×check-base×eviden
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10o] Corpus wiring: playbooks retrievable + rendered, canon-org tier parity, snapshot freshness fields, status-gate parity, NORM tier-4 default"
+OUT=$(cd "${SERVICE_DIR}" && python3 "${SCRIPT_DIR}/test_corpus_wiring.py" 2>&1)
+assert_contains "playbook kind reachable via BM25 + curated mapping + kind badge; canon_org before tier lookup fixes name drift (shared org-tiers.json, live=snapshot); last_verified/status carried when exported; deprecated rows unciteable from snapshot; retrieve default includes practitioner tier 4, never tier 5" "$OUT" "CORPUS_WIRING_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do
