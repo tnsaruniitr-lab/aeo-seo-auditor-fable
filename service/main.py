@@ -384,6 +384,20 @@ def _init_storage():
         log.warning('storage init skipped: %s', e)
 
 
+@app.on_event('startup')
+def _kick_self_benchmark():
+    """Start the entailment acceptance benchmark in a daemon thread (see
+    benchmark_self.py). Cache-first: an unchanged judge re-serves cached
+    verdicts at zero API cost, so this is cheap on every boot. Never blocks
+    or fails startup; /benchmark-status serves the result read-only."""
+    try:
+        import benchmark_self
+        state = benchmark_self.start_background()
+        log.info('entailment self-benchmark: %s', state)
+    except Exception as e:
+        log.warning('self-benchmark kick skipped: %s', e)
+
+
 # ----------------------------------------------------------------------
 # AUTH — HTTP Basic, credentials from env vars (never in code)
 # ----------------------------------------------------------------------
@@ -2052,6 +2066,17 @@ def _brain_ok() -> bool:
     from ranker import BrainIndex
     BrainIndex.from_export_dir(str(THIS_DIR / 'ruleset'))
     return True
+
+
+@app.get('/benchmark-status')
+def benchmark_status():
+    """Public, metrics-only: the entailment gate's self-graded acceptance
+    scores against the in-repo labelled benchmark (see benchmark_self.py).
+    Numbers + model id + git sha only — no data, no config posture. Purely
+    read-only: the run is kicked once at app startup (_kick_self_benchmark),
+    so polling this endpoint can never cause spend."""
+    import benchmark_self
+    return benchmark_self.status()
 
 
 @app.get('/healthz')

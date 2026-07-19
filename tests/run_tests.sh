@@ -226,6 +226,12 @@ assert_contains "playbook kind reachable via BM25 + curated mapping + kind badge
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10p] Self-benchmark: labelled pairs ship in-repo; scores computed via the real gate (stubbed judge); disabled path honest"
+OUT=$(cd "${SERVICE_DIR}" && python3 benchmark_self.py 2>&1)
+assert_contains "206 labelled pairs load with kind/id; stubbed all-supports judge yields exact strict/missed math under DB-less degradation; enabled() honest without a key" "$OUT" "BENCHMARK_SELF_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do
