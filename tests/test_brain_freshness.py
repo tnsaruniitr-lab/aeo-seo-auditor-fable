@@ -32,7 +32,10 @@ def test_status_filter_sql():
     # Honest dates: last_verified and created_at are SEPARATE columns (no COALESCE
     # laundering created_at into a fabricated verified date).
     cfg = sieve_brain._TABLE_CFG['rules']
-    head = sieve_brain._select_head(cfg, '1.0', {'status', 'url_provenance'})
+    # last_verified/created_at are probe-guarded like every optional column
+    # (playbooks may lack them) — pass them as probed, like a live rules table.
+    head = sieve_brain._select_head(cfg, '1.0', {'status', 'url_provenance',
+                                                 'last_verified', 'created_at'})
     assert 't.last_verified::text AS last_verified' in head
     assert 't.created_at AS created_at' in head
     assert 'COALESCE(t.last_verified' not in head
