@@ -355,9 +355,13 @@ def _get_brain():
     return _BRAIN_CACHE
 
 
+_POOL_CAP = 24  # hard ceiling on judge-at-selection pools (matches citation_attach)
+
+
 def query_brain(check_id: str, page_type: str = "homepage",
                 industry: str = "other", max_citations: int = 3,
-                evidence: str = None, evidence_led: bool = False) -> Dict[str, Any]:
+                evidence: str = None, evidence_led: bool = False,
+                pool: int = None) -> Dict[str, Any]:
     """Query the Sieve brain for citations relevant to a given check_id.
 
     Returns top-N rules + anti-patterns ranked by tier ASC, confidence DESC.
@@ -379,7 +383,23 @@ def query_brain(check_id: str, page_type: str = "homepage",
     select_citations — and retrieval is pure search led by the finding's
     evidence + the ORIGINAL id's name tail. A model-invented id must not
     inherit a canonical slot's hand-authored citations.
+
+    pool (judge-at-selection): when set (> max_citations, capped at 24) the
+    returned citation list is a candidate POOL of up to `pool` entries whose
+    FIRST max_citations entries are byte-identical to the pool-less call.
+    Both paths guarantee it structurally: the live path keeps per_table_k a
+    function of max_citations and only deepens the final cut; the snapshot
+    path's curated sort, BM25 scoring (score-everything-then-cut) and
+    curated-first merge are all prefix-stable under a deeper cap. A caller
+    that judges the pool and degrades to [:max_citations] therefore degrades
+    to exact legacy behavior.
     """
+    k = max_citations
+    if pool:
+        try:
+            k = max(max_citations, min(int(pool), _POOL_CAP))
+        except (TypeError, ValueError):
+            k = max_citations
     # LIVE brain (opt-in via SIEVE_LIVE): retrieve from the fresh Sieve DB
     # (23k rules, real source_url + authority-tier ranking + last_verified).
     # ADDITIVE — on any miss/error this returns None and we fall straight
@@ -387,7 +407,8 @@ def query_brain(check_id: str, page_type: str = "homepage",
     try:
         import sieve_brain
         live = sieve_brain.live_citations(check_id, page_type, industry, max_citations,
-                                          evidence=evidence)
+                                          evidence=evidence,
+                                          pool=(k if k > max_citations else None))
         if live:
             return {
                 "check_id": check_id,
@@ -420,21 +441,21 @@ def query_brain(check_id: str, page_type: str = "homepage",
         curated = [] if evidence_led else select_citations(
             brain=brain, check_id=resolved_id,
             page_type=page_type, industry=industry,
-            max_citations=max_citations,
+            max_citations=k,
         )
         searched = []
-        if len(curated) < max_citations and hasattr(brain, "search"):
+        if len(curated) < k and hasattr(brain, "search"):
             try:
                 import sieve_brain
                 query = sieve_brain._query_for(check_id, evidence)
             except Exception:
                 query = check_id.replace("_", " ")
             try:
-                searched = brain.search(query, max_citations * 3)
+                searched = brain.search(query, k * 3)
             except Exception as se:  # noqa: BLE001 — search must never break query_brain
                 log.debug("snapshot search failed: %s", se)
 
-        citations = _merge_citations(curated, searched, max_citations)
+        citations = _merge_citations(curated, searched, k)
         # Trim verbose fields
         for c in citations:
             for k in ("if_condition", "then_action", "description"):

@@ -49,6 +49,16 @@ SIEVE_MIN_TS_RANK = float(os.getenv('SIEVE_MIN_TS_RANK', '0.0'))        # ts_ran
 # always win regardless of tier.
 RELEVANCE_BAND = float(os.getenv('SIEVE_RELEVANCE_BAND', '0.10'))
 
+# Lane B — numeric-aware query enrichment. Max words _numeric_hints may append
+# to a retrieval query (0 disables, hard-capped at 16 so no env value can let
+# the hint drown the check topic that anchors the query).
+_NUM_HINT_HARD_CAP = 16
+try:
+    SIEVE_NUM_HINT_TOKENS = max(0, min(int(os.getenv('SIEVE_NUM_HINT_TOKENS', '8')),
+                                       _NUM_HINT_HARD_CAP))
+except ValueError:
+    SIEVE_NUM_HINT_TOKENS = 8
+
 
 class SieveLiveError(RuntimeError):
     """Live sieve DB was required (SIEVE_STRICT) but unavailable."""
@@ -188,6 +198,124 @@ _SECTION_HINT = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Numeric-aware query enrichment (Lane B)
+#
+# Evidence states measurements in whatever unit the probe emitted
+# ('LCP: 12,417ms'); rules state thresholds in prose units ('under 3 seconds',
+# 'load time'). Neither BM25 nor the embedding reliably bridges '12417ms' →
+# 'seconds', so the right rule sits in the candidate pool but loses the cut to
+# lexical near-misses. _numeric_hints closes that gap DETERMINISTICALLY (pure
+# lexical, no LLM, no I/O): detect measured quantities in the evidence,
+# convert to the canonical unit rules speak in, and append the canonical value
+# plus the metric's conceptual vocabulary. Output is capped
+# (SIEVE_NUM_HINT_TOKENS, default 8 words) and appended AFTER the check topic
+# so the hint can never drown it.
+# ---------------------------------------------------------------------------
+
+# Number: comma-grouped or plain integer + optional decimals. The lookbehind
+# refuses matches inside identifiers/URLs/versions ('page-2s', 'v2', '1.2.3').
+_NUM_PAT = r'(?<![\w/.,-])(\d{1,3}(?:,\d{3})+|\d+)(\.\d+)?'
+_RE_TIME = re.compile(_NUM_PAT +
+                      r'\s*(milliseconds?|msecs?|ms|minutes?|mins?|seconds?|secs?|s)\b')
+_RE_SIZE = re.compile(_NUM_PAT +
+                      r'\s*(kilobytes?|kb|megabytes?|mb|gigabytes?|gb|bytes?)\b')
+_RE_PCT = re.compile(_NUM_PAT + r'\s*(?:%|percent(?:age)?\b|pct\b)')
+_RE_COUNT = re.compile(_NUM_PAT +
+                       r'\s+(words?|characters?|chars?|links?|images?'
+                       r'|requests?|redirects?|scripts?|elements?)\b')
+
+# Conceptual vocabulary per counted noun (singular) — the words threshold
+# rules actually use ('word count', 'redirect chain', 'title ... characters').
+_COUNT_VOCAB = {
+    'word': ('word', 'count', 'content', 'length'),
+    'char': ('character', 'count', 'length'),
+    'character': ('character', 'count', 'length'),
+    'link': ('link', 'count'),
+    'image': ('image', 'count'),
+    'request': ('request', 'count', 'http'),
+    'redirect': ('redirect', 'chain', 'count'),
+    'script': ('script', 'count'),
+    'element': ('element', 'count'),
+}
+
+# KB multiplier per size-unit prefix character (after unit normalization).
+_SIZE_TO_KB = {'b': 1.0 / 1024, 'k': 1.0, 'm': 1024.0, 'g': 1024.0 * 1024}
+
+
+def _fmt_qty(v: float) -> str:
+    """Canonical number token: 1 decimal, integers without '.0'. Pure."""
+    r = round(v, 1)
+    return str(int(r)) if abs(r - int(r)) < 1e-9 else f'{r:.1f}'
+
+
+def _match_val(m) -> float:
+    return float(m.group(1).replace(',', '') + (m.group(2) or ''))
+
+
+def _numeric_hints(text: Optional[str], max_tokens: Optional[int] = None) -> List[str]:
+    """Deterministic numeric enrichment tokens for an evidence string.
+
+    Detects measured quantities (time in ms/s/min, sizes in bytes/KB/MB/GB,
+    percentages, counted nouns), converts each to its canonical unit, and
+    returns canonical-value + conceptual-vocabulary words, first-match-per-
+    class, in fixed class order (time, size, percent, count), de-duplicated,
+    capped at max_tokens (default SIEVE_NUM_HINT_TOKENS; 0 disables). Pure
+    function of its arguments — same evidence always yields the same hints.
+    """
+    if not text:
+        return []
+    cap = SIEVE_NUM_HINT_TOKENS if max_tokens is None else max_tokens
+    try:
+        cap = max(0, min(int(cap), _NUM_HINT_HARD_CAP))
+    except (TypeError, ValueError):
+        cap = SIEVE_NUM_HINT_TOKENS
+    if cap == 0:
+        return []
+    t = re.sub(r'\s+', ' ', str(text)).strip().lower()
+    hints: List[str] = []
+    seen = set()
+
+    def add(tokens):
+        for tok in tokens:
+            if len(hints) >= cap:
+                return
+            if tok not in seen:
+                seen.add(tok)
+                hints.append(tok)
+
+    m = _RE_TIME.search(t)
+    if m:
+        v, unit = _match_val(m), m.group(3)
+        if unit in ('ms', 'msec', 'msecs', 'millisecond', 'milliseconds'):
+            sec = v / 1000.0
+        elif unit.startswith('min'):
+            sec = v * 60.0
+        else:
+            sec = v
+        add([_fmt_qty(sec), 'seconds', 'load', 'time', 'speed'])
+
+    m = _RE_SIZE.search(t)
+    if m:
+        kb = _match_val(m) * _SIZE_TO_KB[m.group(3)[0]]
+        if kb >= 1024:
+            add([_fmt_qty(kb / 1024.0), 'mb', 'megabytes', 'page', 'size', 'weight'])
+        else:
+            add([_fmt_qty(kb), 'kb', 'kilobytes', 'page', 'size', 'weight'])
+
+    m = _RE_PCT.search(t)
+    if m:
+        add([_fmt_qty(_match_val(m)), 'percent', 'percentage', 'ratio'])
+
+    m = _RE_COUNT.search(t)
+    if m:
+        noun = m.group(3)
+        noun = noun[:-1] if noun.endswith('s') else noun
+        add(_COUNT_VOCAB.get(noun, (noun, 'count')))
+
+    return hints
+
+
 def _query_for(check_id: str, evidence: Optional[str] = None) -> str:
     """Build the retrieval query for a check.
 
@@ -196,6 +324,11 @@ def _query_for(check_id: str, evidence: Optional[str] = None) -> str:
     so two findings on the same check with different problems retrieve
     different rules. Evidence is normalized (lowercased, whitespace-collapsed,
     truncated) so identical observations pin to the same embedding.
+
+    Numeric-aware (Lane B): measured quantities in the evidence append their
+    canonical-unit + conceptual-vocabulary tokens (_numeric_hints) at the END
+    of the query — evidence still leads, the check topic still anchors, and
+    evidence WITHOUT measurements builds a byte-identical legacy query.
     """
     clean = check_id.split(':', 1)[-1]
     m = re.match(r'^([A-Z])\d', clean)
@@ -203,9 +336,13 @@ def _query_for(check_id: str, evidence: Optional[str] = None) -> str:
     body = re.sub(r'^[A-Z]\d+[a-z]?_', '', clean).replace('_', ' ').strip()
     base = (body + ' ' + hint).strip() or clean
     if evidence:
-        ev = re.sub(r'\s+', ' ', str(evidence)).strip().lower()[:200]
+        ev_full = re.sub(r'\s+', ' ', str(evidence)).strip().lower()
+        ev = ev_full[:200]
         if ev:
-            return (ev + ' ' + base).strip()
+            q = (ev + ' ' + base).strip()
+            present = set(re.split(r'[^a-z0-9.]+', q.lower()))
+            hints = [h for h in _numeric_hints(ev_full) if h not in present]
+            return (q + ' ' + ' '.join(hints)).strip() if hints else q
     return base
 
 
@@ -591,7 +728,8 @@ def _search_all_tables(conn, query_text: str, per_table_k: int) -> List[Dict[str
 def live_citations(check_id: str, page_type: Optional[str] = None,
                    industry: Optional[str] = None,
                    max_citations: int = 3,
-                   evidence: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+                   evidence: Optional[str] = None,
+                   pool: Optional[int] = None) -> Optional[List[Dict[str, Any]]]:
     """Return citation dicts for a check from the live brain, or None so the
     caller falls back to the snapshot path. Never raises — EXCEPT under
     SIEVE_STRICT, where a live-brain failure raises SieveLiveError so the
@@ -601,7 +739,14 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
     RELEVANCE-floored (off-topic hits are dropped, not the nearest-of-noise),
     and ranked relevance-first with authority a bounded tiebreak. If the
     corpus embedding model differs from SIEVE_EMBED_MODEL the vector layer is
-    refused (falls to FTS) rather than cosine-comparing incompatible spaces."""
+    refused (falls to FTS) rather than cosine-comparing incompatible spaces.
+
+    pool (judge-at-selection): when set (> max_citations) the final cut
+    deepens to `pool` candidates. per_table_k stays a function of
+    max_citations ON PURPOSE — the retrieved candidate set and the ranking
+    sort are identical with or without a pool, so the first max_citations
+    entries of a pooled result are byte-identical to the pool-less call
+    (the degradation guarantee citation_attach's selection judging relies on)."""
     if not live_enabled():
         return None
     try:
@@ -680,7 +825,13 @@ def live_citations(check_id: str, page_type: Optional[str] = None,
     # authority only reorders WITHIN a relevance band. If nothing clears the
     # floor, return None so the caller falls to the snapshot path rather than
     # emitting confident-but-irrelevant tier-1 citations.
-    ranked = _rank_and_floor(cites, max_citations)
+    cut = max_citations
+    if pool:
+        try:
+            cut = max(max_citations, int(pool))
+        except (TypeError, ValueError):
+            cut = max_citations
+    ranked = _rank_and_floor(cites, cut)
     return ranked or None
 
 # ---------------------------------------------------------------------------

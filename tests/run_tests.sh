@@ -110,9 +110,9 @@ assert_contains "renames need semantic agreement (alias table / token overlap); 
 
 # ----------------------------------------------------------------------
 echo ""
-echo "[7] Deterministic citation attachment — Python cites every fail/warn"
+echo "[7] Deterministic citation attachment — Python cites every fail/warn (+ judge-at-selection pool)"
 OUT=$(cd "${SERVICE_DIR}" && python3 citation_attach.py 2>&1)
-assert_contains "fail/warn findings get top-3 brain citations; LLM picks replaced; supports_finding annotated; foreign/renamed go evidence-led; fault-tolerant" "$OUT" "ATTACH_OK"
+assert_contains "fail/warn findings get top-3 brain citations; LLM picks replaced; supports_finding annotated; foreign/renamed go evidence-led; fault-tolerant; judged 12-pool promotes rank-9 supports over rank-1 related, degrades byte-identical without a judge, deterministic + warm-cache on rerun, budget-capped" "$OUT" "ATTACH_OK"
 
 # ----------------------------------------------------------------------
 echo ""
@@ -229,6 +229,18 @@ echo ""
 echo "[10p] Self-benchmark: labelled pairs ship in-repo; scores computed via the real gate (stubbed judge); disabled path honest"
 OUT=$(cd "${SERVICE_DIR}" && python3 benchmark_self.py 2>&1)
 assert_contains "206 labelled pairs load with kind/id; stubbed all-supports judge yields exact strict/missed math under DB-less degradation; enabled() honest without a key" "$OUT" "BENCHMARK_SELF_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10q] Cluster canonicalization tooling: blocking + rule_key/similarity clustering + deterministic election + reversible demote plan"
+OUT=$(cd "${SCRIPTS_DIR}" && python3 canonicalize_clusters.py --selftest 2>&1)
+assert_contains "near-dup clustering (jaccard+cosine gate, rule_key groups, topic blocks); deterministic election (tier>url>extracted>freshest>confidence>id); prior-status capture + guarded reversal SQL; plan validation rejects self/cross supersession" "$OUT" "CANON_OK"
+
+# ----------------------------------------------------------------------
+echo ""
+echo "[10r] Numeric-aware query enrichment: canonical units + conceptual vocab, capped, numberless evidence byte-identical"
+OUT=$(python3 "${SCRIPT_DIR}/test_numeric_hints.py" 2>&1)
+assert_contains "measured quantities canonicalized (ms/min->seconds, bytes/kb/mb/gb, %, counted nouns) + threshold vocab appended after the check topic; capped at 8 + kill switch; deduped vs query words; URL/identifier numbers never fire; live+snapshot+retrieve builds share _query_for" "$OUT" "NUMERIC_HINTS_OK"
 
 # ----------------------------------------------------------------------
 echo ""
