@@ -19,7 +19,11 @@ when DATABASE_URL points at the auditor DB):
     ANTHROPIC_API_KEY=sk-... python3 scripts/entailment_benchmark.py \
         --pairs "/path/to/labelled-pairs-2026-07-19.jsonl" \
         [--audit /path/to/full-audit.json ...] \
-        [--limit N] [--json]
+        [--limit N] [--json] [--no-cache]
+
+After ANY prompt or model revision, run with --no-cache (and bump
+citation_entailment.PROMPT_VERSION with prompt changes): acceptance numbers
+must come from the live judge, never from cached verdicts of the old one.
 
 INPUT FIDELITY: the labelled JSONL carries (check, citation-name, org, gold
 label) but NOT the finding evidence or the rule's if/then text. The harness
@@ -102,6 +106,10 @@ def main() -> int:
                     help='full audit JSON to join finding evidence from (repeatable)')
     ap.add_argument('--limit', type=int, default=0, help='judge only the first N pairs')
     ap.add_argument('--json', action='store_true', help='emit raw metrics JSON only')
+    ap.add_argument('--no-cache', action='store_true',
+                    help='bypass the LRU/DB verdict caches so every pair '
+                         'exercises the LIVE judge (use after any prompt/model '
+                         'change; results are still written back)')
     args = ap.parse_args()
 
     if not os.getenv('ANTHROPIC_API_KEY'):
@@ -153,7 +161,8 @@ def main() -> int:
             finding = {'check_id': check, 'status': 'fail',
                        'evidence': evidence, 'vocab_status': p.get('vs')}
             try:
-                judged = ce.judge_pair(finding, cite, conn=conn)['verdict']
+                judged = ce.judge_pair(finding, cite, conn=conn,
+                                       use_cache=not args.no_cache)['verdict']
             except Exception as e:  # noqa: BLE001
                 errors += 1
                 judged = 'ERROR'

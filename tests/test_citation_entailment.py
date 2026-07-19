@@ -64,6 +64,29 @@ def test_cache_key_stability_and_ddl():
     assert ce.cache_key(f, _cite(cid=8)) != k1
     # kind participates (rule #7 != ap #7)
     assert ce.cache_key(f, _cite(kind='ap')) != k1
+    # The JUDGED text participates: an in-place brain edit to the rule's
+    # if/then re-judges — the TTL-less DB cache must not serve the verdict
+    # computed over the old text forever.
+    assert ce.cache_key(f, _cite(if_condition='rewritten condition')) != k1
+    assert ce.cache_key(f, _cite(then_action='rewritten action')) != k1
+    # Model + prompt version participate: a judge/prompt revision invalidates
+    # (the acceptance benchmark reads the LIVE judge, not the old one's cache).
+    saved_model, saved_pv = ce.MODEL, ce.PROMPT_VERSION
+    try:
+        ce.MODEL = 'claude-other-model'
+        assert ce.cache_key(f, c) != k1
+        ce.MODEL = saved_model
+        ce.PROMPT_VERSION = 'v2'
+        assert ce.cache_key(f, c) != k1
+    finally:
+        ce.MODEL, ce.PROMPT_VERSION = saved_model, saved_pv
+    assert ce.cache_key(f, c) == k1                      # restored -> stable
+    # Benchmark escape hatch: judge_pair(use_cache=False) skips cache reads.
+    import inspect
+    assert 'use_cache' in inspect.signature(ce.judge_pair).parameters
+    bench = open(os.path.join(_SERVICE, 'scripts', 'entailment_benchmark.py'),
+                 encoding='utf-8').read()
+    assert '--no-cache' in bench and 'use_cache=not args.no_cache' in bench
     # DDL auto-creates the auditor's OWN cache table (check_query_embeddings pattern)
     assert 'CREATE TABLE IF NOT EXISTS public.citation_entailment_cache' in ce._TABLE_DDL
     assert 'cache_key' in ce._TABLE_DDL and 'PRIMARY KEY' in ce._TABLE_DDL

@@ -19,10 +19,13 @@ citation with the verdict the renderers act on:
                                       renderers fall back to the legacy
                                       supports_finding behavior
 
-One short claude-haiku-4-5 call per (rule-kind, rule-id, check-base,
-evidence) tuple — cached in the auditor's OWN public.citation_entailment_cache
-(DDL auto-created, same pattern as check_query_embeddings) plus an in-process
-LRU, so repeat findings across audits cost ~zero API calls.
+One short claude-haiku-4-5 call per (prompt-version, model, rule-kind,
+rule-id, check-base, evidence, judged-citation-text) tuple — cached in the
+auditor's OWN public.citation_entailment_cache (DDL auto-created, same
+pattern as check_query_embeddings) plus an in-process LRU, so repeat
+findings across audits cost ~zero API calls, while an in-place rule edit, a
+model swap, or a prompt bump (PROMPT_VERSION) re-judges instead of serving
+a stale verdict from the TTL-less cache.
 
 FAIL-SAFE by construction: judge_citations never raises and never blocks an
 audit — every failure path stamps 'unjudged' and is counted in the stats dict
@@ -52,6 +55,11 @@ UNJUDGED = 'unjudged'
 MODEL = os.getenv('CITATION_ENTAILMENT_MODEL', 'claude-haiku-4-5')
 CALL_TIMEOUT_S = float(os.getenv('CITATION_ENTAILMENT_TIMEOUT_S', '6'))
 TOTAL_BUDGET_S = float(os.getenv('CITATION_ENTAILMENT_BUDGET_S', '30'))
+
+# Bump whenever _pair_prompt (or verdict semantics) changes: the version is
+# part of cache_key, so a prompt revision re-judges instead of serving the
+# old prompt's cached verdicts as if they were the new judge's.
+PROMPT_VERSION = 'v1'
 
 _JUDGED_STATUSES = ('fail', 'warn')
 
@@ -151,11 +159,28 @@ def _db_put(conn, key: str, verdict: str, finding: Dict, citation: Dict) -> None
 
 
 # ---------------------------------------------------------------------------
-# Cache key — sha256(rule-kind:rule-id:check-base:evidence-hash-prefix).
+# Cache key — sha256(prompt-version:model:rule-kind:rule-id:check-base:
+# evidence-hash:citation-text-hash).
 # check BASE (A1, D12b, ...) not the full id, so aliased/renamed ids that
 # canonicalize to the same slot share judgments; evidence prefix-hashed so a
-# different observation on the same check is re-judged.
+# different observation on the same check is re-judged. The JUDGED citation
+# text participates too: when a rule's if/then is edited in-place in the
+# brain, the regrounded text the judge reads changes, and the stale verdict
+# must not be served forever (the DB cache has no TTL). MODEL and
+# PROMPT_VERSION participate so a judge/prompt revision re-judges instead of
+# reporting the OLD judge's cached verdicts — the acceptance benchmark
+# (entailment_benchmark.py) depends on this.
 # ---------------------------------------------------------------------------
+
+def _cite_text(citation: Dict) -> str:
+    """The citation text the judge actually reads — same field fallbacks and
+    truncations as _pair_prompt, so the cache key tracks the judged input."""
+    name = str(citation.get('name') or citation.get('title') or '(unnamed)')[:200]
+    cond = str(citation.get('if_condition') or citation.get('statement')
+               or citation.get('description') or '')[:300]
+    act = str(citation.get('then_action') or citation.get('explanation') or '')[:300]
+    return f'{name}\n{cond}\n{act}'
+
 
 def cache_key(finding: Dict, citation: Dict) -> str:
     try:
@@ -169,8 +194,10 @@ def cache_key(finding: Dict, citation: Dict) -> str:
     cid = str(cid) if cid is not None else str(citation.get('name') or '?')
     ev = str(finding.get('evidence') or '').strip().lower()
     ev_hash = hashlib.sha256(ev.encode('utf-8')).hexdigest()[:16]
+    ct_hash = hashlib.sha256(_cite_text(citation).encode('utf-8')).hexdigest()[:16]
     return hashlib.sha256(
-        f'{kind}:{cid}:{base}:{ev_hash}'.encode('utf-8')).hexdigest()
+        f'{PROMPT_VERSION}:{MODEL}:{kind}:{cid}:{base}:{ev_hash}:{ct_hash}'
+        .encode('utf-8')).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -243,24 +270,29 @@ def _judge(finding: Dict, citation: Dict) -> str:
     return _call_api(finding, citation)
 
 
-def judge_pair(finding: Dict, citation: Dict, conn: Any = None) -> Dict[str, Any]:
+def judge_pair(finding: Dict, citation: Dict, conn: Any = None,
+               use_cache: bool = True) -> Dict[str, Any]:
     """Judge one finding<->citation pair. Returns
     {'verdict': 'supports'|'related'|'unrelated', 'cached': bool}.
 
     Cache order: LRU -> public.citation_entailment_cache -> ONE API call.
+    use_cache=False skips both reads (the result is still written back) —
+    the acceptance benchmark's --no-cache mode, so a run always exercises
+    the LIVE judge rather than reporting cached verdicts.
     Raises on judge failure (no key, timeout, bad output) — fail-safety lives
     in judge_citations, and the benchmark harness wants real errors.
     When conn is None a short-lived connection is opened just for this call;
     judge_citations shares one across the batch."""
     key = cache_key(finding, citation)
-    v = _lru_get(key)
-    if v is not None:
-        return {'verdict': v, 'cached': True}
+    if use_cache:
+        v = _lru_get(key)
+        if v is not None:
+            return {'verdict': v, 'cached': True}
     own = conn is None
     if own:
         conn = _open_conn()
     try:
-        v = _db_get(conn, key)
+        v = _db_get(conn, key) if use_cache else None
         if v is not None:
             _lru_put(key, v)
             return {'verdict': v, 'cached': True}
