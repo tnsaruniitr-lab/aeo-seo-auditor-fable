@@ -1,0 +1,41 @@
+{
+  "version": "2026-07-21",
+  "source": "reverse-engineered from 1000-probe citation experiment + crawl contrast (cited vs Google-ranked-not-cited control). See docs/AEO-REVERSE-ENGINEERED-PLAYBOOK-2026-07-21.md",
+  "surfaces": {
+    "own_site_cite_readiness": "the ~20% own-domain lever this model scores",
+    "category_presence": "the ~55-60% retrieved-documents lever — scored by answermonk Source Intelligence, not here"
+  },
+  "category_dispatch": {
+    "product":       { "own_site_weight": 0.4, "note": "AI cites listicles (43-54%); own site secondary" },
+    "local_service": { "own_site_weight": 1.0, "note": "AI cites the business's own homepage/deep pages (39-46%)" }
+  },
+  "tier0_gates": [
+    { "id": "ai_bot_allowed", "rule": "no Disallow:/ for GPTBot|ClaudeBot|Google-Extended|PerplexityBot", "measured": "0% of cited winners blocked all; gate" },
+    { "id": "server_rendered", "rule": "raw-HTML text words >= 300", "measured": "0% of cited winners JS-blocked; ~19% of candidates failed to yield citable HTML" },
+    { "id": "reachable_200", "rule": "HTTP 200 to GPTBot UA, redirects ok", "measured": "gate" },
+    { "id": "https", "rule": "scheme == https", "measured": "100% both groups; gate" }
+  ],
+  "tier1_factors": [
+    { "id": "faq_schema",       "weight": 22, "level": "page",   "measured_lift": 3.4, "cited": 0.44, "control": 0.13 },
+    { "id": "depth_structure",  "weight": 18, "level": "page",   "measured_lift": 1.9, "detail": "median 2920w cited vs 1575w control; >=10 H2, >=12 lists/tables" },
+    { "id": "question_headings","weight": 15, "level": "page",   "measured_lift": 2.0, "detail": "median 2 vs 1 interrogative headings" },
+    { "id": "article_schema",   "weight": 12, "level": "page",   "measured_lift": 2.6, "cited": 0.34, "control": 0.13 },
+    { "id": "llms_txt",         "weight": 12, "level": "domain", "measured_lift": 2.4, "cited": 0.65, "control": 0.27 },
+    { "id": "answer_shaped_intro","weight": 10,"level": "page",  "measured_lift": null, "detail": "direct answer in first ~80 words; needs DOM render" },
+    { "id": "byline_eeat",      "weight": 6,  "level": "page",   "measured_lift": 1.8, "cited": 0.08, "control": 0.04 },
+    { "id": "delivery_hardening","weight": 5, "level": "domain", "measured_lift": 1.4, "detail": "CDN 65% vs 45%; +HSTS 1.2x, compression, cache-control" }
+  ],
+  "tier2_nonfactors": [
+    { "id": "product_schema",  "measured_lift": 0.7, "note": "controls HIGHER; do NOT reward for citation" },
+    { "id": "review_schema",   "measured_lift": 0.9 },
+    { "id": "org_schema",      "measured_lift": 1.0, "note": "58% vs 61%; table stakes" },
+    { "id": "pricing_present", "measured_lift": 1.0 },
+    { "id": "meta_description","measured_lift": 1.0 },
+    { "id": "canonical",       "measured_lift": 1.0 },
+    { "id": "mobile_viewport", "measured_lift": 1.0 },
+    { "id": "raw_ttfb",        "measured_lift": 1.0, "note": "430 vs 473ms; both above 'good enough'" }
+  ],
+  "scoring": "0 if any tier0 gate fails; else sum(weight*present)/sum(weight_applicable) over page-type-applicable tier1 factors, 0..100. Each contribution renders with its measured_lift for auditability.",
+  "engine_seo_carryover": { "gemini": 0.64, "claude": 0.36, "chatgpt_gpt52": 0.22, "chatgpt_mini": 0.15, "note": "fraction of Google p1 domains an engine cites — Google-rank matters most for Gemini, least for ChatGPT" },
+  "caveats": "n=73 pages / 59 domains / 5 categories / single snapshot; lifts directional (FAQ/depth/llms.txt strongest); per-category recalibration recommended; correlation not proven cause; re-derive quarterly."
+}
