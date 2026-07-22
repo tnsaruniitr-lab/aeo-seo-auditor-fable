@@ -244,6 +244,12 @@ assert_contains "measured quantities canonicalized (ms/min->seconds, bytes/kb/mb
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[10s] Cite-readiness Phase 2: calibrated config consumer + tier-0 gates + E14 llms.txt + per-bot robots verdicts"
+OUT=$(cd "${SERVICE_DIR}" && python3 "${SCRIPT_DIR}/test_cite_readiness.py" 2>&1)
+assert_contains "aeo-scoring-model consumed (null-tolerant); renormalized factor math; gate-zero distinct from INCONCLUSIVE-null (unknown fails open); product default on low confidence; E14 pass/soft-200-reject; GPTBot/Google-Extended tier-0 verdicts; clamp on both compact copies" "$OUT" "CITE_READINESS_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do

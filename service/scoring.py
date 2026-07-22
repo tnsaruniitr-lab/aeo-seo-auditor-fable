@@ -180,6 +180,7 @@ MEASURED_CHECK_BASES = frozenset({
     'E3',    # googlebot_allowed
     'E10',   # claudebot_chatgpt_applebot
     'E13',   # ccbot_llm_training_access
+    'E14',   # llms_txt (deterministic_checks.py — domain-level /llms.txt probe)
     # check_sitemap.py
     'E8',    # page_in_sitemap / target_url_in_sitemap
 })
@@ -552,6 +553,419 @@ def _compute_bap(findings: List[Dict[str, Any]]) -> Tuple[Optional[float], str]:
 
 
 # ---------------------------------------------------------------------------
+# CITE-READINESS (Phase 2) — first consumer of the study-calibrated scoring
+# model (service/ruleset/aeo-scoring-model.json, reverse-engineered from the
+# 1000-probe citation experiment). Computes the on-site cite-readiness
+# sub-score: tier-0 gates zero it, tier-1 factors weight it, tier-2
+# non-factors are excluded entirely. Ships ALONGSIDE the classic PCR — the
+# overall score/grade continue to ride PCR unchanged (no cutover).
+# ---------------------------------------------------------------------------
+
+_SCORING_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   'ruleset', 'aeo-scoring-model.json')
+# Module-level cache: False = not loaded yet; None = load failed (absence
+# tolerated — citeReadiness goes null); dict = the parsed model.
+_SCORING_MODEL_CACHE: Any = False
+
+
+def load_scoring_model() -> Optional[Dict[str, Any]]:
+    """Load + cache aeo-scoring-model.json. Absence/corruption tolerated:
+    returns None (citeReadiness renders null), never raises."""
+    global _SCORING_MODEL_CACHE
+    if _SCORING_MODEL_CACHE is False:
+        try:
+            import json as _json
+            with open(_SCORING_MODEL_PATH) as fh:
+                model = _json.load(fh)
+            _SCORING_MODEL_CACHE = model if isinstance(model, dict) else None
+        except Exception:
+            _SCORING_MODEL_CACHE = None
+    return _SCORING_MODEL_CACHE
+
+
+# Factor id -> auditor check BASES whose findings evidence that factor.
+# Sourced from the measured factor→check-ID map in
+# docs/AEO-PLAYBOOK-measured-2026-07-20.md §1 (the config carries weights and
+# lifts; this table carries the check vocabulary those weights bind to).
+CITE_FACTOR_CHECK_BASES: Dict[str, Tuple[str, ...]] = {
+    'faq_schema':         ('D9', 'F4', 'F3'),
+    'depth_structure':    ('C6', 'C1', 'F12'),
+    'question_headings':  ('F6',),
+    'article_schema':     ('D3', 'D11'),
+    'llms_txt':           ('E14',),
+    'answer_shaped_intro': ('F1', 'F2'),
+    'byline_eeat':        ('G1', 'G2'),
+    'delivery_hardening': ('B7', 'B8'),
+}
+
+VALID_GATE_STATUSES = frozenset({'pass', 'fail', 'unknown'})
+VALID_BUSINESS_TYPES = frozenset({'product', 'local_service'})
+
+# STATUS-DERIVATION MAPPING (deterministic, documented per Phase-2 contract):
+#   Per factor, take every finding whose check-id BASE is in the factor's
+#   CITE_FACTOR_CHECK_BASES entry and whose status is applicable
+#   (pass/warn/fail — 'na' and missing checks are excluded).
+#     presence_fraction = mean of {pass: 1.0, warn: 0.5, fail: 0.0}
+#                         over those applicable constituent checks
+#     factor status     = 'pass' when presence_fraction == 1.0 (all pass)
+#                         'fail' when presence_fraction == 0.0 (all fail)
+#                         'warn' otherwise (mixed / any warn)
+#                         'na'   when NO applicable constituent check exists
+#     factor points     = weight × presence_fraction
+#   Renormalization: score = Σ(weight × presence_fraction) over applicable
+#   factors ÷ Σ(weight) over applicable factors × 100. A factor with no
+#   applicable constituent check ('na') is excluded from BOTH sums — the
+#   finding-driven form of "page-type applicability" (checks the page type
+#   never triggers are absent/na, so their factors drop out of the
+#   denominator instead of dragging the score).
+
+
+def _cite_gates(audit: Dict[str, Any],
+                model: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Evaluate the tier-0 gates. Each gate is pass / fail / unknown:
+    only an explicit FAIL zeroes the score — 'unknown' (missing probe or
+    robots data) fails OPEN so a degraded scripts run can never fake a
+    zero. This zero-path is DISTINCT from TRANSPORT_INCONCLUSIVE Gate 0:
+    an unreached page is handled before this function is called and stays
+    INCONCLUSIVE (citeReadiness null), never 0."""
+    bev = audit.get('bots_eye_view') if isinstance(
+        audit.get('bots_eye_view'), dict) else {}
+    summary = bev.get('summary') if isinstance(bev.get('summary'), dict) else {}
+    probes = bev.get('probes') if isinstance(bev.get('probes'), dict) else {}
+    gates: List[Dict[str, Any]] = []
+
+    # --- ai_bot_allowed — via the robots outputs (runtime-attached
+    # audit['robots_ai_access'], produced by check_robots_txt.py's
+    # evaluate_tier0_bot_access over GPTBot/ClaudeBot/Google-Extended/
+    # PerplexityBot).
+    access = audit.get('robots_ai_access')
+    bots = access.get('bots') if isinstance(access, dict) else None
+    if isinstance(bots, dict) and bots:
+        blocked = sorted(b for b, v in bots.items()
+                         if isinstance(v, dict) and v.get('allowed') is False)
+        known = [v for v in bots.values()
+                 if isinstance(v, dict) and v.get('allowed') is not None]
+        if blocked:
+            gates.append({'id': 'ai_bot_allowed', 'status': 'fail',
+                          'evidence': f'robots.txt disallows the audited path '
+                                      f'for: {", ".join(blocked)} '
+                                      f'(measured: 0% of cited winners '
+                                      f'blocked all AI bots)'})
+        elif known:
+            gates.append({'id': 'ai_bot_allowed', 'status': 'pass',
+                          'evidence': f'all {len(known)} evaluated AI bots '
+                                      f'allowed for the audited path '
+                                      f'(basis: {access.get("basis")})'})
+        else:
+            gates.append({'id': 'ai_bot_allowed', 'status': 'unknown',
+                          'evidence': f'robots.txt access unknown '
+                                      f'(basis: {access.get("basis")})'})
+    else:
+        gates.append({'id': 'ai_bot_allowed', 'status': 'unknown',
+                      'evidence': 'no robots ai_bot_access data attached '
+                                  'to this audit'})
+
+    # --- server_rendered — raw-HTML visible words >= 300, via
+    # bots_eye_view (raw fetch, no JS execution).
+    words = summary.get('visible_words_default')
+    if isinstance(words, bool) or not isinstance(words, (int, float)):
+        gates.append({'id': 'server_rendered', 'status': 'unknown',
+                      'evidence': 'bots_eye_view visible_words_default '
+                                  'not available'})
+    elif words >= 300:
+        gates.append({'id': 'server_rendered', 'status': 'pass',
+                      'evidence': f'{int(words)} words visible in raw HTML '
+                                  f'(threshold 300)'})
+    else:
+        gates.append({'id': 'server_rendered', 'status': 'fail',
+                      'evidence': f'only {int(words)} words visible in raw '
+                                  f'HTML (< 300) — content likely '
+                                  f'JS-rendered; 0% of cited winners were '
+                                  f'JS-blocked'})
+
+    # --- reachable_200 — HTTP 2xx to the GPTBot-class UA probe (redirects
+    # followed). Falls back to the default-UA code when the AI probes are
+    # absent. Note the asymmetry with Gate 0: a page whose DEFAULT probe
+    # never reached content is transport-inconclusive (null, handled
+    # upstream); a page fine for browsers but 4xx to the AI UA is a real,
+    # measured citation-killer and zeroes here.
+    ai_codes = []
+    for name in ('gpt', 'claude', 'perp'):
+        p = probes.get(name)
+        code = p.get('http_code') if isinstance(p, dict) else None
+        if isinstance(code, (int, float)) and not isinstance(code, bool) \
+                and code > 0:
+            ai_codes.append((name, int(code)))
+    if ai_codes:
+        bad = [(n, c) for n, c in ai_codes if not (200 <= c < 300)]
+        if bad:
+            gates.append({'id': 'reachable_200', 'status': 'fail',
+                          'evidence': 'AI-UA probe(s) not 2xx: ' + ', '.join(
+                              f'{n}={c}' for n, c in bad)})
+        else:
+            gates.append({'id': 'reachable_200', 'status': 'pass',
+                          'evidence': 'AI-UA probes 2xx: ' + ', '.join(
+                              f'{n}={c}' for n, c in ai_codes)})
+    else:
+        code = summary.get('http_code_default')
+        if isinstance(code, (int, float)) and not isinstance(code, bool) \
+                and code > 0:
+            ok = 200 <= int(code) < 300
+            gates.append({'id': 'reachable_200',
+                          'status': 'pass' if ok else 'fail',
+                          'evidence': f'no AI-UA probes recorded; default UA '
+                                      f'HTTP {int(code)}'})
+        else:
+            gates.append({'id': 'reachable_200', 'status': 'unknown',
+                          'evidence': 'no probe HTTP codes available'})
+
+    # --- https — scheme of the final served URL. Read from the A1 finding's
+    # runtime-observed detail first (the script's measured final_url), then
+    # the BEV summary, then the audit URL. A1 'fail' for a missing http→https
+    # redirect (insecure duplicate) does NOT fail this gate — the config rule
+    # is scheme == https on the served page.
+    final_url = None
+    for f in (audit.get('findings') or []):
+        if not isinstance(f, dict):
+            continue
+        cid = str(f.get('check_id') or '').split(':', 1)[-1]
+        m = _CHECK_BASE_RE.match(cid)
+        if m and m.group(1) == 'A1':
+            obs = f.get('observed')
+            detail = obs.get('detail') if isinstance(obs, dict) else None
+            if isinstance(detail, dict) and detail.get('final_url'):
+                final_url = str(detail['final_url'])
+            break
+    final_url = final_url or summary.get('final_url') or audit.get('url')
+    fu = str(final_url or '').strip().lower()
+    if fu.startswith('https://'):
+        gates.append({'id': 'https', 'status': 'pass',
+                      'evidence': f'served over https ({final_url})'})
+    elif fu.startswith('http://'):
+        gates.append({'id': 'https', 'status': 'fail',
+                      'evidence': f'served over plain http ({final_url}) — '
+                                  f'100% of cited winners were https'})
+    else:
+        gates.append({'id': 'https', 'status': 'unknown',
+                      'evidence': 'final URL scheme not determinable'})
+    return gates
+
+
+def _cite_business_type(audit: Dict[str, Any],
+                        model: Dict[str, Any]) -> Tuple[str, Optional[str], str]:
+    """Category dispatch per the config's category_dispatch, read from the
+    persisted LLM Phase-4 classification. Returns
+    (business_type, classification_confidence, dispatch_basis).
+
+    Mapping (documented decision): page_type 'local_business' or 'service'
+    -> 'local_service'; every other page_type -> 'product'. Industry is
+    recorded on the audit but does not yet move the dispatch — the config
+    only distinguishes these two categories (vertical overlays are the
+    Phase-3 pinned-menu work, REPORT-SPEC-v3 data decision 2). Defaults to
+    'product' when the classification is absent or confidence is 'low'."""
+    cls = audit.get('classification')
+    cls = cls if isinstance(cls, dict) else {}
+    conf = str(cls.get('confidence') or '').strip().lower() or None
+    if conf not in ('high', 'medium', 'low'):
+        conf = None
+    page_type = str(cls.get('page_type') or '').strip().lower()
+    dispatch = model.get('category_dispatch')
+    dispatch = dispatch if isinstance(dispatch, dict) else {}
+    if not page_type or conf in (None, 'low'):
+        return 'product', conf, 'default (classification absent or low-confidence)'
+    bt = 'local_service' if page_type in ('local_business', 'service') \
+        else 'product'
+    if bt not in dispatch:      # config renamed a category — fall back safe
+        return 'product', conf, f'default (category "{bt}" not in config)'
+    return bt, conf, f'classified page_type={page_type} ({conf} confidence)'
+
+
+def compute_cite_readiness(audit: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """On-site cite-readiness per aeo-scoring-model.json (its first consumer).
+
+    Returns the citeReadiness object, or None when the calibration config is
+    unavailable or the audit is transport-inconclusive:
+
+        {score, gates[], factors[], business_type, own_site_weight,
+         classification_confidence, calibration_version}
+
+    Semantics:
+      - TRANSPORT_INCONCLUSIVE (Gate 0) -> None. An unreachable page stays
+        INCONCLUSIVE/null — this is DISTINCT from the tier-0 zero-path.
+      - Any tier-0 gate FAIL -> score 0 with the failing gates[] detail
+        (factors are still reported: they carry the forfeited points).
+      - Otherwise score = renormalized tier-1 weighted presence, 0..100
+        (see the STATUS-DERIVATION MAPPING comment above). Tier-2
+        non-factors in the config are excluded from scoring entirely.
+      - score is None (with gates/factors intact) when no tier-1 factor has
+        any applicable check — nothing measurable to score.
+    Never raises."""
+    model = load_scoring_model()
+    if model is None or not isinstance(audit, dict):
+        return None
+    inconclusive, _reason = _transport_inconclusive(audit)
+    if inconclusive:
+        return None
+
+    # Index findings by check-id base (source prefixes stripped).
+    by_base: Dict[str, List[Dict[str, Any]]] = {}
+    for f in (audit.get('findings') or []):
+        if not isinstance(f, dict):
+            continue
+        cid = str(f.get('check_id') or '').split(':', 1)[-1].strip()
+        m = _CHECK_BASE_RE.match(cid)
+        if m:
+            by_base.setdefault(m.group(1), []).append(f)
+
+    gates = _cite_gates(audit, model)
+    gate_failed = any(g.get('status') == 'fail' for g in gates)
+
+    factors: List[Dict[str, Any]] = []
+    weighted = 0.0
+    weight_sum = 0.0
+    for spec in (model.get('tier1_factors') or []):
+        if not isinstance(spec, dict):
+            continue
+        fid = str(spec.get('id') or '')
+        try:
+            weight = float(spec.get('weight') or 0.0)
+        except (TypeError, ValueError):
+            weight = 0.0
+        lift = spec.get('measured_lift')
+        bases = CITE_FACTOR_CHECK_BASES.get(fid, ())
+        vals: List[float] = []
+        check_ids: List[str] = []
+        evid_parts: List[str] = []
+        for base in bases:
+            for f in by_base.get(base, []):
+                st = str(f.get('status') or '').strip().lower()
+                if st not in _STATUS_VAL:
+                    continue        # na / invalid -> not applicable
+                vals.append(_STATUS_VAL[st])
+                cid = str(f.get('check_id') or '').split(':', 1)[-1].strip()
+                if cid and cid not in check_ids:
+                    check_ids.append(cid)
+                ev = f.get('evidence')
+                if isinstance(ev, str) and ev.strip() and len(evid_parts) < 4:
+                    evid_parts.append(f'[{cid}] ' + ev.strip()[:160])
+        if not vals:
+            factors.append({'id': fid, 'weight': weight, 'status': 'na',
+                            'points': 0.0, 'check_ids': [],
+                            'evidence': 'no applicable check on this page '
+                                        '(excluded from the denominator)',
+                            'lift': lift})
+            continue
+        fraction = sum(vals) / len(vals)
+        status = 'pass' if fraction >= 1.0 else (
+            'fail' if fraction <= 0.0 else 'warn')
+        factors.append({
+            'id': fid,
+            'weight': weight,
+            'status': status,
+            'points': round(weight * fraction, 1),
+            'check_ids': check_ids[:8],
+            'evidence': ' | '.join(evid_parts)[:400],
+            'lift': lift,
+        })
+        weighted += weight * fraction
+        weight_sum += weight
+
+    business_type, conf, dispatch_basis = _cite_business_type(audit, model)
+    dispatch = model.get('category_dispatch')
+    dispatch = dispatch if isinstance(dispatch, dict) else {}
+    own_site_weight = None
+    bt_cfg = dispatch.get(business_type)
+    if isinstance(bt_cfg, dict):
+        try:
+            own_site_weight = float(bt_cfg.get('own_site_weight'))
+        except (TypeError, ValueError):
+            own_site_weight = None
+
+    if gate_failed:
+        score: Optional[float] = 0.0
+    elif weight_sum > 0:
+        score = round(_clamp(weighted / weight_sum * 100.0), 1)
+    else:
+        score = None    # nothing measurable — nullable, not zero
+
+    out: Dict[str, Any] = {
+        'score': score,
+        'gates': gates,
+        'factors': factors,
+        'business_type': business_type,
+        'own_site_weight': own_site_weight,
+        'classification_confidence': conf,
+        'dispatch_basis': dispatch_basis,
+        'calibration_version': str(model.get('version') or '')[:40] or None,
+    }
+    if gate_failed:
+        out['zeroed_by_gates'] = sorted(
+            g['id'] for g in gates if g.get('status') == 'fail')
+    elif score is None:
+        out['reason'] = 'no tier-1 factor has an applicable check'
+    return out
+
+
+def clamp_cite_readiness(cr: Any) -> Optional[Dict[str, Any]]:
+    """Clamp/enum-guard ONE citeReadiness block (mirror of clamp_shadow).
+    Both copies — scoring['cite_readiness'] and the metadata.cite_readiness
+    mirror reloaded audits fall back to — must pass this before any renderer
+    or API forwards them. Mutates in place; returns the dict or None."""
+    if not isinstance(cr, dict):
+        return None
+    cr['score'] = _num_or_none(cr.get('score'))
+    gates = []
+    for g in (cr.get('gates') or [])[:8] if isinstance(cr.get('gates'), list) else []:
+        if not isinstance(g, dict):
+            continue
+        st = str(g.get('status') or '').strip().lower()
+        gates.append({
+            'id': str(g.get('id') or '')[:64],
+            'status': st if st in VALID_GATE_STATUSES else 'unknown',
+            'evidence': str(g.get('evidence') or '')[:300],
+        })
+    cr['gates'] = gates
+    factors = []
+    for f in (cr.get('factors') or [])[:16] if isinstance(cr.get('factors'), list) else []:
+        if not isinstance(f, dict):
+            continue
+        st = str(f.get('status') or '').strip().lower()
+        w = f.get('weight')
+        p = f.get('points')
+        lift = f.get('lift')
+        ok_num = lambda x: (isinstance(x, (int, float))       # noqa: E731
+                            and not isinstance(x, bool)
+                            and math.isfinite(float(x)))
+        factors.append({
+            'id': str(f.get('id') or '')[:64],
+            'weight': round(_clamp(float(w)), 1) if ok_num(w) else 0.0,
+            'status': st if st in VALID_STATUSES else 'na',
+            'points': round(_clamp(float(p)), 1) if ok_num(p) else 0.0,
+            'check_ids': [str(c)[:64] for c in (f.get('check_ids') or [])[:8]
+                          if isinstance(c, str)],
+            'evidence': str(f.get('evidence') or '')[:400],
+            'lift': round(float(lift), 2) if ok_num(lift) else None,
+        })
+    cr['factors'] = factors
+    bt = str(cr.get('business_type') or '').strip()
+    cr['business_type'] = bt if bt in VALID_BUSINESS_TYPES else 'product'
+    conf = str(cr.get('classification_confidence') or '').strip().lower()
+    cr['classification_confidence'] = conf if conf in ('high', 'medium', 'low') else None
+    osw = cr.get('own_site_weight')
+    if isinstance(osw, bool) or not isinstance(osw, (int, float)) \
+            or not math.isfinite(float(osw)):
+        cr['own_site_weight'] = None
+    else:
+        cr['own_site_weight'] = round(max(0.0, min(1.0, float(osw))), 2)
+    cv = cr.get('calibration_version')
+    cr['calibration_version'] = str(cv)[:40] if cv else None
+    if 'zeroed_by_gates' in cr:
+        cr['zeroed_by_gates'] = [str(g)[:64] for g in (cr.get('zeroed_by_gates') or [])[:8]
+                                 if isinstance(g, str)]
+    return cr
+
+
+# ---------------------------------------------------------------------------
 # PUBLIC: recompute + validate (call both before persist/render)
 # ---------------------------------------------------------------------------
 
@@ -574,6 +988,27 @@ def recompute_scores(audit: Dict[str, Any]) -> Dict[str, Any]:
                       'brand_ai_presence')
             if k in model_reported
         }
+
+    # CITE-READINESS (Phase 2) — additive, nullable companion object beside
+    # the classic PCR (which keeps driving overall score/grade unchanged).
+    # Transport-inconclusive audits get null with a reason: the Gate-0
+    # INCONCLUSIVE path must stay DISTINCT from the tier-0 gate zero-path
+    # (an unreached page is not a zero-scored page).
+    if computed.get('inconclusive'):
+        computed['cite_readiness'] = None
+        computed['cite_readiness_reason'] = (
+            'transport inconclusive — cite-readiness suppressed '
+            '(stays null, never 0)')
+    else:
+        try:
+            cr = compute_cite_readiness(audit)
+        except Exception:
+            cr = None
+        computed['cite_readiness'] = cr
+        if cr is None:
+            computed['cite_readiness_reason'] = (
+                'scoring model unavailable or audit not scorable')
+
     audit['scoring'] = computed
     return audit
 
@@ -654,6 +1089,12 @@ def validate_audit(audit: Dict[str, Any]) -> Dict[str, Any]:
     # persisted-then-edited shadow can't reach the renderer malformed.
     if scoring.get('shadow') is not None:
         scoring['shadow'] = clamp_shadow(scoring.get('shadow'))
+
+    # CITE-READINESS backstop (Phase 2) — same discipline: the object is
+    # clamped/enum-guarded wherever it appears, or nulled if malformed.
+    if scoring.get('cite_readiness') is not None:
+        scoring['cite_readiness'] = clamp_cite_readiness(
+            scoring.get('cite_readiness'))
 
     # Guard finding statuses too — the renderer keys icons off these.
     # Also stamp the evidence tier (roadmap 0.1): additive — an explicit valid

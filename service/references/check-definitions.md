@@ -117,6 +117,7 @@ Source of truth for every audit check. Each check has:
 | E11 | Content not behind paywall/login | HEURISTIC | Check for login gates, paywall indicators, authentication requirements | 2 | high | cms_constraint |
 | E12 | No NOARCHIVE on AI-targeted pages | HARD EVIDENCE | Check meta robots and X-Robots-Tag for noarchive directive | 2 | high | page_html |
 | E13 | CCBot / LLM training crawler allowed | HARD EVIDENCE | Check robots.txt for CCBot Disallow or wildcard blocks | 2 | medium | sitewide_template |
+| E14 | llms.txt present | HARD EVIDENCE | Fetch https://domain/llms.txt — pass requires HTTP 200 AND a non-HTML, text/markdown-shaped body (soft-200 HTML shell rejected; first ~100 chars recorded as evidence). Measured 2.4× citation lift | 2 | medium | sitewide_template |
 
 ---
 

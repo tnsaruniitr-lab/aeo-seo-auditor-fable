@@ -64,6 +64,73 @@ AI_CRAWLERS_ONLY = [
     'CCBot', 'Applebot-Extended',
 ]
 
+# Tier-0 'ai_bot_allowed' gate bots (aeo-scoring-model.json tier0_gates:
+# "no Disallow:/ for GPTBot|ClaudeBot|Google-Extended|PerplexityBot").
+# All four are already in BOTS_TO_CHECK / AI_CRAWLERS_ONLY above; this list
+# names the subset whose PER-BOT verdicts are emitted as structured output
+# (`ai_bot_access`) so scoring.compute_cite_readiness can fire the gate on
+# named bots instead of parsing evidence strings.
+TIER0_GATE_BOTS = ['GPTBot', 'ClaudeBot', 'Google-Extended', 'PerplexityBot']
+
+
+def evaluate_tier0_bot_access(parsed: Dict, target_path: str,
+                              robots_available: bool,
+                              robots_5xx: bool,
+                              http_code: int = 200) -> Dict:
+    """Structured per-bot access verdicts for the tier-0 cite-readiness gate.
+
+    Returns:
+      {
+        'evaluated_path': <path>,
+        'basis': 'parsed' | 'permissive_default' | 'unavailable_5xx',
+        'bots': {
+          '<bot>': {'allowed': bool|None,       # for the audited path
+                    'root_allowed': bool|None,  # for '/'
+                    'evidence': str}
+        }
+      }
+
+    Semantics follow the existing checks: no/4xx robots.txt = RFC 9309
+    permissive default (allowed=True); a 5xx robots.txt means crawlers must
+    assume disallow but the state is transient — allowed=None ('unknown'),
+    so the gate must NOT zero the score on it (fail-open, documented in
+    scoring.compute_cite_readiness).
+    """
+    out = {'evaluated_path': target_path, 'bots': {}}
+    if robots_5xx or http_code == 0:
+        # 5xx = assume-disallow-but-transient; code 0 = the fetch itself
+        # failed (network / SSRF-blocked) — either way access is UNKNOWN,
+        # never a permissive True and never a gate-zeroing False.
+        out['basis'] = 'unavailable_5xx' if robots_5xx else 'unreachable'
+        why = ('robots.txt returned 5xx — access unknown (RFC 9309 '
+               '§2.3.1.4 assume-disallow, transient)') if robots_5xx else \
+              'robots.txt fetch failed — access unknown'
+        for bot in TIER0_GATE_BOTS:
+            out['bots'][bot] = {
+                'allowed': None, 'root_allowed': None, 'evidence': why,
+            }
+        return out
+    if not robots_available:
+        out['basis'] = 'permissive_default'
+        for bot in TIER0_GATE_BOTS:
+            out['bots'][bot] = {
+                'allowed': True, 'root_allowed': True,
+                'evidence': 'no robots.txt (4xx/unreachable body) — '
+                            'permissive default per RFC 9309 §2.3.1.3',
+            }
+        return out
+    out['basis'] = 'parsed'
+    for bot in TIER0_GATE_BOTS:
+        groups = find_matching_groups(parsed, bot)
+        allowed, evidence = evaluate_path_access(groups, target_path)
+        root_allowed, root_evidence = evaluate_path_access(groups, '/')
+        out['bots'][bot] = {
+            'allowed': allowed,
+            'root_allowed': root_allowed,
+            'evidence': f'path {target_path}: {evidence}; root /: {root_evidence}',
+        }
+    return out
+
 
 def parse_robots_txt(body: str) -> Dict:
     """
@@ -473,6 +540,11 @@ def check_robots(target_url: str) -> Dict:
             'sitemaps_declared': parsed.get('sitemaps', []),
             'parse_warnings': parsed.get('parse_warnings', [])[:5]
         },
+        # Structured per-bot verdicts for the tier-0 'ai_bot_allowed' gate
+        # (GPTBot / ClaudeBot / Google-Extended / PerplexityBot). Additive
+        # output field — consumed by scoring.compute_cite_readiness.
+        'ai_bot_access': evaluate_tier0_bot_access(
+            parsed, target_path, robots_available, robots_5xx, http_code),
         'checks': checks
     }
 

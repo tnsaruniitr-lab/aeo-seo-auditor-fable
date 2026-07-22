@@ -2883,7 +2883,7 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
     # through scoring.clamp_shadow here: the metadata mirror never passed
     # validate_audit, and even the scoring copy could have been edited since —
     # nothing unclamped may reach the JSON API. Clamp a copy, not the audit.
-    from scoring import clamp_shadow
+    from scoring import clamp_shadow, clamp_cite_readiness
     shadow = scoring.get('shadow')
     if not isinstance(shadow, dict):
         shadow = (audit.get('metadata') or {}).get('scoring_shadow')
@@ -2892,6 +2892,15 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
                      'grade': shadow.get('grade_evidence'),
                      'coverage': shadow.get('coverage')}
                     if isinstance(shadow, dict) else None)
+
+    # CITE-READINESS (Phase 2) — nullable companion object, same two-copy
+    # discipline as the shadow: scoring.cite_readiness first, then the
+    # metadata.cite_readiness mirror (fetch_audit drops nested scoring blocks
+    # on DB reload). Both copies are clamped here; clamp a copy, not the audit.
+    cite = scoring.get('cite_readiness')
+    if not isinstance(cite, dict):
+        cite = (audit.get('metadata') or {}).get('cite_readiness')
+    cite = clamp_cite_readiness(dict(cite)) if isinstance(cite, dict) else None
 
     domain = audit.get('domain') or ''
     # Build full report URL — prefer the request's host if available
@@ -2920,6 +2929,9 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
         'pageCitationReadiness': scoring.get('page_citation_readiness'),
         'brandAiPresence': scoring.get('brand_ai_presence'),
         'shadowScore': shadow_score,  # nullable {score, grade, coverage} — shadow only, never the grade
+        'citeReadiness': cite,  # nullable Phase-2 object {score, gates, factors,
+                                # business_type, ...} — ships ALONGSIDE PCR; the
+                                # overall score/grade above still ride PCR unchanged
 
         'summary': summary,
         'severityCounts': counts,

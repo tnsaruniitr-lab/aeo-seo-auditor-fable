@@ -1210,6 +1210,23 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
     _stage('Finalizing: computing deterministic scores', 93)
     md.pop("scoring_shadow", None)
     md.pop("scoring_shadow_reason", None)
+    # Same discipline for the cite-readiness mirror keys (Phase 2).
+    md.pop("cite_readiness", None)
+    md.pop("cite_readiness_reason", None)
+    # `robots_ai_access` is RUNTIME-OWNED input to the tier-0 ai_bot_allowed
+    # gate: strip any model-emitted copy, then attach the deterministic
+    # per-bot verdicts the robots script really measured (check_robots_txt
+    # .evaluate_tier0_bot_access — GPTBot/ClaudeBot/Google-Extended/
+    # PerplexityBot). No scripts data means no key: the gate reads 'unknown'
+    # and fails open, never on forged input.
+    audit.pop("robots_ai_access", None)
+    try:
+        _rb = (loop_result.get("scripts_output") or {}).get("robots_txt_analysis")
+        _access = _rb.get("ai_bot_access") if isinstance(_rb, dict) else None
+        if isinstance(_access, dict) and isinstance(_access.get("bots"), dict):
+            audit["robots_ai_access"] = _access
+    except Exception as e:
+        log.warning('%srobots_ai_access attach failed: %s', f'[{audit_id[:8]}] ', e)
     try:
         from scoring import finalize_scoring
         audit = finalize_scoring(audit)
@@ -1221,6 +1238,12 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
         md["scoring_shadow"] = _sc.get("shadow")
         if _sc.get("shadow_reason"):
             md["scoring_shadow_reason"] = _sc.get("shadow_reason")
+        # CITE-READINESS rides the metadata column for the same reason —
+        # fetch_audit drops nested scoring blocks on DB reload; the metadata
+        # mirror is what the compact API falls back to.
+        md["cite_readiness"] = _sc.get("cite_readiness")
+        if _sc.get("cite_readiness_reason"):
+            md["cite_readiness_reason"] = _sc.get("cite_readiness_reason")
     except Exception as e:
         # Never let a scoring bug drop a completed audit — but flag loudly.
         md["scoring_authority"] = f"MODEL-REPORTED (recompute failed: {type(e).__name__}: {e})"

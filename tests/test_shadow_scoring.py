@@ -50,7 +50,11 @@ with open(os.path.join(_FIX, 'shadow_classic_golden.json')) as fh:
 # 1) CLASSIC BYTE-IDENTITY — shadow means shadow (regression gate)
 # ---------------------------------------------------------------------------
 sc = finalize_scoring(copy.deepcopy(FIXTURE))['scoring']
-classic = {k: v for k, v in sc.items() if k not in ('shadow', 'shadow_reason')}
+# cite_readiness (Phase 2) is additive like the shadow — excluded from the
+# classic byte-identity golden the same way.
+classic = {k: v for k, v in sc.items()
+           if k not in ('shadow', 'shadow_reason',
+                        'cite_readiness', 'cite_readiness_reason')}
 assert json.dumps(classic, sort_keys=True) == json.dumps(GOLDEN, sort_keys=True), \
     'classic scoring dict changed — the shadow must be purely additive'
 

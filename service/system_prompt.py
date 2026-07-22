@@ -148,10 +148,13 @@ specific check IDs from `read_reference("static-rules")` (A1–A12, B1–B10, \
 C1–C12, D1–D14). Mark each pass / warn / fail / na with evidence.
 
 **Phase 6: AEO Discovery + Extraction (E-F).** Read `read_reference("aeo-framework")` \
-+ `read_reference("knowledge-aeo")`. Run E1–E10 (Discovery: robots crawler entries, \
-sitemap presence, internal linking) and F1–F12 (Extraction: entity definition in \
-first 150 words, FAQ schema, H2 independence, dateModified). F1, F7, F9, F11 are \
-LLM-judged — assess from the page content directly.
++ `read_reference("knowledge-aeo")`. Run E1–E14 (Discovery: robots crawler entries, \
+sitemap presence, internal linking, llms.txt) and F1–F12 (Extraction: entity \
+definition in first 150 words, FAQ schema, H2 independence, dateModified). F1, F7, \
+F9, F11 are LLM-judged — assess from the page content directly. E14 (llms.txt) is \
+MEASURED by the deterministic scripts — use the `E14_llms_txt` entry in `all_checks` \
+as ground truth (pass requires HTTP 200 AND a non-HTML text/markdown body; a \
+soft-200 HTML shell is a fail); never override it from your own fetch.
 
 **Phase 7: AEO Trust (G).** Read `read_reference("knowledge-aeo")` for trust criteria. \
 Run G1–G8 (author credentials, schema Person hasCredential, sameAs links, \

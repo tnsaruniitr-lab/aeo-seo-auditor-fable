@@ -32,6 +32,11 @@ brain-mappings.json):
   E4.  no_nosnippet_noarchive             — nosnippet / max-snippet:0 / data-nosnippet directives
   E12. no_noarchive                       — noarchive directive (meta or header)
 
+Cite-readiness Phase 2:
+  E14. llms_txt                           — /llms.txt present + text/markdown-shaped
+                                            (soft-200 HTML rejected); measured 2.4×
+                                            citation lift (docs/AEO-PLAYBOOK-measured)
+
 E-E-A-T deterministic subset (roadmap 2.4 — measured inputs feeding the
 G-section LLM trust judgment; G1/G2 canonical ids, G7b/G7c sub-checks of G7):
   G1.  author_byline                      — visible byline pattern / byline markup / schema author
@@ -1206,6 +1211,107 @@ def check_d14_hreflang_coverage(html):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# CHECK E14: llms.txt presence + content validation (domain-level)
+# ──────────────────────────────────────────────────────────────────────────
+
+# HTML markers that expose a soft-200: many hosts return the SPA shell /
+# homepage with HTTP 200 for any unknown path, including /llms.txt. A real
+# llms.txt is plain text/markdown — any of these in the head of the body
+# means the server returned a web page, not the file.
+_LLMS_HTML_MARKERS = ('<!doctype html', '<html', '<head', '<body',
+                      '<script', '<div', '<meta ')
+
+
+def _looks_like_html(body: str, content_type: str = '') -> bool:
+    """True when a /llms.txt response body is actually an HTML page."""
+    if 'text/html' in (content_type or '').lower():
+        return True
+    head = (body or '')[:2048].lstrip().lower()
+    return any(head.startswith(m) or m in head[:512] for m in _LLMS_HTML_MARKERS)
+
+
+def check_e14_llms_txt(page_url):
+    """E14 — llms.txt present at the domain root and text/markdown-shaped.
+
+    Strongest measured domain-level citation differentiator in the 1000-probe
+    study (2.4× lift; 65% of cited winners vs 27% of controls —
+    docs/AEO-PLAYBOOK-measured-2026-07-20.md §1). Fetches
+    https://<domain>/llms.txt via the SSRF-guarded fetch().
+
+    PASS requires BOTH: HTTP 200 AND content validation — a non-HTML,
+    text/markdown-shaped body. A soft-200 (host answers every path with the
+    HTML app shell) is a FAIL, not a pass: the file does not actually exist.
+    The first ~100 chars of the body are recorded as evidence either way.
+
+    Status mapping:
+      2xx + text/markdown-shaped body  -> pass
+      2xx + HTML body (soft-200)       -> fail
+      2xx + empty body                 -> fail
+      4xx                              -> fail (file absent)
+      5xx / other                      -> na  (server error — not assessable)
+      fetch failed (status 0)          -> na
+    """
+    m = re.match(r'(https?://[^/]+)', str(page_url or ''))
+    if not m:
+        return {'status': 'na',
+                'evidence': 'Could not parse origin from URL.',
+                'detail': {}}
+    llms_url = m.group(1) + '/llms.txt'
+    body, final_url, status, headers, _chain = fetch(llms_url, timeout=10)
+    content_type = ''
+    for k, v in (headers or {}).items():
+        if str(k).lower() == 'content-type':
+            content_type = str(v)
+            break
+    snippet = re.sub(r'\s+', ' ', (body or '')[:100]).strip()
+    detail = {
+        'url': llms_url,
+        'final_url': final_url,
+        'http_status': status,
+        'content_type': content_type,
+        'body_bytes': len(body or ''),
+        'first_100_chars': snippet,
+    }
+
+    if status == 0:
+        return {'status': 'na',
+                'evidence': f'llms.txt fetch failed ({llms_url}) — '
+                            f'network error or blocked; not assessable.',
+                'detail': detail}
+    if 200 <= status < 300:
+        if not (body or '').strip():
+            return {'status': 'fail',
+                    'evidence': f'llms.txt returned HTTP {status} but the '
+                                f'body is empty — no usable content.',
+                    'detail': detail}
+        if _looks_like_html(body, content_type):
+            return {'status': 'fail',
+                    'evidence': f'Soft-200: /llms.txt returned HTTP {status} '
+                                f'but the body is an HTML page '
+                                f'(content-type: {content_type or "n/a"}) — '
+                                f'the file does not really exist. '
+                                f'First 100 chars: "{snippet}"',
+                    'detail': {**detail, 'soft_200_html': True}}
+        return {'status': 'pass',
+                'evidence': f'llms.txt present (HTTP {status}, '
+                            f'{len(body)} bytes, content-type: '
+                            f'{content_type or "n/a"}), text/markdown-shaped. '
+                            f'First 100 chars: "{snippet}"',
+                'detail': {**detail, 'soft_200_html': False}}
+    if 400 <= status < 500:
+        return {'status': 'fail',
+                'evidence': f'No llms.txt: {llms_url} returned HTTP {status}. '
+                            f'Measured 2.4× citation lift for domains that '
+                            f'serve one (65% of cited winners vs 27% of '
+                            f'controls).',
+                'detail': detail}
+    return {'status': 'na',
+            'evidence': f'llms.txt not assessable: HTTP {status} '
+                        f'(server error / unresolved redirect).',
+            'detail': detail}
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Shared helpers for the header/meta-based checks (A5, A1, B9, A3, C10,
 # E4, E12 — the "defined but unexecuted" checks wired in roadmap item 0.2)
 # ──────────────────────────────────────────────────────────────────────────
@@ -2209,6 +2315,10 @@ def run_all_checks(url):
         ('A4b_canonical_redirect_chain', check_a4b_canonical_redirect_chain, (html, final_url)),
         ('B1_ttfb_median_5_samples', check_b1_ttfb_median, (url,)),
         ('A2b_title_uniqueness_sample', check_a2b_title_uniqueness, (url,)),
+        # Domain-level llms.txt probe (E14) — measured 2.4× citation lift;
+        # SSRF-guarded fetch of https://<domain>/llms.txt with soft-200
+        # HTML rejection.
+        ('E14_llms_txt', check_e14_llms_txt, (final_url,)),
     ]
 
     # Error/challenge bodies (403/404/500, WAF interstitials) are not the

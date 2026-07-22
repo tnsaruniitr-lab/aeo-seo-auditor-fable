@@ -327,6 +327,12 @@
       "anti_patterns": [],
       "notes": "Rule 2016 (amsive.com, 0.95) 'CCBot (Common Crawl) Access for LLM Training Recognition.' CCBot affects training-time brand recognition."
     },
+    "E14_llms_txt": {
+      "category": "aeo_discovery",
+      "rules": [],
+      "anti_patterns": [],
+      "notes": "llms.txt present at the domain root, text/markdown-shaped (soft-200 HTML rejected). Measured 2.4x citation lift (65% cited vs 27% control) — docs/AEO-PLAYBOOK-measured-2026-07-20.md; deterministic check in scripts/deterministic_checks.py. No curated brain rules yet — retrieval goes evidence-led."
+    },
     "F1_first_paragraph_answers_query": {
       "category": "aeo_extraction",
       "rules": [

@@ -1,8 +1,9 @@
 # Static Rules — The Auditor's Core Brain
 
-Version: 1.3
-Last updated: 2026-04-13
-Changes: v1.3 — Added E13 (CCBot / LLM training crawler access). Source-first citation format. (103 checks total)
+Version: 1.4
+Last updated: 2026-07-22
+Changes: v1.4 — Added E14 (llms.txt present, measured — 2.4× lift from the 1000-probe experiment). (104 checks total)
+v1.3 — Added E13 (CCBot / LLM training crawler access). Source-first citation format. (103 checks total)
 
 Every check has:
 - **Precise pass/fail/warn criteria** — deterministic where possible
@@ -467,6 +468,13 @@ Every check has:
 - **Fail:** robots.txt explicitly blocks CCBot (`User-agent: CCBot / Disallow: /`) OR the site is excluded from Common Crawl index
 - **Research:** Common Crawl (CCBot) is the underlying dataset used to train GPT-4, Claude, Llama, and most foundation LLMs. Blocking CCBot means your brand won't exist in the training data of future AI models. Sieve Rule #2016 (amsive.com, 0.95): "AI Crawler Robots.txt Access Rule — If robots.txt blocks CCBot from accessing the site, the site is excluded from Common Crawl dataset." Unlike real-time AI crawlers (GPTBot, PerplexityBot), CCBot access affects how future AI models KNOW about your brand, not just how current ones retrieve it. **Both matter**: CCBot affects training-time brand recognition; GPTBot/PerplexityBot/ClaudeBot affect inference-time citation.
 - **Fix template:** Add to robots.txt: `User-agent: CCBot\nAllow: /`. If wildcard `Disallow: /` is set, add explicit `Allow: /` for CCBot. Note: CCBot respects robots.txt, unlike some other AI crawlers.
+
+### E14: llms.txt Present (NEW — v1.4, MEASURED by deterministic scripts)
+- **Pass:** `https://<domain>/llms.txt` returns HTTP 200 AND the body is a non-HTML, text/markdown-shaped file (deterministic check `E14_llms_txt` — use its verdict as ground truth, never your own fetch)
+- **Warn:** (not used — the deterministic check emits pass/fail/na only)
+- **Fail:** HTTP 4xx (file absent), 2xx with an empty body, or a soft-200 where the host answers `/llms.txt` with its HTML app shell (the file does not really exist)
+- **Research:** Strongest measured domain-level citation differentiator in the 1000-probe experiment (docs/AEO-PLAYBOOK-measured-2026-07-20.md): **2.4× lift — 65% of cited winners serve llms.txt vs 27% of controls**. In zero competitors' audit rulesets. The deterministic check records the first ~100 chars of the body as evidence.
+- **Fix template:** Create `/llms.txt` at the domain root: a markdown file opening with `# <Brand>` and a one-line summary, then sections linking the key docs/product/FAQ pages with one-line descriptions (llmstxt.org convention). Serve as `text/plain` or `text/markdown`, HTTP 200, no HTML wrapper.
 
 ---
 
