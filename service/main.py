@@ -3386,6 +3386,30 @@ def slug_page(slug: str):
     routes (which may still be auth-gated) are never shadowed."""
     if slug in _RESERVED_SLUGS or slug.startswith('audit'):
         raise HTTPException(status_code=404, detail='not found')
+    # Inject per-report JSON-LD (TechArticle w/ real audit dates) so hosted
+    # share pages carry machine-readable recency. Best-effort: any failure
+    # serves the plain shell.
+    try:
+        audit = fetch_audit(domain=slug)
+        if audit:
+            import json as _json
+            completed = str(audit.get('completed_at') or audit.get('completedAt') or '')[:10]
+            score = audit.get('scoring', {}).get('overall_score') if isinstance(audit.get('scoring'), dict) else None
+            ld = _json.dumps({
+                '@context': 'https://schema.org',
+                '@type': 'TechArticle',
+                'headline': f'AEO / SEO audit report: {slug}',
+                'about': {'@type': 'WebSite', 'url': f'https://{slug}'},
+                'datePublished': completed or None,
+                'dateModified': completed or None,
+                'author': {'@type': 'Organization', 'name': 'AnswerMonk AEO Auditor'},
+                'description': (f'Independent AI-search readiness audit of {slug}'
+                                + (f' — score {score}/100.' if isinstance(score, (int, float)) else '.')),
+            })
+            html = INDEX_HTML.replace('</head>', f'<script type="application/ld+json">{ld}</script>\n</head>', 1)
+            return HTMLResponse(html)
+    except Exception:
+        pass
     return HTMLResponse(INDEX_HTML)
 
 
