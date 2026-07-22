@@ -3393,7 +3393,7 @@ def slug_page(slug: str):
         audit = fetch_audit(domain=slug)
         if audit:
             import json as _json
-            completed = str(audit.get('completed_at') or audit.get('completedAt') or '')[:10]
+            completed = str(audit.get('completed_at') or audit.get('completedAt') or audit.get('date') or '')[:10]
             score = audit.get('scoring', {}).get('overall_score') if isinstance(audit.get('scoring'), dict) else None
             ld = _json.dumps({
                 '@context': 'https://schema.org',
