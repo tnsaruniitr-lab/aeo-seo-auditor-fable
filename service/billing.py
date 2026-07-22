@@ -48,18 +48,27 @@ def _month_bucket(now_iso: Optional[str]) -> str:
     return (now_iso or '')[:7] or 'unknown'
 
 
-def check_and_meter(api_key: str, *, now_iso: Optional[str] = None) -> Dict[str, Any]:
+def check_and_meter(api_key: str, *, now_iso: Optional[str] = None,
+                    profile: Optional[str] = None) -> Dict[str, Any]:
     """Decide whether this key may run an audit, and record one unit of usage.
 
     Returns {allowed: bool, reason: str, key_id, used, quota, remaining}.
     - Billing OFF  → always allowed (metering skipped).
     - Over quota   → allowed=False (fail closed on confirmed over-quota).
     - Infra error  → allowed=True (fail open; log for follow-up).
+
+    profile: annotation for logs/decision only. The api_usage table is
+    (key_id, month, count) with no per-profile shape, so LIGHT audits are
+    metered NEUTRALLY (1 unit like a full audit) but the decision carries
+    profile so a future per-profile meter can price them separately.
     """
     kid = key_id(api_key)
+    if profile:
+        log.info('metering audit key_id=%s profile=%s', kid, profile)
     if not BILLING_ENABLED:
         return {'allowed': True, 'reason': 'billing disabled', 'key_id': kid,
-                'used': None, 'quota': None, 'remaining': None}
+                'used': None, 'quota': None, 'remaining': None,
+                **({'profile': profile} if profile else {})}
 
     bucket = _month_bucket(now_iso)
     try:

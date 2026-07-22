@@ -140,6 +140,18 @@ def build_answermonk_payload(audit: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         val = audit.get(key)
         if isinstance(val, dict) and val:
             payload[key] = val
+    # Profile/target tagging (LIGHT profile + competitor audits) rides in the
+    # ingest schema's optional `metadata` record. STRICTLY conditional: a
+    # default full-profile audit carries none of these keys, so its payload is
+    # byte-identical to before — backward compatible by construction.
+    md = audit.get('metadata') if isinstance(audit.get('metadata'), dict) else {}
+    tags = {}
+    for k in ('profile', 'target', 'session_ref'):
+        v = audit.get(k) or md.get(k)
+        if v:
+            tags[k] = str(v)[:200]
+    if tags:
+        payload['metadata'] = tags
     return payload
 
 

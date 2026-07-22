@@ -183,6 +183,18 @@ MEASURED_CHECK_BASES = frozenset({
     'E14',   # llms_txt (deterministic_checks.py — domain-level /llms.txt probe)
     # check_sitemap.py
     'E8',    # page_in_sitemap / target_url_in_sitemap
+    # scripts/light_checks.py (LIGHT profile deterministic factor checks).
+    # NEW base codes on purpose: the LLM-classified cousins (E5/F3/F6/F8,
+    # C-family city semantics) keep their llm-judged tier on the full path —
+    # adding e.g. 'F6' here would have re-stamped model verdicts as measured.
+    'C13',   # city_in_title_h1
+    'D15',   # localbusiness_geo_schema
+    'E5b',   # raw_html_depth (deterministic variant of E5)
+    # (E14 llms_txt already listed above — the light profile emits the same
+    #  canonical id E14_llms_txt with deterministic_checks.py's verdict bands)
+    'F3b',   # faq_content_present (deterministic variant of F3)
+    'F6b',   # question_headings (deterministic variant of F6)
+    'F8b',   # prices_visible (deterministic variant of F8)
 })
 
 _CHECK_BASE_RE = re.compile(r'^([A-J]\d{1,2}[a-z]?)(?:_|$)')

@@ -311,6 +311,27 @@ def evaluate_path_access(groups: List[Dict], path: str) -> Tuple[bool, str]:
     return allowed, f'{best_directive} pattern "{best_pattern}" (length {best_match_len})'
 
 
+def per_bot_access(parsed: Dict, target_path: str) -> Dict[str, Dict]:
+    """Per-bot allow/deny breakdown for every bot in BOTS_TO_CHECK.
+
+    Returns {bot: {'allowed': bool, 'explicit': bool, 'evidence': str}}.
+    Additive: the aggregate checks above stay the interface for the full
+    profile; the LIGHT profile needs one verdict per bot, and the agent LLM
+    previously had to transcribe these from the aggregate evidence string.
+    Pure function over the already-parsed robots structure — no network."""
+    out: Dict[str, Dict] = {}
+    for bot in BOTS_TO_CHECK:
+        groups = find_matching_groups(parsed, bot)
+        explicit = any(
+            any(ua.lower() == bot.lower() for ua in g['user_agents'])
+            for g in groups
+        )
+        allowed, evidence = evaluate_path_access(groups, target_path)
+        out[bot] = {'allowed': allowed, 'explicit': explicit,
+                    'evidence': evidence}
+    return out
+
+
 def fetch_robots(base_url: str) -> Tuple[int, str, str]:
     """Fetch robots.txt. Returns (http_code, body, error). Never raises."""
     parsed = urllib.parse.urlparse(base_url)
@@ -545,7 +566,13 @@ def check_robots(target_url: str) -> Dict:
         # output field — consumed by scoring.compute_cite_readiness.
         'ai_bot_access': evaluate_tier0_bot_access(
             parsed, target_path, robots_available, robots_5xx, http_code),
-        'checks': checks
+        # Additive flat per-bot breakdown over ALL BOTS_TO_CHECK (LIGHT
+        # profile input; empty when robots.txt is unreachable — callers
+        # treat that as unknown). Distinct key from 'ai_bot_access', whose
+        # nested tier-0 shape is owned by scoring.compute_cite_readiness.
+        'per_bot_access': (per_bot_access(parsed, target_path)
+                           if robots_available else {}),
+        'checks': checks,
     }
 
 

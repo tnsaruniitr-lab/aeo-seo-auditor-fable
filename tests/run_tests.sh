@@ -250,6 +250,12 @@ assert_contains "aeo-scoring-model consumed (null-tolerant); renormalized factor
 
 # ----------------------------------------------------------------------
 echo ""
+echo "[12] LIGHT profile: tier-0 gates + 8 deterministic factors, target tagging, batch, ingest payload"
+OUT=$(python3 "${SCRIPT_DIR}/test_light_profile.py" 2>&1)
+assert_contains "light profile deterministic checks + pipeline + competitor tagging + payload back-compat" "$OUT" "LIGHT_PROFILE_OK"
+
+# ----------------------------------------------------------------------
+echo ""
 echo "[11] py_compile — every service module + script parses"
 COMPILE_OK=1
 for f in "${SERVICE_DIR}"/*.py "${SCRIPTS_DIR}"/*.py; do

@@ -33,8 +33,12 @@ def _emit(event: str, fields: Dict[str, Any]) -> None:
         pass
 
 
-def audit_started(audit_id: str, url: str, mode: str) -> None:
-    _emit('audit.started', {'audit_id': audit_id, 'url': url, 'mode': mode})
+def audit_started(audit_id: str, url: str, mode: str,
+                  profile: Optional[str] = None) -> None:
+    # profile=None (default/full runs) is dropped by _emit — the metric line
+    # for existing callers is unchanged; light runs stamp profile='light'.
+    _emit('audit.started', {'audit_id': audit_id, 'url': url, 'mode': mode,
+                            'profile': profile})
 
 
 def audit_completed(audit: Dict[str, Any]) -> None:
@@ -44,6 +48,9 @@ def audit_completed(audit: Dict[str, Any]) -> None:
     _emit('audit.completed', {
         'audit_id': audit.get('audit_id'),
         'domain': audit.get('domain'),
+        # None for full audits (dropped by _emit); 'light' for light runs.
+        'profile': md.get('profile'),
+        'target': md.get('target'),
         'overall_score': scoring.get('overall_score'),
         'overall_grade': scoring.get('overall_grade'),
         'inconclusive': scoring.get('inconclusive', False),

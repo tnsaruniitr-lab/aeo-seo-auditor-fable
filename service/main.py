@@ -33,6 +33,7 @@ import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -204,6 +205,35 @@ MAX_AUDIT_SECONDS = int(os.getenv('MAX_AUDIT_SECONDS', '1200'))
 # tool-free LLM turns).
 EXPECTED_AUDIT_SECONDS = int(os.getenv('EXPECTED_AUDIT_SECONDS', '360'))
 
+# LIGHT profile — Tier-0 gates + 8 deterministic factors, zero LLM.
+# Light runs finish in well under a minute and spawn no chromium/agent loop,
+# so they get their own ETA and their own (larger) concurrency pool instead
+# of competing with full audits for MAX_CONCURRENT_AUDITS slots.
+EXPECTED_LIGHT_AUDIT_SECONDS = int(os.getenv('EXPECTED_LIGHT_AUDIT_SECONDS', '45'))
+MAX_CONCURRENT_LIGHT_AUDITS = int(os.getenv('MAX_CONCURRENT_LIGHT_AUDITS', '8'))
+# Light jobs run on a dedicated executor, NOT starlette BackgroundTasks:
+# BackgroundTasks awaits its tasks strictly sequentially per request, which
+# would serialize a 4-URL batch (4x the advertised ETA) and let queued batch
+# entries hold light-pool slots while nothing executes. The executor is sized
+# to the light pool so admission control (429 above the cap) matches actual
+# execution parallelism. Full audits keep the per-request BackgroundTasks
+# path (one job per request — nothing to parallelize there).
+_LIGHT_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_LIGHT_AUDITS,
+                                     thread_name_prefix='light-audit')
+VALID_PROFILES = ('full', 'light')
+VALID_TARGETS = ('brand', 'competitor')
+# Batch convenience is a thin loop over single-domain light audits: the whole
+# pipeline (audit_id, scoring, persistence, ingest upsert) is one-URL-per-audit
+# by construction, so a batch = up to 4 independent light jobs in one request.
+MAX_BATCH_URLS = 4
+
+try:
+    from light_profile import run_light_audit
+    LIGHT_AVAILABLE = True
+except Exception as _light_import_err:  # noqa: BLE001
+    LIGHT_AVAILABLE = False
+    _LIGHT_IMPORT_ERROR = str(_light_import_err)
+
 # Fail-closed switch: in production a missing auth env var must NOT silently
 # expose the expensive/mutating endpoints. Detected via Railway's injected
 # vars, or forced with AUDITOR_FAIL_CLOSED=1. Local dev (no signal) stays open.
@@ -286,9 +316,18 @@ def _purge_jobs(domain: Optional[str] = None,
 
 
 def _active_audit_count() -> int:
-    """Count queued+running jobs. Caller must hold JOBS_LOCK."""
+    """Count queued+running FULL-profile jobs (light runs have their own
+    pool — they spawn no chromium/agent loop). Caller must hold JOBS_LOCK."""
     return sum(1 for j in JOBS.values()
-               if j.get('status') in ('queued', 'running'))
+               if j.get('status') in ('queued', 'running')
+               and j.get('profile', 'full') != 'light')
+
+
+def _active_light_count() -> int:
+    """Count queued+running LIGHT-profile jobs. Caller must hold JOBS_LOCK."""
+    return sum(1 for j in JOBS.values()
+               if j.get('status') in ('queued', 'running')
+               and j.get('profile') == 'light')
 
 
 def _reap_and_evict_locked() -> None:
@@ -2253,8 +2292,14 @@ def _run_audit_background(audit_id: str, url: str):
         # API-start callers may opt out of the visibility sweep (they measure
         # it themselves); homepage submissions never set this → False.
         skip_visibility = bool(JOBS[audit_id].get('skip_visibility'))
+        # LIGHT profile + target tagging (API-start only; absent → full/brand).
+        profile = JOBS[audit_id].get('profile', 'full')
+        target = JOBS[audit_id].get('target', 'brand')
+        session_ref = JOBS[audit_id].get('session_ref')
+        city = JOBS[audit_id].get('city')
     if monitoring:
-        monitoring.audit_started(audit_id, url, AUDIT_MODE)
+        monitoring.audit_started(audit_id, url, AUDIT_MODE,
+                                 profile=profile if profile != 'full' else None)
 
     def _update_progress(info: Dict):
         """Bound to this audit_id. Receives {phase, tool, turn, tool_count,
@@ -2265,10 +2310,46 @@ def _run_audit_background(audit_id: str, url: str):
                 JOBS[audit_id]['progress'] = info
 
     try:
-        result = run_audit(url, output_dir=str(OUTPUT_DIR),
-                            progress_callback=_update_progress,
-                            site_context=site_context,
-                            skip_visibility=skip_visibility)
+        if profile == 'light':
+            # 100% deterministic path — Tier-0 gates + 8 measured factors.
+            # No agent loop, no LLM, no chromium.
+            if not LIGHT_AVAILABLE:
+                raise RuntimeError(
+                    f'light profile unavailable: {_LIGHT_IMPORT_ERROR}')
+            result = run_light_audit(url, output_dir=str(OUTPUT_DIR),
+                                     target=target, session_ref=session_ref,
+                                     city=city,
+                                     progress_callback=_update_progress)
+        else:
+            result = run_audit(url, output_dir=str(OUTPUT_DIR),
+                                progress_callback=_update_progress,
+                                site_context=site_context,
+                                skip_visibility=skip_visibility)
+            # Target tagging on the full path: the agent loop persists/posts
+            # internally without these tags; stamp them on the returned result
+            # so status/compact/webhook consumers still see them.
+            if isinstance(result, dict) and not result.get('error') \
+                    and (target != 'brand' or session_ref):
+                md = result.setdefault('metadata', {})
+                if isinstance(md, dict):
+                    md.setdefault('target', target)
+                    if session_ref:
+                        md.setdefault('session_ref', session_ref)
+                    # The agent loop already POSTed to AnswerMonk mid-run —
+                    # BEFORE this stamp — so that ingest row carries no
+                    # target/session_ref. Re-post now: the receiver upserts
+                    # by audit_id, so the second POST safely overwrites the
+                    # untagged record and closes the correlation gap.
+                    # (The Supabase persistence row is also written mid-run
+                    # and is NOT re-written: on the full profile it durably
+                    # carries no target/session_ref — documented in
+                    # docs/LIGHT-PROFILE.md.)
+                    try:
+                        from persistence import post_to_answermonk
+                        md['answermonk_sync'] = post_to_answermonk(result)
+                    except Exception as sync_err:  # noqa: BLE001
+                        log.warning('[%s] tagged answermonk re-post failed: %s',
+                                    sid, sync_err)
         elapsed = round(time.time() - started, 1)
 
         # Agent path returns an error envelope (no exception) when it can't
@@ -2647,12 +2728,50 @@ class StartAuditRequest(BaseModel):
     # same engines in its scoring phase) set this to skip the auditor's
     # post-loop visibility sweep — identical audit otherwise, ~30% cheaper.
     skip_visibility: bool = Field(default=False, alias='skipVisibility')
+    # AUDIT PROFILE — 'full' (default, exactly today's behavior) or 'light'
+    # (Tier-0 gates + 8 deterministic factors, zero LLM, ~45s). Follows the
+    # skip_visibility per-request pattern end to end.
+    profile: str = Field(default='full')
+    # TARGET tagging — 'brand' (default, current behavior) or 'competitor'
+    # (this audit is of a competitor's page, run on the brand's behalf).
+    # profile='light': carried through persistence + the AnswerMonk ingest
+    # metadata. profile='full': the agent loop persists mid-run, so the
+    # Supabase row does NOT carry target/session_ref; the AnswerMonk ingest
+    # record IS re-posted with them after completion (upsert by audit_id).
+    # Status/compact/webhook consumers see the tags on both profiles.
+    target: str = Field(default='brand')
+    # Opaque caller correlation string (e.g. an AnswerMonk scan session id).
+    # Pure passthrough — never parsed. Same durability caveat as `target`
+    # on profile='full' (Supabase row untagged; AnswerMonk re-post tagged).
+    session_ref: Optional[str] = Field(default=None, alias='sessionRef')
+    # Optional target city for the light profile's city-in-title/H1 factor;
+    # when absent it is derived from the page's own JSON-LD address.
+    city: Optional[str] = Field(default=None)
 
 
 class StartAuditResponse(BaseModel):
     auditId: str
     estimatedSeconds: int
     reused: bool
+
+
+class BatchStartAuditRequest(BaseModel):
+    """Batch convenience — up to MAX_BATCH_URLS domains in one LIGHT-profile
+    request. A thin loop over independent single-domain light jobs (the
+    pipeline is strictly single-domain: one audit_id / scoring / persisted row
+    / ingest upsert per URL), documented in docs/LIGHT-PROFILE.md."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    urls: _List[str] = Field(min_length=1, max_length=MAX_BATCH_URLS)
+    target: str = Field(default='brand')
+    session_ref: Optional[str] = Field(default=None, alias='sessionRef')
+    webhookUrl: Optional[str] = None
+    city: Optional[str] = None
+
+
+class BatchStartAuditResponse(BaseModel):
+    audits: _List[Dict[str, Any]]
+    estimatedSeconds: int
 
 
 def _normalize_url(raw: str) -> str:
@@ -2667,17 +2786,27 @@ def _normalize_url(raw: str) -> str:
     return s
 
 
-def _find_recent_audit_for_url(url: str) -> Optional[str]:
+def _find_recent_audit_for_url(url: str, profile: str = 'full',
+                               target: str = 'brand') -> Optional[str]:
     """Idempotency check — return an existing audit_id for `url` if one was
     submitted within the last _IDEMPOTENCY_WINDOW_SECONDS seconds and is
     queued, running, or recently completed. Otherwise None.
 
+    The key includes profile AND target: a light request within 60s of a
+    full one (or a competitor audit next to a brand audit of the same URL)
+    must NOT be deduplicated into the other's audit_id.
+
     Checks in-memory JOBS first (covers in-flight audits), then Supabase
-    (covers completed audits that finished within the window)."""
+    (covers completed audits that finished within the window — full/brand
+    only, since persisted rows predating this field can't be distinguished)."""
     cutoff = time.time() - _IDEMPOTENCY_WINDOW_SECONDS
     with JOBS_LOCK:
         for aid, j in JOBS.items():
             if j.get('url') != url:
+                continue
+            if j.get('profile', 'full') != profile:
+                continue
+            if j.get('target', 'brand') != target:
                 continue
             started = j.get('_submitted_at') or 0
             if started < cutoff:
@@ -2686,6 +2815,11 @@ def _find_recent_audit_for_url(url: str) -> Optional[str]:
             if j.get('status') == 'error':
                 continue
             return aid
+    # Supabase fallback: only for the default profile/target — the persisted
+    # recents list carries no profile column, so matching a light/competitor
+    # request against it could return a full brand audit's id.
+    if profile != 'full' or target != 'brand':
+        return None
     # Supabase fallback for completed audits within the window
     try:
         domain = re.sub(r'^https?://', '', url).rstrip('/').split('/')[0]
@@ -2732,7 +2866,10 @@ def _derive_progress_pct(job: Dict) -> int:
     if started:
         try:
             elapsed = time.time() - datetime.fromisoformat(started).timestamp()
-            pct = max(pct, int(min(90, elapsed / EXPECTED_AUDIT_SECONDS * 90)))
+            # Per-job ETA: light runs finish in ~45s — ramping over the full
+            # audit's 360s would crawl the bar at ~10x slow motion.
+            expected = job.get('expected_seconds') or EXPECTED_AUDIT_SECONDS
+            pct = max(pct, int(min(90, elapsed / max(1, expected) * 90)))
         except (ValueError, TypeError):
             pass
     hint = p.get('pct_hint')
@@ -2919,7 +3056,7 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
     else:
         full_url = f"/{domain}" if domain else None
 
-    return {
+    compact = {
         'status': 'complete',
         'auditId': audit.get('audit_id'),
         'url': audit.get('url'),
@@ -2943,6 +3080,19 @@ def _audit_to_compact(audit: Dict, request: Optional[Request] = None) -> Dict:
         'completedAt': audit.get('date') or audit.get('created_at'),
         'durationSeconds': audit.get('duration_seconds'),
     }
+    # Additive tagging — only stamped when present, so the compact shape for
+    # default full-profile audits is byte-identical to before.
+    md = audit.get('metadata') if isinstance(audit.get('metadata'), dict) else {}
+    profile = audit.get('profile') or md.get('profile')
+    if profile:
+        compact['profile'] = profile
+    tgt = audit.get('target') or md.get('target')
+    if tgt:
+        compact['target'] = tgt
+    sref = audit.get('session_ref') or md.get('session_ref')
+    if sref:
+        compact['sessionRef'] = sref
+    return compact
 
 
 WEBHOOK_SECRET = os.getenv('AUDIT_WEBHOOK_SECRET', '')
@@ -3013,7 +3163,48 @@ async def api_audit_start(req: StartAuditRequest,
         raise HTTPException(status_code=503,
                             detail='API key not configured; endpoint disabled')
 
-    url = _normalize_url(req.url)
+    profile = (req.profile or 'full').strip().lower()
+    if profile not in VALID_PROFILES:
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid profile '{req.profile}' — "
+                                   f"one of {list(VALID_PROFILES)}")
+    target = (req.target or 'brand').strip().lower()
+    if target not in VALID_TARGETS:
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid target '{req.target}' — "
+                                   f"one of {list(VALID_TARGETS)}")
+
+    site_context = sanitize_site_context(req.site_context)
+    audit_id, reused = _submit_audit_job(
+        req.url, profile=profile, target=target,
+        session_ref=req.session_ref, city=req.city,
+        webhook_url=req.webhookUrl, site_context=site_context,
+        skip_visibility=bool(req.skip_visibility),
+        api_key=request.headers.get('X-API-Key', ''),
+        background_tasks=background_tasks,
+    )
+    expected = (EXPECTED_LIGHT_AUDIT_SECONDS if profile == 'light'
+                else EXPECTED_AUDIT_SECONDS)
+    return StartAuditResponse(auditId=audit_id, estimatedSeconds=expected,
+                              reused=reused)
+
+
+def _submit_audit_job(raw_url: str, *, profile: str, target: str,
+                      session_ref: Optional[str], city: Optional[str],
+                      webhook_url: Optional[str],
+                      site_context: Optional[Dict[str, Any]],
+                      skip_visibility: bool, api_key: str,
+                      background_tasks: BackgroundTasks) -> tuple:
+    """Shared submission core for /api/audit/start and the light batch
+    endpoint. Returns (audit_id, reused); raises HTTPException on rejection.
+    Behavior for profile='full', target='brand' is byte-identical to the
+    pre-profile endpoint (same guards, same order, same metering)."""
+    if profile == 'light' and not LIGHT_AVAILABLE:
+        raise HTTPException(status_code=503,
+                            detail=f'light profile unavailable: '
+                                   f'{_LIGHT_IMPORT_ERROR}')
+
+    url = _normalize_url(raw_url)
     if not url or '.' not in url:
         raise HTTPException(status_code=400,
                             detail='Invalid url — must be a domain or full URL')
@@ -3031,43 +3222,51 @@ async def api_audit_start(req: StartAuditRequest,
 
     # SSRF guard for the webhook callback — an API-key holder must not be able
     # to make the server POST to internal services.
-    if req.webhookUrl:
-        wsafe, wreason = check_url_safe(req.webhookUrl)
+    if webhook_url:
+        wsafe, wreason = check_url_safe(webhook_url)
         if not wsafe:
             raise HTTPException(status_code=400,
                                 detail=f'webhookUrl not allowed: {wreason}')
 
     # Idempotency first — a retry/double-click for an in-flight URL returns the
     # existing audit and must NOT be rejected by the concurrency gate below.
-    existing = _find_recent_audit_for_url(url)
+    # Profile + target are part of the key: light≠full, competitor≠brand.
+    existing = _find_recent_audit_for_url(url, profile=profile, target=target)
     if existing:
-        log.info('[%s] idempotency hit for url=%s', existing[:8], url)
-        return StartAuditResponse(auditId=existing,
-                                   estimatedSeconds=EXPECTED_AUDIT_SECONDS,
-                                   reused=True)
+        log.info('[%s] idempotency hit for url=%s profile=%s target=%s',
+                 existing[:8], url, profile, target)
+        return existing, True
 
     with JOBS_LOCK:
         _reap_and_evict_locked()
-        if _active_audit_count() >= MAX_CONCURRENT_AUDITS:
+        if profile == 'light':
+            if _active_light_count() >= MAX_CONCURRENT_LIGHT_AUDITS:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f'Too many light audits in progress '
+                           f'(max {MAX_CONCURRENT_LIGHT_AUDITS}); retry shortly')
+        elif _active_audit_count() >= MAX_CONCURRENT_AUDITS:
             raise HTTPException(
                 status_code=429,
                 detail=f'Too many audits in progress (max {MAX_CONCURRENT_AUDITS}); retry shortly')
 
     # Metering / quota — charge only genuinely-new audits (idempotency hits above
     # already returned). Fails open on infra error, closed on confirmed quota.
+    # Light audits meter neutrally (1 unit) but carry the profile annotation.
     if billing is not None:
         decision = billing.check_and_meter(
-            request.headers.get('X-API-Key', ''),
+            api_key,
             now_iso=datetime.now(timezone.utc).isoformat(),
+            profile=profile if profile != 'full' else None,
         )
         if not decision.get('allowed'):
             raise HTTPException(status_code=402,
                                 detail=f"Quota exceeded: {decision.get('reason')}")
 
     audit_id = str(uuid.uuid4())
-    site_context = sanitize_site_context(req.site_context)
-    log.info('[%s] api/start url=%s webhook=%s site_context=%s', audit_id[:8], url,
-             '(yes)' if req.webhookUrl else '(no)',
+    log.info('[%s] api/start url=%s profile=%s target=%s webhook=%s site_context=%s',
+             audit_id[:8], url, profile, target,
+             '(yes)' if webhook_url else '(no)',
              ','.join(sorted(site_context)) if site_context else '(none)')
     with JOBS_LOCK:
         JOBS[audit_id] = {
@@ -3078,16 +3277,78 @@ async def api_audit_start(req: StartAuditRequest,
             'completed_at': None,
             'result': None,
             'error': None,
-            'webhook_url': req.webhookUrl,
+            'webhook_url': webhook_url,
             'site_context': site_context,
-            'skip_visibility': bool(req.skip_visibility),
+            'skip_visibility': skip_visibility,
+            'profile': profile,
+            'target': target,
+            'session_ref': session_ref,
+            'city': city,
+            'expected_seconds': (EXPECTED_LIGHT_AUDIT_SECONDS
+                                 if profile == 'light'
+                                 else EXPECTED_AUDIT_SECONDS),
             'submitted_via': 'api',
             '_submitted_at': time.time(),
         }
-    background_tasks.add_task(_run_audit_background, audit_id, url)
-    return StartAuditResponse(auditId=audit_id,
-                              estimatedSeconds=EXPECTED_AUDIT_SECONDS,
-                              reused=False)
+    if profile == 'light':
+        # Dedicated executor → batch entries genuinely run in parallel
+        # (BackgroundTasks would await them one-by-one; see _LIGHT_EXECUTOR).
+        _LIGHT_EXECUTOR.submit(_run_audit_background, audit_id, url)
+    else:
+        background_tasks.add_task(_run_audit_background, audit_id, url)
+    return audit_id, False
+
+
+@app.post('/api/audit/start-batch', response_model=BatchStartAuditResponse)
+async def api_audit_start_batch(req: BatchStartAuditRequest,
+                                background_tasks: BackgroundTasks,
+                                request: Request,
+                                _: bool = Depends(require_api_key)):
+    """Batch LIGHT-profile trigger — up to 4 domains in one request.
+
+    ARCHITECTURE NOTE: the audit pipeline is strictly single-domain (one
+    audit_id / scoring block / persisted row / AnswerMonk upsert per URL), so
+    this is deliberately a thin loop over independent light submissions, not a
+    multi-domain audit object. Per-URL failures are reported per entry and
+    never abort the rest (a typo'd competitor domain must not kill the batch).
+
+    Accepted entries are dispatched to the dedicated light executor and run
+    IN PARALLEL (up to MAX_CONCURRENT_LIGHT_AUDITS), so estimatedSeconds is
+    the expected wall clock for the whole batch, not per entry. A shared
+    webhookUrl fires ONE webhook POST per entry (up to 4 calls) as each
+    audit settles — there is no aggregated batch webhook.
+
+    Body: {urls: [1..4], target?, sessionRef?, webhookUrl?, city?}
+    Returns: {audits: [{url, auditId?, reused?, error?}], estimatedSeconds}.
+    """
+    if IS_PRODUCTION and not API_KEY_ENABLED:
+        raise HTTPException(status_code=503,
+                            detail='API key not configured; endpoint disabled')
+    target = (req.target or 'brand').strip().lower()
+    if target not in VALID_TARGETS:
+        raise HTTPException(status_code=400,
+                            detail=f"Invalid target '{req.target}' — "
+                                   f"one of {list(VALID_TARGETS)}")
+    results = []
+    for raw in req.urls[:MAX_BATCH_URLS]:
+        entry: Dict[str, Any] = {'url': raw}
+        try:
+            audit_id, reused = _submit_audit_job(
+                raw, profile='light', target=target,
+                session_ref=req.session_ref, city=req.city,
+                webhook_url=req.webhookUrl, site_context=None,
+                skip_visibility=True,
+                api_key=request.headers.get('X-API-Key', ''),
+                background_tasks=background_tasks,
+            )
+            entry['auditId'] = audit_id
+            entry['reused'] = reused
+        except HTTPException as e:
+            entry['error'] = str(e.detail)
+            entry['statusCode'] = e.status_code
+        results.append(entry)
+    return BatchStartAuditResponse(audits=results,
+                                   estimatedSeconds=EXPECTED_LIGHT_AUDIT_SECONDS)
 
 
 @app.get('/api/audit/{audit_id}/delta')
@@ -3150,8 +3411,11 @@ def api_audit_status(audit_id: str, _: bool = Depends(require_api_key)):
         # Countdown inputs — pollers render "~Xm left" from these instead of
         # hardcoding an ETA (startedAt is null until the job leaves the queue).
         'startedAt': job.get('started_at'),
-        'estimatedSeconds': EXPECTED_AUDIT_SECONDS,
+        'estimatedSeconds': job.get('expected_seconds') or EXPECTED_AUDIT_SECONDS,
     }
+    if job.get('profile') and job.get('profile') != 'full':
+        resp['profile'] = job['profile']
+        resp['target'] = job.get('target', 'brand')
     if job.get('progress'):
         p = job['progress']
         resp['phase'] = p.get('phase')

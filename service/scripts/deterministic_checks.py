@@ -1263,17 +1263,39 @@ def check_e14_llms_txt(page_url):
         if str(k).lower() == 'content-type':
             content_type = str(v)
             break
+    r = classify_llms_txt_response(status, body, content_type,
+                                   llms_url=llms_url)
+    r['detail'] = {'url': llms_url, 'final_url': final_url, **r['detail']}
+    return r
+
+
+def classify_llms_txt_response(status, body, content_type='',
+                               llms_url='/llms.txt'):
+    """Pure E14 verdict bands over an ALREADY-FETCHED /llms.txt response.
+
+    SINGLE SOURCE OF TRUTH for the E14_llms_txt verdict, shared between
+    check_e14_llms_txt (full profile — fetches, then classifies) and the
+    LIGHT profile (scripts/light_checks.check_llms_txt — pre-fetched bytes).
+    Both paths therefore emit identical statuses for the same fixture bytes;
+    tests/test_light_profile.py asserts the agreement.
+
+    Bands (see check_e14_llms_txt docstring for the measured rationale):
+      2xx + text/markdown-shaped body  -> pass
+      2xx + HTML body (soft-200)       -> fail
+      2xx + empty body                 -> fail
+      4xx                              -> fail (file absent)
+      5xx / other                      -> na  (server error — not assessable)
+      fetch failed (status 0 or None)  -> na
+    """
     snippet = re.sub(r'\s+', ' ', (body or '')[:100]).strip()
     detail = {
-        'url': llms_url,
-        'final_url': final_url,
         'http_status': status,
         'content_type': content_type,
         'body_bytes': len(body or ''),
         'first_100_chars': snippet,
     }
 
-    if status == 0:
+    if not status:  # 0 or None — the fetch itself failed
         return {'status': 'na',
                 'evidence': f'llms.txt fetch failed ({llms_url}) — '
                             f'network error or blocked; not assessable.',

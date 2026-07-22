@@ -1053,6 +1053,42 @@
         379
       ],
       "notes": "Rule #1280 (Google, 0.97) 'Indicate hreflang for multi-language or multi-region page variants.' Rule #920 (Google, 0.95) 'Hreflang Annotation Requirement for Multilingual/Multi-Regional Sites.' Rule #1281 (Google, 0.96) 'Include self-referencing hreflang link on every page variant.' AP#678 (Google, high) 'Missing Self-Referencing hreflang Link on Page Variants.' AP#379 (Google, high) 'Incorrect hreflang annotations causing wrong canonical selection.'"
+    },
+    "C13_city_in_title_h1": {
+      "category": "onpage_seo",
+      "rules": [],
+      "anti_patterns": [],
+      "notes": "LIGHT-profile deterministic check (light_checks.py): target city present in <title>/H1. No curated brain ids yet — findings stand on the measured observation."
+    },
+    "D15_localbusiness_geo_schema": {
+      "category": "schema",
+      "rules": [],
+      "anti_patterns": [],
+      "notes": "LIGHT-profile deterministic check (light_checks.py): LocalBusiness-family JSON-LD entity with GeoCoordinates. No curated brain ids yet."
+    },
+    "E5b_raw_html_depth": {
+      "category": "aeo_discovery",
+      "rules": [],
+      "anti_patterns": [],
+      "notes": "Deterministic variant of E5_content_in_raw_html (LIGHT profile): visible word count of raw HTML measured by light_checks.py. No curated brain ids yet."
+    },
+    "F3b_faq_content_present": {
+      "category": "aeo_extraction",
+      "rules": [],
+      "anti_patterns": [],
+      "notes": "Deterministic variant of F3_faq_section (LIGHT profile): visible FAQ widget and/or FAQPage JSON-LD detected by light_checks.py."
+    },
+    "F6b_question_headings": {
+      "category": "aeo_extraction",
+      "rules": [],
+      "anti_patterns": [],
+      "notes": "Deterministic variant of F6_headings_as_questions (LIGHT profile): H2/H3 question-form ratio via looks_like_question."
+    },
+    "F8b_prices_visible": {
+      "category": "aeo_extraction",
+      "rules": [],
+      "anti_patterns": [],
+      "notes": "Deterministic variant of F8_specific_facts (LIGHT profile): visible currency amounts + Offer/priceRange schema cross-check."
     }
   },
   "source_tiers": {
