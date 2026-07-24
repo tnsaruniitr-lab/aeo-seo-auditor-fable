@@ -1,6 +1,6 @@
 {
-  "version": 2,
-  "note": "Mode-C deterministic bindings. For a MEASURED check (status comes from the deterministic scripts, not the LLM), bind a curated rule VERBATIM when the predicate holds. Each id was verified on-topic against the snapshot corpus (rule text read; tier 1/2 source). Unmapped bases (G7c: no on-topic tier-1/2 editorial-policy rule exists in the snapshot) simply get no deterministic binding — never a wrong one. Where a check's warn means 'could not evaluate' (robots/sitemap probes) or a different failure mode, the binding is restricted to the statuses the rule actually speaks to.",
+  "version": 3,
+  "note": "Mode-C deterministic bindings. For a MEASURED check, bind a curated rule only when the resolved Sieve row carries source-faithful provenance. G1 is deliberately unmapped: author bylines are not a universal requirement for non-editorial homepages. Unmapped bases simply get no deterministic binding. Where a check's warn means 'could not evaluate' or a different failure mode, the binding is restricted to the statuses the rule actually speaks to.",
   "bindings": {
     "A1":  [{ "kind": "rule", "id": 1489, "when": { "status": ["fail", "warn"] } }],
     "A2b": [{ "kind": "rule", "id": 25860, "when": { "status": ["fail", "warn"] } }],
@@ -28,7 +28,6 @@
     "E10": [{ "kind": "rule", "id": 7856, "when": { "status": ["fail"] } }],
     "E12": [{ "kind": "rule", "id": 1424, "when": { "status": ["fail", "warn"] } }],
     "E13": [{ "kind": "rule", "id": 2859, "when": { "status": ["fail"] } }],
-    "G1":  [{ "kind": "rule", "id": 1544, "when": { "status": ["fail", "warn"] } }],
     "G2":  [{ "kind": "rule", "id": 1676, "when": { "status": ["fail"] } },
             { "kind": "rule", "id": 1675, "when": { "status": ["warn"] } }],
     "G7b": [{ "kind": "rule", "id": 621, "when": { "status": ["fail", "warn"] } }],

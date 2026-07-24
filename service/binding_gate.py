@@ -8,10 +8,11 @@ the >=2-token _plausible acceptance as the scoring-bearing check. Three tests,
 cheapest-and-strongest first:
 
   1. existence  — (kind, id) resolves to a real brain row.
-  2. candidacy  — the id is a member of the candidate pool retrieval returns
+  2. provenance — the row has a verbatim source excerpt tied to a content hash.
+  3. candidacy  — the id is a member of the candidate pool retrieval returns
                   for THIS finding (kills prose-scraped / hallucinated ids
                   without threading per-finding state).
-  3. support    — the finding's evidence and the rule's then_action/text share
+  4. support    — the finding's evidence and the rule's then_action/text share
                   enough distinctive vocabulary (topical support).
 
 A finding is NEVER dropped: binding_verified + reason are stamped, and an
@@ -73,10 +74,6 @@ def verify_binding(
     br = finding.get('bound_rule')
     if not isinstance(br, dict):
         return None
-    # Mode C deterministic bindings are verified by construction.
-    if br.get('basis') == 'deterministic' and br.get('binding_verified') is True:
-        return br
-
     kind, rid = br.get('kind'), _norm_id(br.get('id'))
     if not kind or rid is None:
         br['binding_verified'] = False
@@ -87,6 +84,28 @@ def verify_binding(
     if not row:
         br['binding_verified'] = False
         br['reason'] = 'not-found'
+        return br
+
+    from rule_eval import source_faithful
+    if not source_faithful(row):
+        br['binding_verified'] = False
+        br['reason'] = 'source-unattested'
+        br['source_faithful'] = False
+        return br
+
+    # Mode C skips the LLM-candidacy/topical gates, but never provenance.
+    if br.get('basis') == 'deterministic':
+        br.update({
+            'binding_verified': True, 'reason': 'ok',
+            'name': row.get('name') or row.get('title'),
+            'source_org': row.get('source_org'),
+            'source_url': row.get('source_url'),
+            'confidence_score': str(row.get('confidence_score') or ''),
+            'source_excerpt': str(row.get('source_excerpt') or '')[:1000],
+            'source_content_hash': row.get('source_content_hash'),
+            'provenance_status': row.get('provenance_status'),
+            'source_faithful': True,
+        })
         return br
 
     pool = candidates_for(finding) or set()
@@ -108,6 +127,10 @@ def verify_binding(
         'source_org': row.get('source_org'),
         'source_url': row.get('source_url'),
         'confidence_score': str(row.get('confidence_score') or ''),
+        'source_excerpt': str(row.get('source_excerpt') or '')[:1000],
+        'source_content_hash': row.get('source_content_hash'),
+        'provenance_status': row.get('provenance_status'),
+        'source_faithful': True,
     })
     return br
 
@@ -120,7 +143,8 @@ def verify_bindings(
     """Verify every finding's bound_rule. Mutates and returns (audit, stats).
     Never raises, never drops a finding."""
     stats = {'applied': True, 'bindings': 0, 'verified': 0,
-             'not_found': 0, 'not_candidate': 0, 'unsupported': 0}
+             'not_found': 0, 'source_unattested': 0,
+             'not_candidate': 0, 'unsupported': 0}
     try:
         findings = audit.get('findings')
         if not isinstance(findings, list):
@@ -137,6 +161,7 @@ def verify_bindings(
             else:
                 reason = br.get('reason')
                 key = {'not-found': 'not_found', 'not-a-candidate': 'not_candidate',
+                       'source-unattested': 'source_unattested',
                        'unsupported': 'unsupported'}.get(reason)
                 if key:
                     stats[key] += 1
@@ -150,9 +175,15 @@ def _selftest() -> None:
     rows = {
         ('rule', '1496'): {'id': 1496, 'name': 'FAQPage markup must match visible FAQ content',
                            'then_action': 'ensure faqpage schema answers appear visibly on the page',
-                           'source_org': 'Google', 'source_url': 'https://g/faq', 'confidence_score': '0.9'},
+                           'source_org': 'Google', 'source_url': 'https://g/faq', 'confidence_score': '0.9',
+                           'source_excerpt': 'FAQPage content must be visible to users.',
+                           'source_content_hash': 'hash-faq',
+                           'provenance_status': 'verified_excerpt'},
         ('rule', '1489'): {'id': 1489, 'name': 'Enforce HTTPS across the domain',
-                           'then_action': 'redirect http to https everywhere', 'source_org': 'Perplexity'},
+                           'then_action': 'redirect http to https everywhere', 'source_org': 'Perplexity',
+                           'source_excerpt': 'Redirect HTTP traffic to HTTPS.',
+                           'source_content_hash': 'hash-https',
+                           'provenance_status': 'verified_excerpt'},
     }
     resolve = lambda k, i: rows.get((k, str(i)))
     # candidate pool: what retrieval would surface for the FAQ finding
@@ -191,7 +222,15 @@ def _selftest() -> None:
     assert f[3]['bound_rule']['binding_verified'] is False and f[3]['bound_rule']['reason'] == 'unsupported', f[3]
     assert f[4]['bound_rule']['binding_verified'] is True, 'deterministic binding untouched'
     assert stats == {'applied': True, 'bindings': 5, 'verified': 2,
+                     'source_unattested': 0,
                      'not_found': 1, 'not_candidate': 1, 'unsupported': 1}, stats
+
+    unattested = {'check_id': 'D9_faqpage', 'status': 'fail',
+                  'evidence': 'faqpage schema but answers hidden',
+                  'bound_rule': {'kind': 'rule', 'id': 1496}}
+    bare_resolve = lambda k, i: {'id': 1496, 'name': 'FAQPage visible'}
+    br = verify_binding(unattested, bare_resolve, candidates_for)
+    assert br['binding_verified'] is False and br['reason'] == 'source-unattested', br
 
     for shape in ({}, {'findings': None}, {'findings': [1]}):
         _, s = verify_bindings(dict(shape), resolve, candidates_for)

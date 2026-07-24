@@ -173,6 +173,10 @@ r = dc.check_g1_author_byline('<p>Written by Marta Alvarez</p>')
 check("'Written by <Name>' matches case-insensitively on the verb",
       r['status'] == 'pass' and 'Marta Alvarez' in str(r['detail']),
       r['evidence'])
+r = dc.check_g1_author_byline(
+    '<html><body><main><h1>Payments platform</h1><p>Automate invoices.</p></main></body></html>')
+check('non-editorial SaaS homepage is not penalized for lacking a byline',
+      r['status'] == 'na' and 'not required' in r['evidence'], r['evidence'])
 
 # ---------------------------------------------------------------- G2
 print('[G2] schema-author linkage')

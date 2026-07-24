@@ -1960,8 +1960,10 @@ def check_g1_author_byline(html):
 
     Measures the objective substrate of the E-E-A-T authorship judgment:
     a visible byline pattern in the rendered text / byline-intent markup,
-    and/or an author declared in JSON-LD. pass = visibly bylined;
-    warn = schema-only (add a visible byline); fail = neither.
+    and/or an author declared in JSON-LD. The requirement applies to
+    editorial/article content, not ordinary product or SaaS homepages.
+    pass = visibly bylined; warn = schema-only; fail = an article without
+    attribution; na = no editorial/article signal.
     """
     text = strip_tags(html)
     visible_hits = []
@@ -1974,11 +1976,18 @@ def check_g1_author_byline(html):
                     if not (h in seen or seen.add(h))]
     markup_hit = bool(_BYLINE_MARKUP_RE.search(html or ''))
     schema_authors = _schema_author_names(html)
+    items = list(_iter_jsonld_items(html))
+    article_nodes = [i for i in items
+                     if any(_ARTICLE_TYPES_RE.search(t)
+                            for t in _node_types(i))]
+    article_markup = bool(re.search(r'<article\b', html or '', re.IGNORECASE))
 
     detail = {
         'visible_byline_names': visible_hits[:5],
         'byline_markup_present': markup_hit,
         'schema_authors': schema_authors[:5],
+        'article_nodes': len(article_nodes),
+        'article_markup_present': article_markup,
     }
 
     if visible_hits or markup_hit:
@@ -2001,6 +2010,13 @@ def check_g1_author_byline(html):
                 f'Author declared in schema ({schema_authors[0]}) but no '
                 f'visible byline pattern found on the page — answer engines '
                 f'weight visible attribution; add a byline.'),
+            'detail': detail,
+        }
+    if not article_nodes and not article_markup:
+        return {
+            'status': 'na',
+            'evidence': ('No Article-family schema, <article> element, or author '
+                         'signal — a byline is not required for this page type.'),
             'detail': detail,
         }
     return {

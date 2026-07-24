@@ -312,12 +312,18 @@ def status_excluded(row: Optional[dict]) -> bool:
 def _row_freshness(row: dict) -> dict:
     """Freshness/lifecycle fields carried from the snapshot row WHEN PRESENT
     (post re-export); older snapshot files simply yield None values."""
+    excerpt = str(row.get('source_excerpt') or '').strip()
+    content_hash = str(row.get('source_content_hash') or '').strip()
+    proof_status = str(row.get('provenance_status') or '').strip()
     return {
         'last_verified': (str(row['last_verified'])[:10]
                           if row.get('last_verified') else None),
         'status': row.get('status'),
         'added': (str(row['created_at'])[:10]
                   if row.get('created_at') else None),
+        'source_excerpt': excerpt[:1000] or None,
+        'source_content_hash': content_hash or None,
+        'provenance_status': proof_status or 'unverified',
     }
 
 
@@ -409,6 +415,10 @@ def _snapshot_cite(kind: str, row: dict, score: float, snapshot_date: Optional[s
         # Freshness carried from the export WHEN PRESENT, never fabricated.
         'freshness': 'snapshot', **_row_freshness(row),
     }
+    cite['source_faithful'] = bool(
+        kind == 'rule'
+        and cite.get('provenance_status') == 'verified_excerpt'
+        and cite.get('source_excerpt') and cite.get('source_content_hash'))
     if kind == 'ap':
         cite['risk_level'] = row.get('risk_level')
         cite['guidance_kind'] = 'avoid'

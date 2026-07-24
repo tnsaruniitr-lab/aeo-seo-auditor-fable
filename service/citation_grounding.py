@@ -86,6 +86,8 @@ _KIND_ALIASES = {
 # The fields this module owns. Whatever the LLM put there is replaced;
 # any other keys on the citation object are left untouched.
 _AUTHORITATIVE_TEXT_FIELDS = ('name', 'if_condition', 'then_action')
+_AUTHORITATIVE_PROOF_FIELDS = ('source_excerpt', 'source_content_hash',
+                               'provenance_status', 'source_faithful')
 
 # Kind-specific alias fields also owned by this module — popped before the
 # authoritative update so a rule citation can't keep a stale 'statement' etc.
@@ -192,6 +194,11 @@ def _live_sql(cfg: Dict[str, Any], cols: set) -> str:
     dtag = "t.domain_tag" if 'domain_tag' in cols else "NULL"
     lv = "t.last_verified::text" if 'last_verified' in cols else "NULL"
     ca = "t.created_at" if 'created_at' in cols else "NULL"
+    excerpt = "t.source_excerpt" if 'source_excerpt' in cols else "NULL"
+    content_hash = ("t.source_content_hash"
+                    if 'source_content_hash' in cols else "NULL")
+    proof_status = ("t.provenance_status"
+                    if 'provenance_status' in cols else "NULL")
     # Retired/superseded guidance is unciteable on this path too:
     # a by-id fetch that resurrects a retired rule as 'verified'
     # would undo the retrieval-side status filter.
@@ -212,7 +219,10 @@ def _live_sql(cfg: Dict[str, Any], cols: set) -> str:
                {src_url} AS source_url,
                {lv} AS last_verified,
                {ca} AS created_at,
-               {prov} AS url_provenance
+               {prov} AS url_provenance,
+               {excerpt} AS source_excerpt,
+               {content_hash} AS source_content_hash,
+               {proof_status} AS provenance_status
         FROM sieve.{cfg['table']} t{join}
         WHERE t.id = ANY(%s){status_f}
         """
@@ -286,6 +296,12 @@ def _live_row_fields(kind: str, r: Dict[str, Any]) -> Dict[str, Any]:
         conf_str = str(round(float(conf), 2))
     except (TypeError, ValueError):
         conf_str = '0.0'
+    excerpt = str(r.get('source_excerpt') or '').strip()
+    content_hash = str(r.get('source_content_hash') or '').strip()
+    proof_status = str(r.get('provenance_status') or '').strip()
+    source_faithful = bool(
+        kind == 'rule' and proof_status == 'verified_excerpt'
+        and excerpt and content_hash)
     fields = {
         'kind': kind,
         'tier': tier,
@@ -305,6 +321,10 @@ def _live_row_fields(kind: str, r: Dict[str, Any]) -> Dict[str, Any]:
         # Overwrites the retrieval-time value so a re-grounded source_url never
         # carries a stale provenance label from a URL it replaced.
         'url_provenance': r.get('url_provenance'),
+        'source_excerpt': excerpt[:1000] or None,
+        'source_content_hash': content_hash or None,
+        'provenance_status': proof_status or 'unverified',
+        'source_faithful': source_faithful,
         'from': 'sieve-live',
     }
     if kind == 'ap':
@@ -355,6 +375,12 @@ def _snapshot_fields(kind: str, rid: str) -> Optional[Dict[str, Any]]:
     if conf is None and kind == 'ap':
         conf = {'high': 0.95, 'medium': 0.80, 'low': 0.65}.get(
             str(row.get('risk_level') or '').strip().lower(), 0.75)
+    excerpt = str(row.get('source_excerpt') or '').strip()
+    content_hash = str(row.get('source_content_hash') or '').strip()
+    proof_status = str(row.get('provenance_status') or '').strip()
+    source_faithful = bool(
+        kind == 'rule' and proof_status == 'verified_excerpt'
+        and excerpt and content_hash)
     fields = {
         'kind': kind,
         'tier': tier,
@@ -368,6 +394,10 @@ def _snapshot_fields(kind: str, rid: str) -> Optional[Dict[str, Any]]:
         'then_action': _cap(row.get(cfg['snap_t2']) if cfg['snap_t2'] else ''),
         'domain_tag': row.get('domain_tag'),
         'url_provenance': None,  # snapshot rows carry no provenance — clear any stale label
+        'source_excerpt': excerpt[:1000] or None,
+        'source_content_hash': content_hash or None,
+        'provenance_status': proof_status or 'unverified',
+        'source_faithful': source_faithful,
         'from': 'snapshot',
     }
     if kind == 'ap':
@@ -470,6 +500,8 @@ def reground_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
                 if auth is None:
                     c['grounded'] = 'unresolved'
                     c['verbatim'] = False
+                    c['source_faithful'] = False
+                    c['provenance_status'] = 'unverified'
                     stats['unresolved'] += 1
                     continue
 
@@ -481,6 +513,8 @@ def reground_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
                     stats['kind_corrected'] = stats.get('kind_corrected', 0) + 1
                 for k in _ALIAS_FIELDS:
                     c.pop(k, None)
+                for k in _AUTHORITATIVE_PROOF_FIELDS:
+                    c.pop(k, None)
                 c.update(auth)
                 c['id'] = rid
                 c['grounded'] = grounded
@@ -488,7 +522,8 @@ def reground_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
                 # §6: re-stamp support against the AUTHORITATIVE text (the
                 # attach-time stamp saw pre-correction fields). Unresolved
                 # cites above keep their attach-time verdict untouched.
-                c['supports_finding'] = _supports(ftok, c)
+                c['supports_finding'] = bool(
+                    c.get('source_faithful') is True and _supports(ftok, c))
                 stats['support_stamped'] += 1
                 stats['regrounded_live' if grounded == 'sieve-live'
                       else 'regrounded_snapshot'] += 1
@@ -576,6 +611,10 @@ def ground_fix_sources(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
                 if auth is None:
                     stats['unresolved'] += 1
                     continue
+                if auth.get('source_faithful') is not True:
+                    stats['unresolved'] += 1
+                    stats['source_unattested'] = stats.get('source_unattested', 0) + 1
+                    continue
                 # A prose-scraped id resolves to SOME row; only stamp its
                 # authoritative source_url if that row actually supports the
                 # fix. An off-topic / hallucinated id is dropped, not minted.
@@ -628,6 +667,9 @@ def _selftest() -> None:
                 'confidence_score': '0.98', 'source_org': 'Schema.org',
                 'source_url': 'https://schema.org/Organization',
                 'source_title': 'Organization - Schema.org', 'domain_tag': 'seo',
+                'source_excerpt': 'Organization schema includes name and url properties.',
+                'source_content_hash': 'hash-org-schema',
+                'provenance_status': 'verified_excerpt',
             },
             2001: {
                 'id': 2001, 'name': 'Indicate hreflang for multi-language variants',

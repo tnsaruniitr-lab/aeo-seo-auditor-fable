@@ -39,7 +39,10 @@ def _cite(kind='rule', cid=7, name='Use HTTP Observatory security headers audit'
     c = {'kind': kind, 'id': cid, 'name': name,
          'if_condition': 'missing security headers such as HSTS',
          'then_action': 'add the missing headers before launch',
-         'source_org': 'MDN', 'supports_finding': False}
+         'source_org': 'MDN', 'supports_finding': False,
+         'source_excerpt': 'Add security headers such as HSTS before launch.',
+         'source_content_hash': 'hash-mdn',
+         'provenance_status': 'verified_excerpt', 'source_faithful': True}
     c.update(kw)
     return c
 
@@ -274,8 +277,8 @@ def test_agent_wiring_order_and_gate():
 
 
 # ---------------------------------------------------------------------------
-# 7. render branches (main.py): supports=proof, related=see-also,
-#    unrelated=hidden-not-dropped, unjudged=lexical fallback; compact carries
+# 7. render branches (main.py): supports+provenance=proof, all other
+#    non-hidden citations=context; compact carries
 #    the verdict
 # ---------------------------------------------------------------------------
 
@@ -284,16 +287,18 @@ def test_render_branches_and_compact_field():
     src = open(os.path.join(_SERVICE, 'main.py'), encoding='utf-8').read()
     # unrelated: hidden from display (skipped BEFORE dedup), kept in JSON
     assert "if (c.entailment === 'unrelated') continue;" in src
-    # related: collapsed see-also section, rendered after the proof tiers
-    assert "if (c.entailment === 'related') { seeAlso.push(c); continue; }" in src
-    assert 'See also — related guidance (' in src
-    # judged supports overrides the lexical demotion + fallback label
-    assert "x.entailment === 'supports'" in src
-    assert "c.supports_finding === false && c.entailment !== 'supports'" in src
+    # proof is a conjunction: judged support AND verified source provenance.
+    assert ("c.entailment === 'supports'" in src
+            and "c.source_faithful === true" in src
+            and "c.provenance_blocked !== true" in src)
+    assert "if (!isProof(c)) { seeAlso.push(c); continue; }" in src
+    assert 'Context — not direct proof (' in src
 
     # compact payload carries entailment per citation
     slim = main._slim_citation(_cite(cid=3, entailment='supports'))
-    assert slim['entailment'] == 'supports' and slim['supportsFinding'] is False, slim
+    assert (slim['entailment'] == 'supports' and slim['supportsFinding'] is False
+            and slim['sourceFaithful'] is True
+            and slim['sourceContentHash']), slim
     audit = {'audit_id': 'a', 'domain': 'd', 'scoring': {},
              'findings': [_finding(cites=[_cite(cid=3, entailment='related',
                                                 source_url='https://ex/hsts')])]}
@@ -319,6 +324,44 @@ def test_lexical_gate_stays_candidate_annotation():
     assert c['supports_finding'] is False and c['entailment'] == 'supports', c
 
 
+def test_unattested_source_is_never_judged_or_promoted():
+    _reset()
+    ce._judge_fn = lambda f, c: (_ for _ in ()).throw(
+        AssertionError('unattested citations must not reach the judge'))
+    findings = [_finding(cites=[_cite(cid=12, source_faithful=False,
+                                      provenance_status='unverified')])]
+    stats = ce.judge_citations(findings)
+    c = findings[0]['citations'][0]
+    assert c['entailment'] == 'unjudged' and c['provenance_blocked'] is True, c
+    assert stats['source_unattested'] == 1 and stats['api_calls'] == 0, stats
+
+
+def test_selection_pool_blocks_unattested_before_cache_and_promotion():
+    _reset()
+    finding = _finding()
+    blocked = [
+        _cite(cid=21, source_faithful=False, provenance_status='unverified'),
+        _cite(cid=22, source_faithful=False, provenance_status='unverified'),
+        _cite(cid=23, source_faithful=False, provenance_status='unverified'),
+    ]
+    trusted = _cite(cid=24)
+    # Even a legacy warm "supports" verdict must not rescue unattested proof.
+    ce._lru_put(ce.cache_key(finding, blocked[0]), 'supports')
+    calls = []
+    ce._judge_fn = lambda f, c: calls.append(c['id']) or 'supports'
+
+    pool = blocked + [trusted]
+    verdicts, info = ce.judge_selection_pool(finding, pool)
+    assert verdicts == ['unjudged', 'unjudged', 'unjudged', 'supports'], verdicts
+    assert calls == [24], calls
+    assert info['source_unattested'] == 3 and info['cache_hits'] == 0, info
+    assert all(c.get('provenance_blocked') is True for c in blocked)
+
+    from citation_attach import _select_from_pool
+    selected, promoted = _select_from_pool(pool, verdicts)
+    assert selected[0]['id'] == 24 and promoted == 1, (selected, promoted)
+
+
 if __name__ == '__main__':
     test_cache_key_stability_and_ddl()
     test_parse_verdict()
@@ -330,5 +373,7 @@ if __name__ == '__main__':
     test_agent_wiring_order_and_gate()
     test_render_branches_and_compact_field()
     test_lexical_gate_stays_candidate_annotation()
+    test_unattested_source_is_never_judged_or_promoted()
+    test_selection_pool_blocks_unattested_before_cache_and_promotion()
     _reset()
     print('ENTAILMENT_OK')

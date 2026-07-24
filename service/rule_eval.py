@@ -4,9 +4,10 @@ rule_eval.py — Mode C: deterministic rule binding for MEASURED checks.
 For checks whose status is computed by the deterministic scripts over real
 bytes (scoring.MEASURED_CHECK_BASES), the rule outcome is not a matter of LLM
 judgement — so we bind a curated rule VERBATIM from rule-bindings.json when its
-predicate holds. binding_verified is True by construction (a human curated the
-id→check link and the script decided the status), and the bound rule can carry
-scoring weight (Phase 4). An unmapped base gets no binding — never a wrong one.
+predicate holds. A curated id→check mapping is necessary but no longer
+sufficient: the resolved row must also carry a verbatim excerpt tied to a
+specific fetched source version. Only then can the bound rule carry scoring
+weight (Phase 4). An unmapped or unattested base gets no binding.
 
 Pure + deterministic; no LLM, no network. The rule ROW (for name/source_url) is
 resolved via an injectable resolver so this is unit-testable without a DB.
@@ -77,6 +78,20 @@ def _default_resolver() -> Callable[[str, Any], Optional[dict]]:
         return lambda kind, rid: None
 
 
+def source_faithful(row: Any) -> bool:
+    """True only for rules whose source excerpt is tied to a content version.
+
+    Do not trust a caller-provided boolean alone: LLM-authored payloads pass
+    through adjacent code, so the primitive provenance fields are mandatory.
+    """
+    return bool(
+        isinstance(row, dict)
+        and row.get('provenance_status') == 'verified_excerpt'
+        and str(row.get('source_excerpt') or '').strip()
+        and str(row.get('source_content_hash') or '').strip()
+    )
+
+
 def evaluate_measured_bindings(
     audit: Dict[str, Any],
     resolve: Optional[Callable[[str, Any], Optional[dict]]] = None,
@@ -84,7 +99,7 @@ def evaluate_measured_bindings(
     """Attach a verbatim, verified bound_rule to every MEASURED fail/warn finding
     that has a curated binding. Mutates and returns (audit, stats). Never raises."""
     stats = {'applied': True, 'measured_findings': 0, 'bound': 0,
-             'unresolved': 0, 'no_binding': 0}
+             'unresolved': 0, 'source_unattested': 0, 'no_binding': 0}
     try:
         findings = audit.get('findings')
         if not isinstance(findings, list):
@@ -114,6 +129,9 @@ def evaluate_measured_bindings(
                 if not row:
                     stats['unresolved'] += 1
                     continue
+                if not source_faithful(row):
+                    stats['source_unattested'] += 1
+                    continue
                 bound = {
                     'kind': b.get('kind'), 'id': b.get('id'),
                     'name': row.get('name') or row.get('title'),
@@ -123,6 +141,10 @@ def evaluate_measured_bindings(
                     'if_condition': (row.get('if_condition') or row.get('statement')
                                      or row.get('description') or '')[:500],
                     'then_action': (row.get('then_action') or row.get('explanation') or '')[:500],
+                    'source_excerpt': str(row.get('source_excerpt') or '')[:1000],
+                    'source_content_hash': row.get('source_content_hash'),
+                    'provenance_status': row.get('provenance_status'),
+                    'source_faithful': True,
                     'binding_verified': True,
                     'basis': 'deterministic',
                 }
@@ -145,7 +167,10 @@ def _selftest() -> None:
             return {'id': 1489, 'name': 'Enforce HTTPS across entire domain',
                     'source_org': 'Perplexity', 'source_url': 'https://ex/https',
                     'if_condition': 'if served over http', 'then_action': 'redirect to https',
-                    'confidence_score': '0.95'}
+                    'confidence_score': '0.95',
+                    'source_excerpt': 'Redirect every HTTP request to HTTPS.',
+                    'source_content_hash': 'sha256:abc',
+                    'provenance_status': 'verified_excerpt'}
         return None
 
     audit = {'findings': [
@@ -165,6 +190,14 @@ def _selftest() -> None:
     assert 'bound_rule' not in f[3]
     assert stats['bound'] == 1 and stats['measured_findings'] == 2, stats
     assert stats['unresolved'] == 1, stats
+
+    unattested = {'findings': [
+        {'check_id': 'A1_https_enforcement', 'status': 'fail'}]}
+    evaluate_measured_bindings(
+        unattested,
+        resolve=lambda kind, rid: {'id': rid, 'name': 'HTTPS',
+                                   'source_url': 'https://ex/https'})
+    assert 'bound_rule' not in unattested['findings'][0], unattested
 
     # Robustness: junk shapes never raise.
     for shape in ({}, {'findings': None}, {'findings': [7]}):

@@ -1735,19 +1735,23 @@ function renderBrainSources(findings) {
   // Entailment-first display: the LLM judgment (post-loop, on the final
   // verbatim text) decides where a citation renders. 'supports' → proof;
   // 'related' → collapsed see-also below the proof tiers; 'unrelated' →
-  // hidden here but KEPT in the JSON (never-drop); 'unjudged'/absent →
-  // legacy supports_finding behavior.
+  // hidden here but KEPT in the JSON (never-drop). Only a judged `supports`
+  // citation with source-faithful provenance is proof; every other verdict is
+  // context, never a fallback proof claim.
   const seeAlso = [];
   // BRAIN-MODE DISCLOSURE: which brain answered, and how fresh it is — counted
   // over the SAME deduped set the header total uses (a rule cited by N checks
   // is one source, not N; malformed citations count nowhere).
   let fromLive = 0, fromSnap = 0, maxVer = '';
   // PASS 1 — best copy per dedupKey. The same rule cited by two findings can
-  // carry different verdicts; dedup must keep the BEST one (supports >
-  // unjudged > related), not whichever iterated first — otherwise a
+  // carry different verdicts; dedup must keep the BEST eligible one, not
+  // whichever iterated first — otherwise a
   // 'related' copy consumes the key and the 'supports' copy renders only in
   // the collapsed see-also, working against the missed-support (<=5%) goal.
-  const verdictRank = (c) => (c.entailment === 'supports') ? 0 : (c.entailment === 'related' ? 2 : 1);
+  const isProof = (c) => c.entailment === 'supports' &&
+    c.source_faithful === true && c.provenance_blocked !== true &&
+    c.related_only !== true;
+  const verdictRank = (c) => isProof(c) ? 0 : (c.entailment === 'related' ? 1 : 2);
   for (const f of findings) {
     for (const c of (f.citations || [])) {
       const name = c.name || c.title;
@@ -1765,7 +1769,7 @@ function renderBrainSources(findings) {
   for (const c of seen.values()) {
     if (c.from === 'snapshot') fromSnap++; else if (c.from) fromLive++;
     if (c.last_verified && String(c.last_verified) > maxVer) maxVer = String(c.last_verified);
-    if (c.entailment === 'related') { seeAlso.push(c); continue; }
+    if (!isProof(c)) { seeAlso.push(c); continue; }
     // Citations the grounding step could NOT verify against the brain keep
     // only LLM-claimed fields — never let them claim an authoritative tier.
     const tier = (c.verbatim === false) ? 5 : (c.tier || 5);
@@ -1794,13 +1798,9 @@ function renderBrainSources(findings) {
   let html = '<section><h2>Sources cited (' + totalCites + ' · ' + mode + ')</h2>' + snapBanner;
   for (const t of [1,2,3,4,5]) {
     if (!byTier[t] || !byTier[t].length) continue;
-    // Non-supporting citations sort after supporting ones within their tier
-    // (§6: a "related, not proof" cite must never take the top position).
-    // A judged 'supports' verdict overrides the lexical supports_finding
-    // demotion — the labelled set showed the gate hides ~30% of true proof.
-    // Then URL-less citations sort last — a receipt you can click beats a
-    // name you have to trust.
-    const demoted = (x) => (x.entailment === 'supports') ? 0 : (x.supports_finding === false ? 1 : 0);
+    // Every item in a proof tier already passed entailment + provenance.
+    // URL-less citations sort last — a receipt you can click beats a name.
+    const demoted = (x) => isProof(x) ? 0 : 1;
     byTier[t].sort((a,b) =>
       (demoted(a) - demoted(b)) ||
       ((a.source_url ? 0 : 1) - (b.source_url ? 0 : 1)));
@@ -1818,7 +1818,7 @@ function renderBrainSources(findings) {
       const risk = c.risk_level ? ' [' + escapeHtml(c.risk_level) + ' risk]' : '';
       const unverified = (c.verbatim === false)
         ? ' <span class="cite-unver">unverified</span>' : '';
-      const verified = (c.last_verified && c.verbatim !== false)
+      const verified = (c.last_verified && c.verbatim !== false && c.source_faithful === true)
         ? ' <span class="cite-ver">· verified ' + escapeHtml(String(c.last_verified)) + '</span>' : '';
       // Only show [#id] if id is actually a usable number
       const idTag = (c.id != null && c.id !== '' && !isNaN(c.id))
@@ -1829,13 +1829,7 @@ function renderBrainSources(findings) {
         ? ' <span class="cite-unver" title="no source URL on this rule">no link</span>' : '';
       const provNote = c.url_provenance === 'neighbor-inferred'
         ? ' <span class="cite-unver" title="URL adopted from a similar rule, not the extraction page">inferred link</span>' : '';
-      // §6 fallback (unjudged citations only): retrieval could not tie this
-      // cite to the finding it decorates — still shown, honestly labeled.
-      // A judged 'supports' verdict suppresses the label: the entailment
-      // check IS the display decision now, the lexical gate is candidate
-      // annotation.
-      const related = (c.supports_finding === false && c.entailment !== 'supports')
-        ? ' <span class="cite-unver" title="topically related guidance — not direct proof of this finding">related — not direct proof</span>' : '';
+      const related = '';
       // The rule's own reasoning, verbatim from the brain: when it applies →
       // what to do. Suppressed for unverified citations — their text is
       // LLM-claimed, not brain-backed.
@@ -1857,9 +1851,8 @@ function renderBrainSources(findings) {
     }
     html += '</div>';
   }
-  // Entailment 'related' verdicts: same-topic guidance that does not prove a
-  // specific finding — offered as a collapsed, smaller see-also AFTER the
-  // supporting sources, never dressed as proof.
+  // Related, unjudged, and source-unattested guidance is offered only as a
+  // collapsed context section after proof, never dressed as evidence.
   if (seeAlso.length) {
     let sa = '';
     for (const c of seeAlso.slice(0, 20)) {
@@ -1873,7 +1866,7 @@ function renderBrainSources(findings) {
     }
     html += '<details class="see-also" style="margin-top:10px">' +
       '<summary style="font-size:13px;color:#6b7280;cursor:pointer">' +
-      'See also — related guidance (' + seeAlso.length + ')</summary>' + sa + '</details>';
+      'Context — not direct proof (' + seeAlso.length + ')</summary>' + sa + '</details>';
   }
   html += '</section>';
   return html;
@@ -2905,11 +2898,17 @@ def _slim_citation(c: Dict) -> Optional[Dict]:
         'snapshotDate': c.get('snapshot_date'),
         'lastVerified': c.get('last_verified'),
         'grounded': c.get('grounded'), 'verbatim': c.get('verbatim'),
-        'supportsFinding': c.get('supports_finding'),  # §6: lexical CANDIDATE annotation (unjudged fallback)
+        'supportsFinding': c.get('supports_finding'),  # lexical candidate annotation; never a proof fallback
         # Display verdict from the post-loop LLM entailment judge:
         # 'supports' (proof) | 'related' (see-also) | 'unrelated' (hide) |
-        # 'unjudged'/None (legacy supports_finding behavior).
+        # 'unjudged'/None (context only; never proof).
         'entailment': c.get('entailment'),
+        'sourceFaithful': c.get('source_faithful') is True,
+        'provenanceStatus': c.get('provenance_status'),
+        'sourceExcerpt': (str(c.get('source_excerpt'))[:1000]
+                          if c.get('source_excerpt') else None),
+        'sourceContentHash': c.get('source_content_hash'),
+        'provenanceBlocked': c.get('provenance_blocked') is True,
     }
 
 
@@ -2922,6 +2921,8 @@ def _slim_bound_rule(br: Dict) -> Optional[Dict]:
         'confidence': br.get('confidence_score'),
         'bindingVerified': br.get('binding_verified'),
         'basis': br.get('basis'), 'reason': br.get('reason'),
+        'sourceFaithful': br.get('source_faithful') is True,
+        'provenanceStatus': br.get('provenance_status'),
     }
 
 

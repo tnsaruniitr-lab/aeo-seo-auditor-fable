@@ -15,9 +15,9 @@ citation with the verdict the renderers act on:
                       'related'    -> collapsed "see also" (after proof, smaller)
                       'unrelated'  -> hidden from display, KEPT in JSON
                                       (citations are never dropped)
-                      'unjudged'   -> no key / API error / timeout / budget:
-                                      renderers fall back to the legacy
-                                      supports_finding behavior
+                      'unjudged'   -> no key / API error / timeout / budget,
+                                      or source provenance is unattested:
+                                      context only, never proof
 
 One short claude-haiku-4-5 call per (prompt-version, model, rule-kind,
 rule-id, check-base, evidence, judged-citation-text) tuple — cached in the
@@ -70,10 +70,9 @@ _RETRY_BACKOFF_S = (2.0, 8.0, 20.0)
 # Bump whenever _pair_prompt (or verdict semantics) changes: the version is
 # part of cache_key, so a prompt revision re-judges instead of serving the
 # old prompt's cached verdicts as if they were the new judge's.
-PROMPT_VERSION = 'v2'  # v2: operational supports/related boundary (two-step
-                       # test, generality rule, synthetic calibration examples)
-                       # after v1 self-graded 81.9/20.9 with 15+16 boundary
-                       # confusions on the 206-pair benchmark
+PROMPT_VERSION = 'v3'  # v3: source excerpt is part of the judged input and a
+                       # supports verdict also requires the extracted rule to
+                       # be entailed by that verbatim source passage.
 
 _JUDGED_STATUSES = ('fail', 'warn')
 
@@ -193,7 +192,8 @@ def _cite_text(citation: Dict) -> str:
     cond = str(citation.get('if_condition') or citation.get('statement')
                or citation.get('description') or '')[:300]
     act = str(citation.get('then_action') or citation.get('explanation') or '')[:300]
-    return f'{name}\n{cond}\n{act}'
+    excerpt = str(citation.get('source_excerpt') or '')[:500]
+    return f'{name}\n{cond}\n{act}\n{excerpt}'
 
 
 def cache_key(finding: Dict, citation: Dict) -> str:
@@ -225,13 +225,15 @@ def _pair_prompt(finding: Dict, citation: Dict) -> str:
     cond = str(citation.get('if_condition') or citation.get('statement')
                or citation.get('description') or '')[:300]
     act = str(citation.get('then_action') or citation.get('explanation') or '')[:300]
+    excerpt = str(citation.get('source_excerpt') or '')[:500]
     return (
         'You judge whether a cited guideline proves a website-audit finding.\n\n'
         f"FINDING check: {finding.get('check_id')}\n"
         f'EVIDENCE: {ev}\n\n'
         f"CITED {citation.get('kind') or 'item'}: {name}\n"
         f'IF: {cond}\n'
-        f'THEN: {act}\n\n'
+        f'THEN: {act}\n'
+        f'VERBATIM SOURCE EXCERPT: {excerpt}\n\n'
         'Decide in two steps.\n\n'
         'STEP 1 — eliminate "unrelated". It is unrelated if ANY of: '
         '(1) different platform — a LinkedIn/YouTube/social rule never proves a '
@@ -240,13 +242,15 @@ def _pair_prompt(finding: Dict, citation: Dict) -> str:
         'the inverse condition; (4) the overlap is a single shared word; (5) it '
         'is an outreach/marketing tactic offered against a site-state '
         'diagnostic.\n\n'
-        'STEP 2 — "supports" requires BOTH: '
+        'STEP 2 — "supports" requires ALL THREE: '
         '(a) the IF-condition describes the same condition class the EVIDENCE '
         'observed — same feature AND same aspect of it. A more GENERAL rule '
         'still passes when the observed evidence is an instance of its '
         'condition (evidence "LCP 4.1s" is an instance of "IF LCP exceeds '
         '2.5s"). (b) the THEN prescribes fixing or avoiding exactly what the '
-        'finding flags. Same feature but a DIFFERENT aspect fails (a): '
+        'finding flags; and (c) the VERBATIM SOURCE EXCERPT itself supports '
+        'the cited IF/THEN guidance without adding a requirement the excerpt '
+        'does not state. Same feature but a DIFFERENT aspect fails (a): '
         'evidence "title lacks the brand name" vs rule "IF title exceeds 60 '
         'characters THEN shorten" is the same feature (title tag) but a '
         'different aspect (branding vs length) — that is "related", never '
@@ -406,11 +410,21 @@ def judge_selection_pool(finding: Dict, citations: List[Any], conn: Any = None,
     ranks exactly where legacy retrieval order would put them."""
     verdicts: List[str] = []
     info: Dict[str, Any] = {'cache_hits': 0, 'api_calls': 0, 'errors': 0,
+                            'source_unattested': 0,
                             'budget_exhausted': False}
     has_judge = selection_judge_available()
     for c in citations:
         v = None
         if isinstance(c, dict):
+            # This must precede both cache lookup and API judgment. Otherwise a
+            # legacy cached "supports" verdict can promote a rule whose source
+            # excerpt was never verified, displacing a source-faithful rule
+            # before the later display gate gets a chance to demote it.
+            if c.get('source_faithful') is not True:
+                c['provenance_blocked'] = True
+                info['source_unattested'] += 1
+                verdicts.append(UNJUDGED)
+                continue
             try:
                 key = cache_key(finding, c)
                 v = _lru_get(key)
@@ -453,6 +467,7 @@ def judge_citations(findings: Any) -> Dict[str, Any]:
         'eligible_findings': 0, 'citations_seen': 0,
         'judged': 0, 'cache_hits': 0, 'api_calls': 0,
         'supports': 0, 'related': 0, 'unrelated': 0, 'unjudged': 0,
+        'source_unattested': 0,
         'errors': 0, 'budget_exhausted': False, 'no_api_key': False,
     }
     conn = None
@@ -476,6 +491,16 @@ def judge_citations(findings: Any) -> Dict[str, Any]:
                 if not isinstance(c, dict):
                     continue
                 stats['citations_seen'] += 1
+                # A cached or newly generated supports verdict can never
+                # rescue a rule whose source excerpt was not verified by the
+                # ingestion pipeline. This gate precedes cache lookup to stop
+                # legacy cached verdicts leaking through after migration.
+                if c.get('source_faithful') is not True:
+                    c['entailment'] = UNJUDGED
+                    c['provenance_blocked'] = True
+                    stats['source_unattested'] += 1
+                    stats['unjudged'] += 1
+                    continue
                 verdict = None
                 try:
                     key = cache_key(f, c)

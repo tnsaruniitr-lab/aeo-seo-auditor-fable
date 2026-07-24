@@ -270,16 +270,16 @@ assert li['citations'][0]['supportsFinding'] is None, li
 
 
 # ---------------------------------------------------------------------------
-# 5) INDEX_HTML — "related, not proof" label + demotion sort (§6)
+# 5) INDEX_HTML — proof requires entailment + source-faithful provenance (§6)
 # ---------------------------------------------------------------------------
 html = main.INDEX_HTML
-assert 'related — not direct proof' in html, 'non-supporting cite label missing'
-assert "c.supports_finding === false" in html, 'supports_finding gate missing'
-# the tier sort must demote non-supporting cites BEFORE the URL-less tiebreak
-# (since the entailment pass, demotion lives in demoted() — a judged
-# 'supports' verdict overrides the lexical gate, which stays the fallback)
-sort_ix = html.index('x.supports_finding === false ? 1 : 0')
+assert 'Context — not direct proof' in html, 'context-only citation label missing'
+assert "c.entailment === 'supports'" in html and \
+       "c.source_faithful === true" in html and \
+       "c.provenance_blocked !== true" in html, 'proof conjunction missing'
+# the tier sort keeps proof first before the URL-less tiebreak
+sort_ix = html.index('isProof(x) ? 0 : 1')
 url_ix = html.index('a.source_url ? 0 : 1')
-assert sort_ix < url_ix, 'supports_finding must be the primary within-tier sort key'
+assert sort_ix < url_ix, 'proof eligibility must be the primary sort key'
 
 print('EVIDENCE_IDENTITY_OK')

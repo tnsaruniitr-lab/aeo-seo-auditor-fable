@@ -491,7 +491,9 @@ def _optional_cols(conn) -> Dict[str, set]:
             WHERE table_schema='sieve'
               AND column_name IN ('url_provenance', 'status', 'contested',
                                   'superseded_by', 'document_id',
-                                  'domain_tag', 'last_verified', 'created_at')
+                                  'domain_tag', 'last_verified', 'created_at',
+                                  'source_excerpt', 'source_content_hash',
+                                  'provenance_status')
         """)
         for t, c in cur.fetchall():
             out.setdefault(t, set()).add(c)
@@ -508,6 +510,11 @@ def _select_head(cfg, score_sql: str, cols: Optional[set] = None) -> str:
     dtag = "t.domain_tag" if 'domain_tag' in cols else "NULL"
     lv = "t.last_verified::text" if 'last_verified' in cols else "NULL"
     ca = "t.created_at" if 'created_at' in cols else "NULL"
+    excerpt = "t.source_excerpt" if 'source_excerpt' in cols else "NULL"
+    content_hash = ("t.source_content_hash"
+                    if 'source_content_hash' in cols else "NULL")
+    proof_status = ("t.provenance_status"
+                    if 'provenance_status' in cols else "NULL")
     # S4: join documents on the real document_id FK when the column exists;
     # fall back to the legacy source_refs_json regex only on an older DB.
     # no_doc_join kinds (playbooks) carry their own source_url — no join.
@@ -534,6 +541,9 @@ def _select_head(cfg, score_sql: str, cols: Optional[set] = None) -> str:
                {lv} AS last_verified,
                {ca} AS created_at,
                {prov} AS url_provenance,
+               {excerpt} AS source_excerpt,
+               {content_hash} AS source_content_hash,
+               {proof_status} AS provenance_status,
                {score_sql} AS score
         FROM sieve.{{table}} t{join}
     """
@@ -633,6 +643,12 @@ def _row_to_cite(r) -> Dict[str, Any]:
     except (TypeError, ValueError):
         conf = 0.0
     prov = _prov_method(r.get('url_provenance'))
+    excerpt = str(r.get('source_excerpt') or '').strip()
+    content_hash = str(r.get('source_content_hash') or '').strip()
+    proof_status = str(r.get('provenance_status') or '').strip()
+    source_faithful = bool(
+        r.get('kindtag', 'rule') == 'rule'
+        and proof_status == 'verified_excerpt' and excerpt and content_hash)
     return {
         'id': r.get('id'), 'kind': r.get('kindtag', 'rule'),
         'tier': t, 'tier_icon': TIER_ICONS.get(t, '📝'),
@@ -651,6 +667,10 @@ def _row_to_cite(r) -> Dict[str, Any]:
         'relevance': round(float(r.get('score') or 0.0), 4),
         'url_spec': _url_spec(r.get('source_url')),
         'url_provenance': r.get('url_provenance'),
+        'source_excerpt': excerpt[:1000] or None,
+        'source_content_hash': content_hash or None,
+        'provenance_status': proof_status or 'unverified',
+        'source_faithful': source_faithful,
         'retrieval_layer': r.get('_layer', 'vector'),
         'from': 'sieve-live',
     }

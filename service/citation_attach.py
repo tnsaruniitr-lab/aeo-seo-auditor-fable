@@ -141,8 +141,10 @@ def attach_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, A
                              'llm_lists_replaced': 0, 'empty_retrievals': 0,
                              'evidence_led': 0, 'cites_supporting': 0,
                              'cites_related_only': 0,
+                             'cites_source_unattested': 0,
                              'deprecated_excluded': 0, 'errors': 0,
                              'selection_pool': 0, 'pool_judged': 0,
+                             'pool_source_unattested': 0,
                              'promoted_from_pool': 0, 'pool_cache_hits': 0,
                              'pool_api_calls': 0, 'pool_errors': 0,
                              'pool_budget_exhausted': False}
@@ -234,6 +236,8 @@ def attach_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, A
                         stats['pool_cache_hits'] += info['cache_hits']
                         stats['pool_api_calls'] += info['api_calls']
                         stats['pool_errors'] += info['errors']
+                        stats['pool_source_unattested'] += info.get(
+                            'source_unattested', 0)
                         if info['budget_exhausted']:
                             stats['pool_budget_exhausted'] = True
                         stats['pool_judged'] += sum(
@@ -271,7 +275,11 @@ def attach_citations(audit: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, A
             # unjudged-fallback signal only.
             ftok = _sup_tokens(f.get('evidence'), f.get('title'))
             for c in cites:
-                c['supports_finding'] = _supports(ftok, c)
+                faithful = c.get('source_faithful') is True
+                c['supports_finding'] = bool(faithful and _supports(ftok, c))
+                if not faithful:
+                    c['provenance_blocked'] = True
+                    stats['cites_source_unattested'] += 1
                 stats['cites_supporting' if c['supports_finding']
                       else 'cites_related_only'] += 1
             f['citations'] = cites
@@ -333,11 +341,13 @@ def _selftest() -> None:
         if check_id == 'A10_robots_txt':                  # evidence-led path
             return {'citations': [
                 {'id': '7', 'kind': 'rule', 'name': 'robots.txt disallow blocks crawler access',
-                 'then_action': 'remove the disallow rule blocking the crawler from the page'},
+                 'then_action': 'remove the disallow rule blocking the crawler from the page',
+                 'source_faithful': True},
             ]}
         return {'citations': [
             {'id': '1', 'kind': 'rule', 'name': 'Enforce HTTPS sitewide',
-             'then_action': 'redirect http to https and serve an hsts header on the site'},
+             'then_action': 'redirect http to https and serve an hsts header on the site',
+             'source_faithful': True},
             {'id': '2', 'kind': 'principle', 'name': 'P2'},
             'junk-not-a-dict',
             {'id': '3', 'kind': 'ap', 'name': 'A3'},
@@ -424,7 +434,11 @@ def _selftest() -> None:
                     evidence=None, evidence_led=False, pool=None):
             pool_calls.append((check_id, max_citations, pool))
             return {'citations': [
-                {'id': str(i), 'kind': 'rule', 'name': f'R{i}'}
+                {'id': str(i), 'kind': 'rule', 'name': f'R{i}',
+                 'source_faithful': True,
+                 'provenance_status': 'verified_excerpt',
+                 'source_excerpt': f'Exact source proof for R{i}.',
+                 'source_content_hash': f'hash-{i}'}
                 for i in range(1, 13)]}
 
         judge_calls = []
@@ -471,8 +485,12 @@ def _selftest() -> None:
         ce.TOTAL_BUDGET_S = -1.0
         fb = {'check_id': 'A1_https_enforcement', 'status': 'fail',
               'evidence': 'budget scenario evidence'}
-        ce._lru_put(ce.cache_key(fb, {'id': '9', 'kind': 'rule', 'name': 'R9'}),
-                    'supports')
+        ce._lru_put(ce.cache_key(
+            fb, {'id': '9', 'kind': 'rule', 'name': 'R9',
+                 'source_faithful': True,
+                 'provenance_status': 'verified_excerpt',
+                 'source_excerpt': 'Exact source proof for R9.',
+                 'source_content_hash': 'hash-9'}), 'supports')
         judge_calls.clear()
         a3, s3 = attach_citations(
             {'classification': {'page_type': 'blog', 'industry': 'saas'},
