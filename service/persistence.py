@@ -150,6 +150,16 @@ def build_answermonk_payload(audit: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         v = audit.get(k) or md.get(k)
         if v:
             tags[k] = str(v)[:200]
+    # Brand-family: carry the self-declared product/service NAMES so the PUSH
+    # transport (this endpoint) matches the POLL transport (/audit/{id}/json →
+    # answermonk bridge). The receiver stores metadata verbatim, so
+    # metadata.declared_entities survives on whichever ingest lands last.
+    decl = audit.get('declared_entities')
+    if not (isinstance(decl, list) and decl):
+        d2 = md.get('declared_entities')
+        decl = d2 if isinstance(d2, list) else None
+    if isinstance(decl, list) and decl:
+        tags['declared_entities'] = decl[:200]
     if tags:
         payload['metadata'] = tags
     return payload

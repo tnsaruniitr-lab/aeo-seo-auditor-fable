@@ -177,6 +177,52 @@ def run_deterministic_scripts(url: str, timeout: int = 180) -> Dict:
 
 
 # ----------------------------------------------------------------------
+# BRAND-FAMILY SIGNAL: self-declared product/service/offer names
+# ----------------------------------------------------------------------
+
+# @types whose schema `name` denotes an OWNED offering the brand self-declares
+# (Effiflo's "Talent Flo"/"Deal Flo"/"Signal Flo"). Organization / LocalBusiness
+# / WebSite / WebPage etc. are the brand ITSELF or page furniture — never a
+# sub-brand product — so they are deliberately excluded. Conservative on purpose:
+# this list drives a downstream competitor exclusion, and answermonk re-vets each
+# name (length / generic / strict whole-phrase) before it can drop a rival.
+OWNED_ENTITY_TYPES = {
+    'service', 'product', 'softwareapplication', 'mobileapplication',
+    'webapplication', 'offer', 'individualproduct', 'productmodel',
+    'productgroup',
+}
+
+
+def extract_declared_entities(scripts_output: Dict) -> list:
+    """Brand-family: the brand's self-declared product/service/offer NAMES from
+    JSON-LD schema (check_schema_completeness `validations`). Returns
+    [{type, name}] for offering types with a non-empty string name, deduped by
+    lowercased name. Pure; never raises — a missing/odd shape yields []."""
+    try:
+        schema = (scripts_output or {}).get('schema_completeness') or {}
+        validations = schema.get('validations') or []
+        out = []
+        seen = set()
+        for v in validations:
+            if not isinstance(v, dict):
+                continue
+            t = str(v.get('type') or '').strip().lower()
+            if t not in OWNED_ENTITY_TYPES:
+                continue
+            name = v.get('name')
+            if not isinstance(name, str) or not name.strip():
+                continue
+            key = name.strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({'type': t, 'name': name.strip()})
+        return out
+    except Exception:
+        return []
+
+
+# ----------------------------------------------------------------------
 # STEP 2: PAGE CLASSIFICATION (light)
 # ----------------------------------------------------------------------
 
@@ -921,6 +967,11 @@ def run_audit(url: str, output_dir: str = './audits/') -> Dict:
         'scoring': scoring,
         'findings': findings,
         'narrative': narrative,
+        # Brand-family exclusion: the brand's self-declared product/service names
+        # so answermonk can stop a multi-product brand's OWN products from
+        # rendering as its competitors. Emitted top-level; the answermonk bridge
+        # carries it into external_audits.metadata.declared_entities.
+        'declared_entities': extract_declared_entities(scripts_output),
         'scripts_output': scripts_output,
         'brain_stats': brain_stats,
     }

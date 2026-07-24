@@ -1411,6 +1411,17 @@ def run_audit_agent(url: str, output_dir: str = "./audits/",
         render_markdown_report = None
         render_pdf_summary = None
 
+    # Brand-family exclusion: the brand's self-declared product/service NAMES
+    # from JSON-LD schema, so answermonk can stop a multi-product brand's OWN
+    # products from rendering as competitors. Emitted top-level (the answermonk
+    # bridge carries it into external_audits.metadata.declared_entities). Set
+    # BEFORE the JSON write so the served /audit/{id}/json file carries it.
+    try:
+        from audit_pipeline import extract_declared_entities
+        audit["declared_entities"] = extract_declared_entities(loop_result.get("scripts_output"))
+    except Exception:  # noqa: BLE001
+        audit.setdefault("declared_entities", [])
+
     slug = domain.replace(".", "-")
     base_path = out_dir / f"{slug}-{audit_id[:8]}"
 
